@@ -1,0 +1,119 @@
+openapi: 3.0.3
+info:
+  title: SliceStream API Contract
+  version: 1.0.0
+paths:
+  /provider/jobs/{job_id}/status:
+    get:
+      summary: Provider job status
+      parameters:
+        - in: path
+          name: job_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Job status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderJobStatus'
+  /receipts/{receipt_id}:
+    get:
+      summary: Settlement receipt
+      parameters:
+        - in: path
+          name: receipt_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Receipt payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Receipt'
+components:
+  schemas:
+    ProviderJobStatus:
+      type: object
+      required:
+        - job_id
+        - status
+      properties:
+        job_id:
+          type: string
+        status:
+          type: string
+        # New optional fields
+        telemetry_summary:
+          type: object
+          description: Window-level telemetry summary for settlement.
+          properties:
+            sampled_at:
+              type: string
+              format: date-time
+            window_seconds:
+              type: integer
+              example: 15
+            active_ratio:
+              type: number
+              format: float
+            active_samples:
+              type: integer
+            total_samples:
+              type: integer
+        telemetry_sig:
+          type: string
+          description: Signature for telemetry_summary.
+        window_index:
+          type: integer
+          minimum: 0
+        work_units_window:
+          type: number
+          format: float
+        unit_price_per_work_unit:
+          type: number
+          format: float
+        owed_window:
+          type: number
+          format: float
+    Receipt:
+      type: object
+      required:
+        - receipt_id
+        - amount_paid
+      properties:
+        receipt_id:
+          type: string
+        amount_paid:
+          type: number
+          format: float
+        # New optional fields
+        telemetry_summary:
+          type: object
+          properties:
+            window_seconds:
+              type: integer
+            active_ratio:
+              type: number
+              format: float
+            active_samples:
+              type: integer
+            total_samples:
+              type: integer
+        telemetry_sig:
+          type: string
+        window_index:
+          type: integer
+        work_units_window:
+          type: number
+          format: float
+        unit_price_per_work_unit:
+          type: number
+          format: float
+        owed_window:
+          type: number
+          format: float
