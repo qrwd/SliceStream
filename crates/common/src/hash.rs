@@ -5,6 +5,14 @@ pub enum HashAlg {
     Sha256V1,
 }
 
+impl HashAlg {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HashAlg::Sha256V1 => "sha256:v1",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CanonicalValue {
     Null,
@@ -222,5 +230,10 @@ mod tests {
             canonical_json_bytes(&CanonicalValue::Object(a)),
             canonical_json_bytes(&CanonicalValue::Object(b))
         );
+    }
+
+    #[test]
+    fn hash_alg_label_is_versioned_and_stable() {
+        assert_eq!(HashAlg::Sha256V1.as_str(), "sha256:v1");
     }
 }

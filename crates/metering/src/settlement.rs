@@ -120,7 +120,7 @@ pub fn settle_window(input: WindowInput, previous_hash: &str) -> Receipt {
     let owed_window = base_owed * active_ratio;
 
     let mut material = BTreeMap::new();
-    material.insert("alg", "sha256:v1".to_string());
+    material.insert("alg", RECEIPT_HASH_ALG.as_str().to_string());
     material.insert("prev_receipt_hash", previous_hash.to_string());
     material.insert("job_id", input.job_id.clone());
     material.insert("window_index", input.window_index.to_string());
@@ -299,6 +299,26 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn same_inputs_produce_same_root_hash_across_runs() {
+        let inputs = vec![
+            window("job-a", 0, 60, 10.0, 1.0),
+            window("job-a", 1, 30, 10.0, 1.0),
+            window("job-a", 2, 0, 5.0, 3.0),
+        ];
+
+        let first = settle_batch(&inputs);
+        let second = settle_batch(&inputs);
+
+        assert_eq!(first.root_hash, second.root_hash);
+        assert_eq!(first.receipts.len(), second.receipts.len());
+        for (left, right) in first.receipts.iter().zip(second.receipts.iter()) {
+            assert_eq!(left.receipt_hash, right.receipt_hash);
+            assert_eq!(left.hash_alg, right.hash_alg);
+        }
+    }
+
     #[test]
     fn tampering_any_covered_receipt_field_changes_root_hash() {
         let base = settle_batch(&[
@@ -310,6 +330,12 @@ mod tests {
         changed_job.telemetry_digest = "t-job-a-1".to_string();
         let changed_job_batch = settle_batch(&[window("job-a", 0, 60, 10.0, 1.0), changed_job]);
         assert_ne!(base.root_hash, changed_job_batch.root_hash);
+
+        let changed_window_index = settle_batch(&[
+            window("job-a", 0, 60, 10.0, 1.0),
+            window("job-a", 2, 30, 10.0, 1.0),
+        ]);
+        assert_ne!(base.root_hash, changed_window_index.root_hash);
 
         let changed_valid = settle_batch(&[
             window("job-a", 0, 60, 10.0, 1.0),

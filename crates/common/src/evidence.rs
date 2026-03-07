@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::canonical_json::to_canonical_json_from_value;
 use crate::hash::{canonical_json_bytes, hash_hex, CanonicalValue, HashAlg};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +40,10 @@ pub struct EvidenceBundle {
 pub fn evidence_root(bundle: &EvidenceBundle) -> String {
     let canonical = canonical_json_bytes(&bundle_to_canonical(bundle));
     hash_hex(HashAlg::Sha256V1, &canonical)
+}
+
+pub fn export_evidence_bundle_json(bundle: &EvidenceBundle) -> String {
+    to_canonical_json_from_value(&bundle_to_canonical(bundle))
 }
 
 pub fn verify(bundle: &EvidenceBundle, root: &str) -> bool {
@@ -208,11 +213,107 @@ mod tests {
     #[test]
     fn evidence_bundle_export_and_verify() {
         let bundle = sample_bundle();
+        let exported = export_evidence_bundle_json(&bundle);
+        assert!(exported.starts_with("{"));
+        assert!(exported.contains("\"job_id\":\"job-a\""));
+
         let root = evidence_root(&bundle);
         assert!(verify(&bundle, &root));
 
-        let mut tampered = bundle;
+        let mut tampered = bundle.clone();
+        tampered.version = "v2".to_string();
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.job_id = "job-b".to_string();
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.window_range = "1-2".to_string();
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.merge_policy = "60s".to_string();
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.root_hash = "root-1".to_string();
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.telemetry_samples_digest = "samples-digest-2".to_string();
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.telemetry_source_manifest = "manifest-2".to_string();
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
         tampered.pricing_inputs = "pricing-tampered".to_string();
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.idempotency_records = vec!["job-a:30".to_string()];
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.conflict_records = vec!["conflict".to_string()];
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.stall_records = vec!["stall".to_string()];
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.generated_at_utc = "2026-01-01T00:00:02Z".to_string();
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.generator_version = "gen-v2".to_string();
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.receipts[0].window_index = 1;
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.receipts[0].valid_samples = 59;
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.receipts[0].work_units_window = "11.000000".to_string();
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.receipts[0].unit_price_per_work_unit = "2.000000".to_string();
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.receipts[0].active_ratio = "0.500000".to_string();
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.receipts[0].base_owed = "9.000000".to_string();
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.receipts[0].owed_window = "9.000000".to_string();
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.receipts[0].telemetry_digest = "telemetry-b".to_string();
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.receipts[0].prev_receipt_hash = "prev-1".to_string();
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.receipts[0].receipt_hash = "hash-1".to_string();
+        assert!(!verify(&tampered, &root));
+
+        let mut tampered = bundle.clone();
+        tampered.receipts[0].timestamp_utc = "2026-01-01T00:00:03Z".to_string();
         assert!(!verify(&tampered, &root));
     }
 }

@@ -51,6 +51,12 @@ Where `active_ratio` is derived from valid telemetry samples for that window.
 - default merge = 2 windows (30s)
 - optional merge = 4 windows (60s)
 
+### Network baseline (frozen for contest/runtime profile)
+
+- default network MUST be **CKB Testnet**
+- default CKB address prefix MUST be **`ckt`**
+- mainnet-ready configuration MAY exist, but MUST be opt-in (explicit switch)
+
 ---
 
 ## 6) 90–120s Demo Script (operator runbook)

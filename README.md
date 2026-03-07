@@ -35,6 +35,46 @@ SliceStream is a **work-based billing system** with **0.25s telemetry sampling**
 
 Use the runbook in `docs/project-charter.md` (section: 90–120s Demo Script), then execute acceptance checks from `docs/acceptance.md`.
 
+
+## Network profile (default: CKB Testnet)
+
+SliceStream now defaults to **CKB Testnet** for the contest/runtime profile:
+- `network = testnet`
+- CKB address prefix = `ckt`
+
+Mainnet-ready configuration remains available behind an explicit switch in `config/network.toml` (`network = mainnet`, prefix `ckb`).
+
+### Switch network configuration
+
+1. Open `config/network.toml`.
+2. Keep default testnet:
+   - `network = "testnet"`
+   - `ckb_address_prefix = "ckt"`
+3. To switch to mainnet-ready mode:
+   - `network = "mainnet"`
+   - `mainnet_ready = true`
+   - use `mainnet_address_prefix = "ckb"`
+
+### Example commands (default to testnet/ckt)
+
+```bash
+export SLICESTREAM_NETWORK=testnet
+export CKB_ADDRESS_PREFIX=ckt
+cargo run -p providerd
+```
+
+```bash
+export SLICESTREAM_NETWORK=testnet
+export CKB_ADDRESS_PREFIX=ckt
+cargo run -p agentd
+```
+
+```bash
+export SLICESTREAM_NETWORK=testnet
+export CKB_ADDRESS_PREFIX=ckt
+cargo run -p dashboard
+```
+
 ## Durable project memory (single source of truth)
 
 All normative behavior is defined in `docs/`. Treat these files as the **only source of truth**:

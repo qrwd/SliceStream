@@ -7,7 +7,11 @@ name = "agentd"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "common",
+ "serde",
+ "serde_json",
  "tokio",
+ "tower",
 ]
 
 [[package]]
@@ -108,6 +112,7 @@ dependencies = [
 name = "fiber_rpc"
 version = "0.1.0"
 dependencies = [
+ "common",
  "serde",
  "serde_json",
 ]
@@ -327,7 +332,11 @@ name = "providerd"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "common",
+ "serde",
+ "serde_json",
  "tokio",
+ "tower",
 ]
 
 [[package]]

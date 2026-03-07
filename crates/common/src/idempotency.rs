@@ -14,7 +14,7 @@ fn ledger() -> &'static Mutex<HashMap<String, String>> {
 }
 
 pub fn make_key(job_id: &str, window_end: u64) -> String {
-    format!("idem:v1:{job_id}:{window_end}")
+    format!("{job_id}:{window_end}")
 }
 
 pub fn record_payment(key: &str, payment_id: &str) -> Result<(), Conflict> {
@@ -43,11 +43,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn idempotency_same_key_different_payload_conflict() {
+    fn make_key_uses_job_id_and_window_end_format() {
+        assert_eq!(make_key("job-a", 15), "job-a:15");
+    }
+
+    #[test]
+    fn same_key_same_payment_id_is_ok() {
+        reset_for_tests();
+        let key = make_key("job-a", 15);
+        assert!(record_payment(&key, "pay-1").is_ok());
+        assert!(record_payment(&key, "pay-1").is_ok());
+    }
+
+    #[test]
+    fn same_key_different_payment_id_is_conflict() {
         reset_for_tests();
         let key = make_key("job-a", 15);
         assert!(record_payment(&key, "pay-1").is_ok());
         let err = record_payment(&key, "pay-2").unwrap_err();
+        assert_eq!(err.key, key);
         assert_eq!(err.existing_payment_id, "pay-1");
     }
 }
