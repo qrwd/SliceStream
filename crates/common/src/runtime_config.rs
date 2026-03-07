@@ -151,19 +151,21 @@ pub fn resolve_runtime_config(
         if !p.is_empty() {
             cfg.address_prefix = p.to_string();
         }
-    } else {
-        // Keep network-safe defaults even with invalid file values.
-        if cfg.network == Network::Testnet && cfg.address_prefix != "ckt" {
-            cfg.address_prefix = "ckt".to_string();
-        }
-        if cfg.network == Network::Mainnet && cfg.mainnet_ready && cfg.address_prefix != "ckb" {
-            cfg.address_prefix = "ckb".to_string();
-        }
     }
 
+    enforce_network_prefix_consistency(cfg)
+}
+
+fn enforce_network_prefix_consistency(mut cfg: RuntimeConfig) -> RuntimeConfig {
     if cfg.network == Network::Mainnet && !cfg.mainnet_ready {
         cfg.network = Network::Testnet;
         cfg.address_prefix = "ckt".to_string();
+        return cfg;
+    }
+
+    match cfg.network {
+        Network::Testnet => cfg.address_prefix = "ckt".to_string(),
+        Network::Mainnet => cfg.address_prefix = "ckb".to_string(),
     }
 
     cfg
@@ -217,5 +219,46 @@ mod tests {
         assert_eq!(cfg.network, Network::Testnet);
         assert_eq!(cfg.address_prefix, "ckt");
         assert_eq!(cfg.settlement_mode, SettlementMode::Merge30s);
+    }
+
+    #[test]
+    fn mainnet_requested_but_not_ready_falls_back_to_testnet_and_ckt() {
+        let mut file_map = HashMap::new();
+        file_map.insert("mainnet_ready".to_string(), "false".to_string());
+
+        let mut env_map = HashMap::new();
+        env_map.insert("SLICESTREAM_NETWORK".to_string(), "mainnet".to_string());
+        env_map.insert("CKB_ADDRESS_PREFIX".to_string(), "ckb".to_string());
+
+        let cfg = resolve_runtime_config(&file_map, &env_map);
+        assert_eq!(cfg.network, Network::Testnet);
+        assert_eq!(cfg.address_prefix, "ckt");
+    }
+
+    #[test]
+    fn testnet_with_ckb_prefix_is_normalized_to_ckt() {
+        let mut file_map = HashMap::new();
+        file_map.insert("network".to_string(), "testnet".to_string());
+
+        let mut env_map = HashMap::new();
+        env_map.insert("CKB_ADDRESS_PREFIX".to_string(), "ckb".to_string());
+
+        let cfg = resolve_runtime_config(&file_map, &env_map);
+        assert_eq!(cfg.network, Network::Testnet);
+        assert_eq!(cfg.address_prefix, "ckt");
+    }
+
+    #[test]
+    fn mainnet_ready_with_ckt_prefix_is_normalized_to_ckb() {
+        let mut file_map = HashMap::new();
+        file_map.insert("network".to_string(), "mainnet".to_string());
+        file_map.insert("mainnet_ready".to_string(), "true".to_string());
+
+        let mut env_map = HashMap::new();
+        env_map.insert("CKB_ADDRESS_PREFIX".to_string(), "ckt".to_string());
+
+        let cfg = resolve_runtime_config(&file_map, &env_map);
+        assert_eq!(cfg.network, Network::Mainnet);
+        assert_eq!(cfg.address_prefix, "ckb");
     }
 }

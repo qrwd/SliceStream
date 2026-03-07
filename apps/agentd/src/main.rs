@@ -14,14 +14,43 @@ use common::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
+    env,
     io::{Read, Write},
     net::TcpStream as StdTcpStream,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
+#[allow(dead_code)]
+#[path = "../../../crates/fiber_rpc/src/client.rs"]
+mod fiber_rpc_client;
+use fiber_rpc_client::FiberRpcClient;
+
 const DEFAULT_PROVIDER_ADDR: &str = "127.0.0.1:4001";
 const POLL_INTERVAL_SECS: u64 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettlementGatewayMode {
+    Mock,
+    Fiber,
+}
+
+impl SettlementGatewayMode {
+    fn from_env() -> Self {
+        match env::var("SLICESTREAM_SETTLEMENT_MODE") {
+            Ok(v) if v.trim().eq_ignore_ascii_case("fiber") => Self::Fiber,
+            Ok(v) if v.trim().eq_ignore_ascii_case("mock") => Self::Mock,
+            _ => Self::Mock,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Mock => "mock",
+            Self::Fiber => "fiber",
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct ConfirmRequest {
@@ -87,6 +116,15 @@ struct TaskReceipt {
     last_payment_id: Option<String>,
     total_paid: f64,
     last_settled_window_index: u64,
+    payment_records: Vec<PaymentRecordView>,
+}
+
+#[derive(Debug, Serialize)]
+struct PaymentRecordView {
+    invoice_id: String,
+    payment_id: String,
+    window_indexes: Vec<u64>,
+    amount_paid: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -151,6 +189,175 @@ struct WindowCharge {
 }
 
 #[derive(Debug, Clone)]
+struct GatewayInvoice {
+    invoice_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct GatewayPayment {
+    payment_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct GatewayError {
+    code: String,
+    message: String,
+}
+
+trait SettlementGateway {
+    fn create_invoice(
+        &mut self,
+        task: &mut TaskRuntime,
+        windows: &[WindowCharge],
+    ) -> Result<GatewayInvoice, GatewayError>;
+    fn settle_payment(
+        &mut self,
+        task: &mut TaskRuntime,
+        invoice: &GatewayInvoice,
+        windows: &[WindowCharge],
+    ) -> Result<GatewayPayment, GatewayError>;
+    fn record_result(
+        &mut self,
+        task: &mut TaskRuntime,
+        invoice: &GatewayInvoice,
+        payment: &GatewayPayment,
+    ) -> Result<(), GatewayError>;
+}
+
+#[derive(Default)]
+struct MockSettlementGateway;
+
+impl SettlementGateway for MockSettlementGateway {
+    fn create_invoice(
+        &mut self,
+        task: &mut TaskRuntime,
+        windows: &[WindowCharge],
+    ) -> Result<GatewayInvoice, GatewayError> {
+        let start = windows.first().map(|w| w.window_index).unwrap_or(0);
+        let end = windows.last().map(|w| w.window_index).unwrap_or(0);
+        task.next_invoice_seq += 1;
+        Ok(GatewayInvoice {
+            invoice_id: format!("inv-{}-{}-{}", task.task_id, start, end),
+        })
+    }
+
+    fn settle_payment(
+        &mut self,
+        task: &mut TaskRuntime,
+        _invoice: &GatewayInvoice,
+        _windows: &[WindowCharge],
+    ) -> Result<GatewayPayment, GatewayError> {
+        let payment_id = format!("pay-{}-{}", task.task_id, task.next_payment_seq);
+        task.next_payment_seq += 1;
+        Ok(GatewayPayment { payment_id })
+    }
+
+    fn record_result(
+        &mut self,
+        _task: &mut TaskRuntime,
+        _invoice: &GatewayInvoice,
+        _payment: &GatewayPayment,
+    ) -> Result<(), GatewayError> {
+        Ok(())
+    }
+}
+
+struct FiberSettlementGateway {
+    rpc: FiberRpcClient,
+}
+
+impl FiberSettlementGateway {
+    fn new() -> Self {
+        let rpc = FiberRpcClient::default();
+        println!(
+            "fiber gateway init network={} prefix={} settlement_mode={} endpoint={}",
+            rpc.runtime_config().network.as_str(),
+            rpc.runtime_config().address_prefix,
+            rpc.runtime_config().settlement_mode.as_str(),
+            rpc.endpoint().unwrap_or("<not_configured>")
+        );
+        Self { rpc }
+    }
+
+    #[cfg(test)]
+    fn from_client(rpc: FiberRpcClient) -> Self {
+        Self { rpc }
+    }
+}
+
+impl SettlementGateway for FiberSettlementGateway {
+    fn create_invoice(
+        &mut self,
+        task: &mut TaskRuntime,
+        windows: &[WindowCharge],
+    ) -> Result<GatewayInvoice, GatewayError> {
+        let start = windows.first().map(|w| w.window_index).unwrap_or(0);
+        let end = windows.last().map(|w| w.window_index).unwrap_or(0);
+        let amount_shannons = (windows.iter().map(|w| w.owed_window).sum::<f64>() * 100_000_000.0)
+            .round() as u64;
+        println!(
+            "fiber rpc call method=create_invoice request_sent=true endpoint={}",
+            self.rpc.endpoint().unwrap_or("<not_configured>")
+        );
+        match self
+            .rpc
+            .create_invoice(&task.task_id, start, end, amount_shannons)
+        {
+            Ok(inv) => {
+                println!("fiber rpc result method=create_invoice status=success");
+                Ok(GatewayInvoice {
+                    invoice_id: inv.invoice_id,
+                })
+            }
+            Err(err) => Err(GatewayError {
+                code: err.code.as_str().to_string(),
+                message: err.message,
+            }),
+        }
+    }
+
+    fn settle_payment(
+        &mut self,
+        _task: &mut TaskRuntime,
+        invoice: &GatewayInvoice,
+        _windows: &[WindowCharge],
+    ) -> Result<GatewayPayment, GatewayError> {
+        println!(
+            "fiber rpc call method=settle_payment request_sent=true endpoint={}",
+            self.rpc.endpoint().unwrap_or("<not_configured>")
+        );
+        match self.rpc.settle_payment(&invoice.invoice_id) {
+            Ok(p) => {
+                println!("fiber rpc result method=settle_payment status=success");
+                Ok(GatewayPayment {
+                    payment_id: p.payment_id,
+                })
+            }
+            Err(err) => Err(GatewayError {
+                code: err.code.as_str().to_string(),
+                message: err.message,
+            }),
+        }
+    }
+
+    fn record_result(
+        &mut self,
+        _task: &mut TaskRuntime,
+        invoice: &GatewayInvoice,
+        payment: &GatewayPayment,
+    ) -> Result<(), GatewayError> {
+        println!("fiber rpc call method=record_result request_sent=false endpoint=local_placeholder");
+        self.rpc
+            .record_result(&invoice.invoice_id, &payment.payment_id)
+            .map(|_| ())
+            .map_err(|err| GatewayError {
+                code: err.code.as_str().to_string(),
+                message: err.message,
+            })
+    }
+}
+
+#[derive(Debug, Clone)]
 struct PaymentRecord {
     invoice_id: String,
     payment_id: String,
@@ -180,6 +387,7 @@ struct TaskRuntime {
     last_payment_id: Option<String>,
     total_paid: f64,
     payment_records: Vec<PaymentRecord>,
+    settlement_audit_events: Vec<String>,
     next_invoice_seq: u64,
     next_payment_seq: u64,
 }
@@ -188,6 +396,7 @@ struct TaskRuntime {
 struct AppState {
     tasks: Arc<Mutex<HashMap<String, TaskRuntime>>>,
     provider_addr: String,
+    settlement_gateway: Arc<Mutex<Box<dyn SettlementGateway + Send>>>,
 }
 
 impl Default for AppState {
@@ -253,6 +462,7 @@ impl Default for AppState {
                 last_payment_id: None,
                 total_paid: 0.0,
                 payment_records: vec![],
+                settlement_audit_events: vec![],
                 next_invoice_seq: 1,
                 next_payment_seq: 1,
             },
@@ -261,7 +471,15 @@ impl Default for AppState {
         Self {
             tasks: Arc::new(Mutex::new(tasks)),
             provider_addr: DEFAULT_PROVIDER_ADDR.to_string(),
+            settlement_gateway: Arc::new(Mutex::new(make_settlement_gateway())),
         }
+    }
+}
+
+fn make_settlement_gateway() -> Box<dyn SettlementGateway + Send> {
+    match SettlementGatewayMode::from_env() {
+        SettlementGatewayMode::Mock => Box::<MockSettlementGateway>::default(),
+        SettlementGatewayMode::Fiber => Box::new(FiberSettlementGateway::new()),
     }
 }
 
@@ -310,6 +528,7 @@ fn update_evidence_for_runtime(task: &mut TaskRuntime, polled: &ProviderJobStatu
         .iter()
         .map(|p| format!("{}:{}:{:?}:{:.6}", p.invoice_id, p.payment_id, p.window_indexes, p.amount_paid))
         .collect();
+    task.evidence_bundle.conflict_records = task.settlement_audit_events.clone();
     task.evidence_bundle.stall_records = task
         .last_audit_event
         .as_ref()
@@ -383,46 +602,99 @@ fn bundle_to_view(bundle: &EvidenceBundle) -> EvidenceBundleView {
     }
 }
 
-fn maybe_merge_and_mock_pay(task: &mut TaskRuntime) {
+fn maybe_merge_and_settle(
+    task: &mut TaskRuntime,
+    gateway: &mut (dyn SettlementGateway + Send),
+) {
     while task.pending_windows.len() >= task.merge_window_count {
         let windows: Vec<WindowCharge> = task
             .pending_windows
             .drain(0..task.merge_window_count)
             .collect();
 
-        let start = windows.first().map(|w| w.window_index).unwrap_or(0);
-        let end = windows.last().map(|w| w.window_index).unwrap_or(0);
-        let invoice_id = format!("inv-{}-{}-{}", task.task_id, start, end);
+        let invoice = match gateway.create_invoice(task, &windows) {
+            Ok(v) => v,
+            Err(err) => {
+                task.pending_windows.splice(0..0, windows.into_iter());
+                eprintln!("settlement gateway error category={} detail={}", err.code, err.message);
+                task.settlement_audit_events.push(format!(
+                    "method=create_invoice request_sent=true status={} detail={}",
+                    err.code, err.message
+                ));
+                task.last_audit_event = Some(format!("settlement_error:{}:{}", err.code, err.message));
+                task.stall_status = "pause".to_string();
+                break;
+            }
+        };
+        task.settlement_audit_events.push(format!(
+            "method=create_invoice request_sent=true status=success invoice_id={}",
+            invoice.invoice_id
+        ));
 
-        if task.payment_records.iter().any(|p| p.invoice_id == invoice_id) {
-            continue;
+        let payment = match gateway.settle_payment(task, &invoice, &windows) {
+            Ok(v) => v,
+            Err(err) => {
+                task.pending_windows.splice(0..0, windows.into_iter());
+                eprintln!("settlement gateway error category={} detail={}", err.code, err.message);
+                task.settlement_audit_events.push(format!(
+                    "method=settle_payment request_sent=true status={} detail={}",
+                    err.code, err.message
+                ));
+                task.last_audit_event = Some(format!("settlement_error:{}:{}", err.code, err.message));
+                task.stall_status = "pause".to_string();
+                break;
+            }
+        };
+        task.settlement_audit_events.push(format!(
+            "method=settle_payment request_sent=true status=success payment_id={} invoice_id={}",
+            payment.payment_id, invoice.invoice_id
+        ));
+
+        if let Err(err) = gateway.record_result(task, &invoice, &payment) {
+            task.pending_windows.splice(0..0, windows.into_iter());
+            eprintln!("settlement gateway error category={} detail={}", err.code, err.message);
+            task.settlement_audit_events.push(format!(
+                "method=record_result request_sent=false status={} detail={}",
+                err.code, err.message
+            ));
+            task.last_audit_event = Some(format!("settlement_error:{}:{}", err.code, err.message));
+            task.stall_status = "pause".to_string();
+            break;
         }
-
-        let payment_id = format!("pay-{}-{}", task.task_id, task.next_payment_seq);
-        task.next_invoice_seq += 1;
-        task.next_payment_seq += 1;
+        task.settlement_audit_events.push(format!(
+            "method=record_result request_sent=false status=success_local_placeholder invoice_id={} payment_id={}",
+            invoice.invoice_id, payment.payment_id
+        ));
 
         let amount_paid: f64 = windows.iter().map(|w| w.owed_window).sum();
         let window_indexes: Vec<u64> = windows.iter().map(|w| w.window_index).collect();
+        for w in &window_indexes {
+            task.settled_windows.insert(*w);
+        }
         if let Some(max_w) = window_indexes.iter().max() {
             task.last_settled_window_index = *max_w;
         }
 
         task.total_paid += amount_paid;
-        task.last_invoice_id = Some(invoice_id.clone());
-        task.last_payment_id = Some(payment_id.clone());
-        task.last_audit_event = Some("mock_payment_committed".to_string());
+        task.last_invoice_id = Some(invoice.invoice_id.clone());
+        task.last_payment_id = Some(payment.payment_id.clone());
+        task.last_audit_event = Some("settlement_committed".to_string());
 
         task.payment_records.push(PaymentRecord {
-            invoice_id,
-            payment_id,
+            invoice_id: invoice.invoice_id,
+            payment_id: payment.payment_id,
             window_indexes,
             amount_paid,
         });
     }
 }
 
-fn apply_provider_poll(task: &mut TaskRuntime, polled: &ProviderJobStatusPoll, now_secs: u64) {
+fn apply_provider_poll(
+    task: &mut TaskRuntime,
+    polled: &ProviderJobStatusPoll,
+    now_secs: u64,
+    gateway: &mut (dyn SettlementGateway + Send),
+) {
     let previous_window = task.last_window_index;
     let polled_window = polled.window_index.unwrap_or(task.last_window_index);
     let polled_owed = polled.owed_window.unwrap_or(0.0);
@@ -441,7 +713,7 @@ fn apply_provider_poll(task: &mut TaskRuntime, polled: &ProviderJobStatusPoll, n
             task.spent += polled_owed;
             task.last_progress_at_secs = now_secs;
             task.last_audit_event = Some("provider_window_advanced".to_string());
-            maybe_merge_and_mock_pay(task);
+            maybe_merge_and_settle(task, gateway);
         }
     }
 
@@ -563,8 +835,12 @@ async fn poll_once(state: &AppState, now_secs: u64) {
     for (task_id, provider_job_id) in tasks_to_poll {
         if let Some(polled) = fetch_provider_status(&state.provider_addr, &provider_job_id).await {
             let mut tasks = state.tasks.lock().expect("tasks lock poisoned");
+            let mut gateway = state
+                .settlement_gateway
+                .lock()
+                .expect("settlement gateway lock poisoned");
             if let Some(task) = tasks.get_mut(&task_id) {
-                apply_provider_poll(task, &polled, now_secs);
+                apply_provider_poll(task, &polled, now_secs, &mut **gateway);
             }
         }
     }
@@ -728,6 +1004,16 @@ async fn get_task_receipt(
         last_payment_id: runtime.last_payment_id.clone(),
         total_paid: runtime.total_paid,
         last_settled_window_index: runtime.last_settled_window_index,
+        payment_records: runtime
+            .payment_records
+            .iter()
+            .map(|r| PaymentRecordView {
+                invoice_id: r.invoice_id.clone(),
+                payment_id: r.payment_id.clone(),
+                window_indexes: r.window_indexes.clone(),
+                amount_paid: r.amount_paid,
+            })
+            .collect(),
     };
 
     (StatusCode::OK, Json(receipt)).into_response()
@@ -736,12 +1022,15 @@ async fn get_task_receipt(
 #[tokio::main]
 async fn main() {
     let runtime_cfg = load_runtime_config();
+    let fiber_probe = FiberRpcClient::default();
     println!(
-        "agentd runtime network={} prefix={} mainnet_ready={} settlement_mode={}",
+        "agentd runtime network={} prefix={} mainnet_ready={} settlement_mode={} settlement_gateway={} fiber_endpoint={}",
         runtime_cfg.network.as_str(),
         runtime_cfg.address_prefix,
         runtime_cfg.mainnet_ready,
-        runtime_cfg.settlement_mode.as_str()
+        runtime_cfg.settlement_mode.as_str(),
+        SettlementGatewayMode::from_env().as_str(),
+        fiber_probe.endpoint().unwrap_or("<not_configured>")
     );
 
     let state = AppState::default();
@@ -761,8 +1050,39 @@ mod tests {
         body::{to_bytes, Body},
         http::Request,
     };
+    use std::net::TcpListener;
+    use std::thread;
     use serde_json::Value;
     use tower::ServiceExt;
+
+    fn start_mock_fiber_rpc_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock fiber rpc");
+        let addr = listener.local_addr().expect("mock fiber rpc addr");
+        thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0_u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.contains("\"method\":\"create_invoice\"") {
+                    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"invoice_id\":\"inv-fiber-ok\",\"window_start\":1,\"window_end\":2,\"amount_shannons\":500000000}}"
+                } else if req.contains("\"method\":\"settle_payment\"") {
+                    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"payment_id\":\"pay-fiber-ok\",\"invoice_id\":\"inv-fiber-ok\",\"status\":\"submitted\"}}"
+                } else {
+                    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}"
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
 
     fn polled(window_index: u64, owed: f64, status: &str) -> ProviderJobStatusPoll {
         ProviderJobStatusPoll {
@@ -782,11 +1102,12 @@ mod tests {
     async fn creates_mock_payment_after_two_windows_default_30s() {
         let state = AppState::default();
         {
+            let mut gateway = MockSettlementGateway;
             let mut tasks = state.tasks.lock().unwrap();
             let task = tasks.get_mut("task-demo").unwrap();
             task.merge_window_count = 2;
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 2);
-            apply_provider_poll(task, &polled(2, 3.0, "running"), 4);
+            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway);
+            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway);
 
             assert!(task.last_payment_id.is_some());
             assert!(task.last_invoice_id.is_some());
@@ -799,11 +1120,12 @@ mod tests {
     async fn merges_correctly_in_4_window_mode_60s() {
         let state = AppState::default();
         {
+            let mut gateway = MockSettlementGateway;
             let mut tasks = state.tasks.lock().unwrap();
             let task = tasks.get_mut("task-demo").unwrap();
             task.merge_window_count = 4;
             for (i, owed) in [(1, 1.0), (2, 1.5), (3, 2.0), (4, 2.5)] {
-                apply_provider_poll(task, &polled(i, owed, "running"), i * 2);
+                apply_provider_poll(task, &polled(i, owed, "running"), i * 2, &mut gateway);
             }
             assert_eq!(task.total_paid, 7.0);
             assert_eq!(task.last_settled_window_index, 4);
@@ -815,11 +1137,12 @@ mod tests {
     async fn same_window_not_counted_twice_for_payment() {
         let state = AppState::default();
         {
+            let mut gateway = MockSettlementGateway;
             let mut tasks = state.tasks.lock().unwrap();
             let task = tasks.get_mut("task-demo").unwrap();
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 2);
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 4);
-            apply_provider_poll(task, &polled(2, 3.0, "running"), 6);
+            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway);
+            apply_provider_poll(task, &polled(1, 2.0, "running"), 4, &mut gateway);
+            apply_provider_poll(task, &polled(2, 3.0, "running"), 6, &mut gateway);
 
             assert_eq!(task.spent, 5.0);
             assert_eq!(task.payment_records.len(), 1);
@@ -831,10 +1154,11 @@ mod tests {
     async fn receipt_amount_matches_payment_records() {
         let state = AppState::default();
         {
+            let mut gateway = MockSettlementGateway;
             let mut tasks = state.tasks.lock().unwrap();
             let task = tasks.get_mut("task-demo").unwrap();
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 2);
-            apply_provider_poll(task, &polled(2, 3.0, "running"), 4);
+            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway);
+            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway);
 
             let paid_sum: f64 = task.payment_records.iter().map(|p| p.amount_paid).sum();
             assert_eq!(task.total_paid, paid_sum);
@@ -857,16 +1181,127 @@ mod tests {
     async fn budget_and_stall_still_apply_during_mock_payment() {
         let state = AppState::default();
         {
+            let mut gateway = MockSettlementGateway;
             let mut tasks = state.tasks.lock().unwrap();
             let task = tasks.get_mut("task-demo").unwrap();
             task.budget_max = 3.0;
             task.stall_sla_secs = 4;
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 2);
-            apply_provider_poll(task, &polled(2, 2.0, "running"), 4);
-            apply_provider_poll(task, &polled(2, 2.0, "running"), 12);
+            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway);
+            apply_provider_poll(task, &polled(2, 2.0, "running"), 4, &mut gateway);
+            apply_provider_poll(task, &polled(2, 2.0, "running"), 12, &mut gateway);
             assert!(task.status == "pause" || task.status == "stop");
             assert!(task.stall_status == "pause" || task.stall_status == "stop");
         }
+    }
+
+    #[tokio::test]
+    async fn fiber_mode_returns_safe_unavailable_error_without_panic() {
+        let state = AppState::default();
+        {
+            let cfg = common::runtime_config::RuntimeConfig {
+                network: common::runtime_config::Network::Testnet,
+                address_prefix: "ckt".to_string(),
+                mainnet_ready: false,
+                settlement_mode: common::runtime_config::SettlementMode::Merge30s,
+            };
+            let rpc = FiberRpcClient::new(cfg, None);
+            let mut gateway = FiberSettlementGateway::from_client(rpc);
+            let mut tasks = state.tasks.lock().unwrap();
+            let task = tasks.get_mut("task-demo").unwrap();
+            task.merge_window_count = 2;
+            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway);
+            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway);
+            assert!(task.last_payment_id.is_none());
+            assert!(task
+                .last_audit_event
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("settlement_error:not_configured"));
+        }
+    }
+
+    #[tokio::test]
+    async fn fiber_mode_invalid_endpoint_returns_rpc_unreachable() {
+        let state = AppState::default();
+        {
+            let cfg = common::runtime_config::RuntimeConfig {
+                network: common::runtime_config::Network::Testnet,
+                address_prefix: "ckt".to_string(),
+                mainnet_ready: false,
+                settlement_mode: common::runtime_config::SettlementMode::Merge30s,
+            };
+            let rpc = FiberRpcClient::new(cfg, Some("http://127.0.0.1:1".to_string()));
+            let mut gateway = FiberSettlementGateway::from_client(rpc);
+            let mut tasks = state.tasks.lock().unwrap();
+            let task = tasks.get_mut("task-demo").unwrap();
+            task.merge_window_count = 2;
+            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway);
+            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway);
+            assert!(task.last_payment_id.is_none());
+            assert!(task
+                .last_audit_event
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("settlement_error:rpc_unreachable"));
+            assert!(task
+                .settlement_audit_events
+                .iter()
+                .any(|e| e.contains("status=rpc_unreachable")));
+            assert!(task
+                .evidence_bundle
+                .conflict_records
+                .iter()
+                .any(|e| e.contains("rpc_unreachable")));
+        }
+    }
+
+    #[tokio::test]
+    async fn fiber_success_writes_back_runtime_receipt_evidence_and_audit() {
+        let state = AppState::default();
+        {
+            let cfg = common::runtime_config::RuntimeConfig {
+                network: common::runtime_config::Network::Testnet,
+                address_prefix: "ckt".to_string(),
+                mainnet_ready: false,
+                settlement_mode: common::runtime_config::SettlementMode::Merge30s,
+            };
+            let endpoint = start_mock_fiber_rpc_server();
+            let rpc = FiberRpcClient::new(cfg, Some(endpoint));
+            let mut gateway = FiberSettlementGateway::from_client(rpc);
+            let mut tasks = state.tasks.lock().unwrap();
+            let task = tasks.get_mut("task-demo").unwrap();
+            task.merge_window_count = 2;
+            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway);
+            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway);
+
+            assert_eq!(task.last_invoice_id.as_deref(), Some("inv-fiber-ok"));
+            assert_eq!(task.last_payment_id.as_deref(), Some("pay-fiber-ok"));
+            assert_eq!(task.total_paid, 5.0);
+            assert_eq!(task.last_settled_window_index, 2);
+            assert_eq!(task.payment_records.len(), 1);
+            assert!(task
+                .settlement_audit_events
+                .iter()
+                .any(|e| e.contains("method=create_invoice") && e.contains("status=success")));
+            assert!(task
+                .evidence_bundle
+                .conflict_records
+                .iter()
+                .any(|e| e.contains("pay-fiber-ok")));
+        }
+
+        let app = app_with_state(state);
+        let req = Request::builder()
+            .uri("/v1/tasks/task-demo/receipt")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["amount_paid"], 5.0);
+        assert_eq!(json["payment_records"][0]["invoice_id"], "inv-fiber-ok");
+        assert_eq!(json["payment_records"][0]["payment_id"], "pay-fiber-ok");
     }
 
     #[tokio::test]
