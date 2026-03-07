@@ -1,93 +1,105 @@
 # SliceStream
 
-SliceStream is a **work-based billing system** with **0.25s telemetry sampling**, **15s settlement windows**, and **30s/60s merged payment windows**.
+SliceStream is a deterministic work-based billing pipeline that converts telemetry into auditable settlement receipts and merged payments.
 
 ## Architecture (text diagram)
 
-`telemetryd (C++) -> providerd (Rust) -> metering core (Rust) -> agentd (Rust) -> fiber_rpc (Rust) -> external payment rail`
+```text
+cpp/telemetryd (250ms exported samples)
+        -> apps/providerd (window runtime + reconcile view)
+        -> crates/metering (formula + merge rules + hash-chain)
+        -> apps/agentd (settlement orchestration)
+        -> SettlementGateway (mock | fiber)
+        -> crates/fiber_rpc (minimal real RPC path)
 
-`dashboard (Rust SSR)` consumes status, receipts, disputes, and evidence artifacts.
+cpp/qualify -> benchmark_score -> providerd runtime scaling
 
-## Current repository stage
+dashboard (SSR placeholder) reads status/result endpoints.
+```
 
-- Rust + C++ workspace bootstrap exists.
-- Metering logic is being hardened against normative docs.
-- This repository prioritizes deterministic settlement and dispute evidence.
+## Default network profile (contest baseline)
 
-## Local build / run (placeholder-friendly)
+SliceStream defaults to **CKB Testnet**:
+- `network=testnet`
+- address prefix `ckt`
 
-### Build
-- Rust workspace:
-  - `cargo build --workspace`
-- C++ components:
-  - `cmake -S cpp -B cpp/build && cmake --build cpp/build`
-- One-command helper:
-  - `scripts/dev.sh`
+Mainnet-ready config is retained as opt-in only.
 
-### Run (placeholder services)
-- `cargo run -p providerd`
-- `cargo run -p agentd`
-- `cargo run -p dashboard`
-- `./cpp/build/telemetryd/telemetryd`
-- `./cpp/build/qualify/qualify`
-
-## How to demo
-
-Use the runbook in `docs/project-charter.md` (section: 90–120s Demo Script), then execute acceptance checks from `docs/acceptance.md`.
-
-
-## Network profile (default: CKB Testnet)
-
-SliceStream now defaults to **CKB Testnet** for the contest/runtime profile:
-- `network = testnet`
-- CKB address prefix = `ckt`
-
-Mainnet-ready configuration remains available behind an explicit switch in `config/network.toml` (`network = mainnet`, prefix `ckb`).
-
-### Switch network configuration
-
-1. Open `config/network.toml`.
-2. Keep default testnet:
-   - `network = "testnet"`
-   - `ckb_address_prefix = "ckt"`
-3. To switch to mainnet-ready mode:
-   - `network = "mainnet"`
-   - `mainnet_ready = true`
-   - use `mainnet_address_prefix = "ckb"`
-
-### Example commands (default to testnet/ckt)
+## Build
 
 ```bash
-export SLICESTREAM_NETWORK=testnet
-export CKB_ADDRESS_PREFIX=ckt
+cargo build --workspace
+cmake -S cpp -B cpp/build && cmake --build cpp/build
+```
+
+## Run
+
+### 1) Start Provider (reads qualify + telemetryd if available)
+
+```bash
 cargo run -p providerd
 ```
 
+### 2) Start Agent (mock settlement by default)
+
 ```bash
-export SLICESTREAM_NETWORK=testnet
-export CKB_ADDRESS_PREFIX=ckt
 cargo run -p agentd
 ```
 
+### 3) Optional UI placeholder
+
 ```bash
-export SLICESTREAM_NETWORK=testnet
-export CKB_ADDRESS_PREFIX=ckt
 cargo run -p dashboard
 ```
 
-## Durable project memory (single source of truth)
+## Settlement modes
 
-All normative behavior is defined in `docs/`. Treat these files as the **only source of truth**:
-- `docs/project-charter.md`
-- `docs/hard-requirements.md`
-- `docs/state-machine.md`
-- `docs/evidence.md`
-- `docs/acceptance.md`
-- `docs/api-contract.yaml`
+### Mock mode (default)
+- `settlement_mode=mock` (or no override)
+- merged payments are produced by `MockSettlementGateway`
+- best for repeatable demo/acceptance runs
 
-## API compatibility policy
+### Fiber mode
+- `settlement_mode=fiber`
+- uses `FiberSettlementGateway` + `crates/fiber_rpc`
+- if endpoint is missing/unreachable, system returns structured safe errors (no panic)
 
-Backward compatibility is mandatory:
-- do not change existing API paths,
-- do not remove/rename existing required fields,
-- only add optional fields with explicit semantic descriptions.
+Example (Fiber mode):
+
+```bash
+export SLICESTREAM_SETTLEMENT_MODE=fiber
+export SLICESTREAM_FIBER_RPC_ENDPOINT=http://127.0.0.1:8227
+cargo run -p agentd
+```
+
+## What is complete vs future
+
+### Completed now
+- Deterministic metering constants and merge rules (250ms / 15s / 60 samples, 30s/60s merge).
+- Telemetry pipeline with C++ telemetryd integration and Provider fallback path.
+- Provider qualification tri-test (`cpp/qualify`) and benchmark-score scaling in Provider runtime.
+- Mock/Fiber gateway branching with structured Fiber failure categories.
+- Receipt/evidence/audit and Provider-Agent reconciliation flow.
+
+### Future extension
+- Fiber `record_result` remains minimal/placeholder-oriented and can be expanded to full on-chain writeback semantics.
+- Production-grade dashboard UX and long-term storage/indexing are not finalized in this repo stage.
+
+## Demo + acceptance docs
+
+- 90–120s operator script: `docs/demo-script.md`
+- Technical deep dive: `docs/technical-breakdown.md`
+- Executable acceptance commands: `docs/acceptance.md`
+- Project scope and commitments: `docs/project-charter.md`
+
+## Submission Checklist
+
+Before final handoff, verify this package is complete:
+
+- **Repo**: clean branch with docs + code aligned to the final submission scope.
+- **Testable version**: all acceptance commands in `docs/acceptance.md` are runnable in order.
+- **Screenshots**: include key service/status screenshots used in slides or submission form.
+- **Video**: record the 90–120s flow from `docs/demo-script.md` (plus fallback scenario).
+- **Summary**: short problem/solution/value summary for judges.
+- **Technical breakdown**: attach/link `docs/technical-breakdown.md` in submission materials.
+

@@ -605,6 +605,7 @@ fn bundle_to_view(bundle: &EvidenceBundle) -> EvidenceBundleView {
 fn maybe_merge_and_settle(
     task: &mut TaskRuntime,
     gateway: &mut (dyn SettlementGateway + Send),
+    provider_addr: &str,
 ) {
     while task.pending_windows.len() >= task.merge_window_count {
         let windows: Vec<WindowCharge> = task
@@ -686,6 +687,30 @@ fn maybe_merge_and_settle(
             window_indexes,
             amount_paid,
         });
+
+        let latest = task.payment_records.last().expect("just pushed record");
+        match notify_provider_reconciliation(
+            provider_addr,
+            &task.provider_job_id,
+            &latest.invoice_id,
+            &latest.payment_id,
+            &latest.window_indexes,
+            latest.amount_paid,
+        ) {
+            Ok(()) => {
+                task.settlement_audit_events.push(format!(
+                    "method=provider_reconcile request_sent=true status=success invoice_id={} payment_id={}",
+                    latest.invoice_id, latest.payment_id
+                ));
+            }
+            Err(detail) => {
+                task.settlement_audit_events.push(format!(
+                    "method=provider_reconcile request_sent=true status=rpc_error detail={}",
+                    detail
+                ));
+                task.last_audit_event = Some("provider_reconcile_failed".to_string());
+            }
+        }
     }
 }
 
@@ -694,6 +719,7 @@ fn apply_provider_poll(
     polled: &ProviderJobStatusPoll,
     now_secs: u64,
     gateway: &mut (dyn SettlementGateway + Send),
+    provider_addr: &str,
 ) {
     let previous_window = task.last_window_index;
     let polled_window = polled.window_index.unwrap_or(task.last_window_index);
@@ -713,7 +739,7 @@ fn apply_provider_poll(
             task.spent += polled_owed;
             task.last_progress_at_secs = now_secs;
             task.last_audit_event = Some("provider_window_advanced".to_string());
-            maybe_merge_and_settle(task, gateway);
+            maybe_merge_and_settle(task, gateway, provider_addr);
         }
     }
 
@@ -750,6 +776,55 @@ fn apply_provider_poll(
     }
 
     update_evidence_for_runtime(task, polled, now_secs);
+}
+
+fn notify_provider_reconciliation(
+    provider_addr: &str,
+    job_id: &str,
+    invoice_id: &str,
+    payment_id: &str,
+    window_indexes: &[u64],
+    amount_paid: f64,
+) -> Result<(), String> {
+    let mut stream = StdTcpStream::connect(provider_addr)
+        .map_err(|e| format!("connect provider {provider_addr} failed: {e}"))?;
+    let window_indexes_json = window_indexes
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = format!(
+        "{{\"job_id\":\"{}\",\"invoice_id\":\"{}\",\"payment_id\":\"{}\",\"window_indexes\":[{}],\"amount_paid\":{:.6}}}",
+        escape_json_string(job_id),
+        escape_json_string(invoice_id),
+        escape_json_string(payment_id),
+        window_indexes_json,
+        amount_paid
+    );
+    let req = format!(
+        "POST /internal/provider/reconcile HTTP/1.1\r\nHost: {provider_addr}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(), body
+    );
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("send reconcile request failed: {e}"))?;
+
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read reconcile response failed: {e}"))?;
+    let text = String::from_utf8(buf).map_err(|e| format!("invalid utf8 reconcile response: {e}"))?;
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "malformed reconcile response".to_string())?;
+    if !head.contains(" 200 ") {
+        return Err(format!("provider reconcile non-200: {head}; body={body}"));
+    }
+    Ok(())
+}
+
+fn escape_json_string(v: &str) -> String {
+    v.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 async fn fetch_provider_status(provider_addr: &str, job_id: &str) -> Option<ProviderJobStatusPoll> {
@@ -840,7 +915,13 @@ async fn poll_once(state: &AppState, now_secs: u64) {
                 .lock()
                 .expect("settlement gateway lock poisoned");
             if let Some(task) = tasks.get_mut(&task_id) {
-                apply_provider_poll(task, &polled, now_secs, &mut **gateway);
+                apply_provider_poll(
+                    task,
+                    &polled,
+                    now_secs,
+                    &mut **gateway,
+                    &state.provider_addr,
+                );
             }
         }
     }
@@ -1106,8 +1187,8 @@ mod tests {
             let mut tasks = state.tasks.lock().unwrap();
             let task = tasks.get_mut("task-demo").unwrap();
             task.merge_window_count = 2;
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway);
-            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway);
+            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway, &state.provider_addr);
+            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway, &state.provider_addr);
 
             assert!(task.last_payment_id.is_some());
             assert!(task.last_invoice_id.is_some());
@@ -1125,7 +1206,7 @@ mod tests {
             let task = tasks.get_mut("task-demo").unwrap();
             task.merge_window_count = 4;
             for (i, owed) in [(1, 1.0), (2, 1.5), (3, 2.0), (4, 2.5)] {
-                apply_provider_poll(task, &polled(i, owed, "running"), i * 2, &mut gateway);
+                apply_provider_poll(task, &polled(i, owed, "running"), i * 2, &mut gateway, &state.provider_addr);
             }
             assert_eq!(task.total_paid, 7.0);
             assert_eq!(task.last_settled_window_index, 4);
@@ -1140,9 +1221,9 @@ mod tests {
             let mut gateway = MockSettlementGateway;
             let mut tasks = state.tasks.lock().unwrap();
             let task = tasks.get_mut("task-demo").unwrap();
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway);
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 4, &mut gateway);
-            apply_provider_poll(task, &polled(2, 3.0, "running"), 6, &mut gateway);
+            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway, &state.provider_addr);
+            apply_provider_poll(task, &polled(1, 2.0, "running"), 4, &mut gateway, &state.provider_addr);
+            apply_provider_poll(task, &polled(2, 3.0, "running"), 6, &mut gateway, &state.provider_addr);
 
             assert_eq!(task.spent, 5.0);
             assert_eq!(task.payment_records.len(), 1);
@@ -1157,8 +1238,8 @@ mod tests {
             let mut gateway = MockSettlementGateway;
             let mut tasks = state.tasks.lock().unwrap();
             let task = tasks.get_mut("task-demo").unwrap();
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway);
-            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway);
+            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway, &state.provider_addr);
+            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway, &state.provider_addr);
 
             let paid_sum: f64 = task.payment_records.iter().map(|p| p.amount_paid).sum();
             assert_eq!(task.total_paid, paid_sum);
@@ -1186,9 +1267,9 @@ mod tests {
             let task = tasks.get_mut("task-demo").unwrap();
             task.budget_max = 3.0;
             task.stall_sla_secs = 4;
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway);
-            apply_provider_poll(task, &polled(2, 2.0, "running"), 4, &mut gateway);
-            apply_provider_poll(task, &polled(2, 2.0, "running"), 12, &mut gateway);
+            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway, &state.provider_addr);
+            apply_provider_poll(task, &polled(2, 2.0, "running"), 4, &mut gateway, &state.provider_addr);
+            apply_provider_poll(task, &polled(2, 2.0, "running"), 12, &mut gateway, &state.provider_addr);
             assert!(task.status == "pause" || task.status == "stop");
             assert!(task.stall_status == "pause" || task.stall_status == "stop");
         }
@@ -1209,8 +1290,8 @@ mod tests {
             let mut tasks = state.tasks.lock().unwrap();
             let task = tasks.get_mut("task-demo").unwrap();
             task.merge_window_count = 2;
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway);
-            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway);
+            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway, &state.provider_addr);
+            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway, &state.provider_addr);
             assert!(task.last_payment_id.is_none());
             assert!(task
                 .last_audit_event
@@ -1235,8 +1316,8 @@ mod tests {
             let mut tasks = state.tasks.lock().unwrap();
             let task = tasks.get_mut("task-demo").unwrap();
             task.merge_window_count = 2;
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway);
-            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway);
+            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway, &state.provider_addr);
+            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway, &state.provider_addr);
             assert!(task.last_payment_id.is_none());
             assert!(task
                 .last_audit_event
@@ -1271,8 +1352,8 @@ mod tests {
             let mut tasks = state.tasks.lock().unwrap();
             let task = tasks.get_mut("task-demo").unwrap();
             task.merge_window_count = 2;
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway);
-            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway);
+            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway, &state.provider_addr);
+            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway, &state.provider_addr);
 
             assert_eq!(task.last_invoice_id.as_deref(), Some("inv-fiber-ok"));
             assert_eq!(task.last_payment_id.as_deref(), Some("pay-fiber-ok"));

@@ -1,92 +1,146 @@
-# Acceptance Commands and Criteria
+# Final Acceptance Commands
 
-This checklist maps hard requirements to executable verification commands.
+This is the final executable checklist for demo/review packaging.
 
-## 1) Window discount logic (30 valid samples)
-- Command:
-  - `cargo test -p metering half_price_when_valid_samples_is_30 -- --exact --nocapture`
-- Expected:
-  - test passes,
-  - computed `active_ratio = 0.5`,
-  - `owed_window = 0.5 * base_owed`.
+## A) Build + baseline
 
-## 2) Boundary: valid_samples = 0
-- Command:
-  - `cargo test -p metering zero_valid_samples_means_zero_owed -- --exact --nocapture`
-- Expected:
-  - test passes,
-  - `owed_window = 0`.
+```bash
+cargo test --workspace
+cmake -S cpp -B cpp/build && cmake --build cpp/build
+ctest --test-dir cpp/build/telemetryd --output-on-failure
+ctest --test-dir cpp/build/qualify --output-on-failure
+```
 
-## 3) Boundary: work_units_window = 0
-- Command:
-  - `cargo test -p metering zero_work_units_means_zero_owed -- --exact --nocapture`
-- Expected:
-  - test passes,
-  - `owed_window = 0` regardless of valid samples.
+Expected:
+- Rust workspace tests pass.
+- C++ targets build.
+- telemetryd and qualify self-tests pass.
 
-## 4) Boundary: valid_samples = 60
-- Command:
-  - `cargo test -p metering full_valid_samples_means_base_owed -- --exact --nocapture`
-- Expected:
-  - test passes,
-  - `owed_window = base_owed`.
+---
 
-## 5) Merge payment: 30s / 2 windows
-- Command:
-  - `cargo test -p metering merge_2_windows_total_is_correct -- --exact --nocapture`
-- Expected:
-  - test passes,
-  - invoice emitted exactly after 2 windows,
-  - merged amount equals sum of `owed_window` for those windows.
+## B) Mock settlement mode (default)
 
-## 6) Merge payment: 60s / 4 windows
-- Command:
-  - `cargo test -p metering merge_4_windows_total_is_correct -- --exact --nocapture`
-- Expected:
-  - test passes,
-  - invoice emitted exactly after 4 windows,
-  - merged amount equals sum of `owed_window` for those windows.
+### Start services
 
-## 7) Cross-job merge rejection
-- Command:
-  - `cargo test -p metering merge_cannot_cross_jobs -- --exact --nocapture`
-- Expected:
-  - test passes,
-  - explicit cross-job merge error observed.
+```bash
+cargo run -p providerd
+cargo run -p agentd
+```
 
-## 8) Hash-chain tamper sensitivity
-- Command:
-  - `cargo test -p metering tampering_any_covered_receipt_field_changes_root_hash -- --exact --nocapture`
-- Expected:
-  - test passes,
-  - `root_hash` differs after receipt field mutation.
+### Verify Agent task/receipt view
 
-## 9) Idempotency conflict (409-equivalent)
-- Command:
-  - `cargo test -p common idempotency::tests::idempotency_same_key_different_payload_conflict -- --exact --nocapture`
-- Expected:
-  - conflict result equivalent to `409`,
-  - conflict contains existing `payment_id`.
+```bash
+curl -s http://127.0.0.1:4002/v1/agent/tasks/task-demo | jq
+curl -s http://127.0.0.1:4002/v1/agent/tasks/task-demo/receipt | jq
+```
 
-## 10) Stall detector safe-stop
-- Command:
-  - `cargo test -p common stall::tests::stall_detector_blocks_irreversible_confirm -- --exact --nocapture`
-- Expected:
-  - stall state entered after configured threshold,
-  - recommended action is `STOP`,
-  - audit event is emitted.
+Expected:
+- merged settlement fields evolve over time (`last_payment_id`, `total_paid`, `last_settled_window_index`).
+- receipt/evidence fields remain internally consistent.
 
-## 11) Evidence bundle export and verify
-- Command:
-  - `cargo test -p common evidence::tests::evidence_bundle_export_and_verify -- --exact --nocapture`
-- Expected:
-  - bundle root is generated,
-  - `verify(bundle, root)` returns true,
-  - tampered bundle verification returns false.
+---
 
-## 12) Full suite gate
-- Command:
-  - `cargo test -p metering -- --nocapture`
-  - `cargo test -p common -- --nocapture`
-- Expected:
-  - all required hard-rule tests pass.
+## C) Fiber settlement mode (minimal real RPC path)
+
+### 1) Not configured endpoint
+
+```bash
+SLICESTREAM_SETTLEMENT_MODE=fiber cargo run -p agentd
+```
+
+Expected:
+- process keeps running.
+- structured `not_configured` style behavior appears; no panic.
+
+### 2) Configured but unreachable endpoint
+
+```bash
+SLICESTREAM_SETTLEMENT_MODE=fiber \
+SLICESTREAM_FIBER_RPC_ENDPOINT=http://127.0.0.1:8227 \
+cargo run -p agentd
+```
+
+Expected:
+- structured `rpc_unreachable` style behavior appears; no panic.
+
+---
+
+## D) Qualify mode / benchmark-score integration
+
+### 1) Qualify available
+
+```bash
+./cpp/build/qualify/qualify
+cargo run -p providerd
+```
+
+Expected:
+- providerd logs benchmark score loaded from qualify.
+- status/result surfaces include benchmark-influenced runtime output (e.g., summary/signature with benchmark context).
+
+### 2) Qualify unavailable (safe fallback)
+
+```bash
+SLICESTREAM_QUALIFY_CMD=/no/such/qualify cargo run -p providerd
+```
+
+Expected:
+- default benchmark score fallback is logged clearly.
+- no panic; service continues.
+
+---
+
+## E) Final demo command pack (copy/paste)
+
+```bash
+# terminal-1
+cargo run -p providerd
+
+# terminal-2
+cargo run -p agentd
+
+# terminal-3 (observe)
+curl -s http://127.0.0.1:4002/v1/agent/tasks/task-demo | jq
+curl -s http://127.0.0.1:4002/v1/agent/tasks/task-demo/receipt | jq
+curl -s http://127.0.0.1:4001/v1/provider/jobs/job-demo | jq
+curl -s http://127.0.0.1:4001/v1/provider/jobs/job-demo/result | jq
+```
+
+
+## F) 最终一键命令顺序（评委执行顺序）
+
+```bash
+# 0) build + test
+cargo test --workspace
+cmake -S cpp -B cpp/build && cmake --build cpp/build
+ctest --test-dir cpp/build/telemetryd --output-on-failure
+ctest --test-dir cpp/build/qualify --output-on-failure
+
+# 1) run provider (terminal-1)
+cargo run -p providerd
+
+# 2) run agent (terminal-2, mock default)
+cargo run -p agentd
+
+# 3) observe agent/provider views (terminal-3)
+curl -s http://127.0.0.1:4002/v1/agent/tasks/task-demo | jq
+curl -s http://127.0.0.1:4002/v1/agent/tasks/task-demo/receipt | jq
+curl -s http://127.0.0.1:4001/v1/provider/jobs/job-demo | jq
+curl -s http://127.0.0.1:4001/v1/provider/jobs/job-demo/result | jq
+
+# 4) optional fiber graceful-failure demo (restart agent)
+SLICESTREAM_SETTLEMENT_MODE=fiber \
+SLICESTREAM_FIBER_RPC_ENDPOINT=http://127.0.0.1:8227 \
+cargo run -p agentd
+
+# 5) fallback to mock immediately if fiber endpoint unavailable
+unset SLICESTREAM_SETTLEMENT_MODE
+unset SLICESTREAM_FIBER_RPC_ENDPOINT
+cargo run -p agentd
+```
+
+Expected:
+- Steps 0–3 always form the main pass path.
+- Step 4 demonstrates fiber error categorization without panic.
+- Step 5 is the rapid fallback path to keep demo continuity.
+
