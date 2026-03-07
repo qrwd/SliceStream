@@ -1,0 +1,10 @@
+# SliceStream network profile
+# Default for contest/runtime demos: CKB Testnet
+network = "testnet"
+ckb_address_prefix = "ckt"
+ckb_rpc_url = "https://testnet.ckb.dev/rpc"
+
+# Keep mainnet-ready switch in config (disabled by default)
+mainnet_ready = false
+mainnet_address_prefix = "ckb"
+mainnet_rpc_url = "https://mainnet.ckb.dev/rpc"
