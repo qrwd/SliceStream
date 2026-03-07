@@ -7,6 +7,12 @@ use axum::{
 };
 use common::{
     idempotency::{make_key, record_payment},
+    market::{
+        MatchRecord, ProviderCapabilities, ProviderHardwareInfo, ProviderPricingInfo,
+        ProviderRegistryEntry, SellOrder, MARKET_ROUTE_MATCHES, MARKET_ROUTE_PROVIDERS,
+        MARKET_ROUTE_SELL_ORDERS, ORDER_STATUS_LOCKED, ORDER_STATUS_MATCHED, ORDER_STATUS_OPEN,
+        ORDER_STATUS_SETTLED, ORDER_STATUS_SETTLING,
+    },
     runtime_config::load_runtime_config,
 };
 use serde::{Deserialize, Serialize};
@@ -128,6 +134,12 @@ struct NotFoundError {
     error: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+struct OrderActionResponse {
+    status: &'static str,
+    order_id: String,
+}
+
 #[derive(Debug, Clone)]
 struct WindowAccumulator {
     sample_count: u64,
@@ -184,6 +196,9 @@ struct TelemetryFeed {
 #[derive(Clone)]
 struct AppState {
     jobs: Arc<Mutex<HashMap<String, JobRuntime>>>,
+    provider_registry: Arc<Mutex<Vec<ProviderRegistryEntry>>>,
+    sell_orders: Arc<Mutex<Vec<SellOrder>>>,
+    match_records: Arc<Mutex<Vec<MatchRecord>>>,
 }
 
 impl AppState {
@@ -227,8 +242,51 @@ impl AppState {
                 reconciliation_last_error: None,
             },
         );
+        let provider_registry = vec![ProviderRegistryEntry {
+            provider_id: "provider-demo".to_string(),
+            display_name: "Provider Demo".to_string(),
+            benchmark_score,
+            telemetry_source: "mock".to_string(),
+            status: "online".to_string(),
+            hardware: ProviderHardwareInfo {
+                gpu_model: "RTX-4090".to_string(),
+                gpu_count: 1,
+                vram_gb: 24,
+                cpu_model: "Ryzen-7950X".to_string(),
+                ram_gb: 64,
+            },
+            pricing: ProviderPricingInfo {
+                unit_price_per_work_unit: 0.05,
+                min_order_work_units: 5.0,
+                currency: "USD".to_string(),
+            },
+            capabilities: ProviderCapabilities {
+                supports_fp16: true,
+                supports_int8: true,
+                max_context_tokens: 32768,
+                tags: vec!["llm".to_string(), "vision".to_string()],
+            },
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+        }];
+
+        let sell_orders = vec![SellOrder {
+            order_id: "sell-order-demo-1".to_string(),
+            provider_id: "provider-demo".to_string(),
+            provider_job_id: "job-demo".to_string(),
+            unit_price_per_work_unit: 0.05,
+            min_work_units: 5.0,
+            max_work_units: 120.0,
+            capabilities_required: vec!["fp16".to_string(), "llm".to_string()],
+            status: ORDER_STATUS_OPEN.to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }];
+
         Self {
             jobs: Arc::new(Mutex::new(jobs)),
+            provider_registry: Arc::new(Mutex::new(provider_registry)),
+            sell_orders: Arc::new(Mutex::new(sell_orders)),
+            match_records: Arc::new(Mutex::new(vec![])),
         }
     }
 }
@@ -249,7 +307,25 @@ fn app_with_state(state: AppState) -> Router {
         .route("/confirm", post(confirm_payment))
         .route("/internal/provider/reconcile", post(reconcile_payment))
         .route("/v1/provider/jobs/:job_id", get(get_provider_job_status))
-        .route("/v1/provider/jobs/:job_id/result", get(get_provider_job_result))
+        .route(
+            "/v1/provider/jobs/:job_id/result",
+            get(get_provider_job_result),
+        )
+        .route(MARKET_ROUTE_PROVIDERS, get(get_provider_registry))
+        .route(MARKET_ROUTE_SELL_ORDERS, get(get_sell_orders))
+        .route(MARKET_ROUTE_MATCHES, get(get_match_records))
+        .route(
+            "/internal/market/orders/sell/:order_id/lock",
+            post(lock_sell_order),
+        )
+        .route(
+            "/internal/market/orders/sell/:order_id/mark_settling",
+            post(mark_sell_order_settling),
+        )
+        .route(
+            "/internal/market/orders/sell/:order_id/mark_settled",
+            post(mark_sell_order_settled),
+        )
         .with_state(state)
 }
 
@@ -293,7 +369,11 @@ fn load_benchmark_score() -> f64 {
     let cmd = std::env::var("SLICESTREAM_QUALIFY_CMD")
         .unwrap_or_else(|_| DEFAULT_QUALIFY_CMD.to_string());
 
-    let out = match Command::new(&cmd).stdout(Stdio::piped()).stderr(Stdio::null()).output() {
+    let out = match Command::new(&cmd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
         Ok(out) => out,
         Err(err) => {
             println!(
@@ -457,7 +537,12 @@ fn ingest_sample(job: &mut JobRuntime, sample: SampleInput) {
     };
     job.telemetry_sig = format!(
         "sig:w={}:src={}:b={:.2}:a={}:u={:.6}:o={:.6}",
-        job.window_index, job.telemetry_source, job.benchmark_score, job.window_acc.active_samples, work_units_window, owed_window
+        job.window_index,
+        job.telemetry_source,
+        job.benchmark_score,
+        job.window_acc.active_samples,
+        work_units_window,
+        owed_window
     );
     job.last_window_summary = format!(
         "window={} source={} benchmark_score={:.2} active={}/{} work={:.3} owed={:.3}",
@@ -482,7 +567,9 @@ fn ingest_sample(job: &mut JobRuntime, sample: SampleInput) {
 fn advance_all_jobs_one_sample(state: &AppState, external: Option<SampleInput>) {
     let mut jobs = state.jobs.lock().expect("jobs lock poisoned");
     for job in jobs.values_mut() {
-        let sample = external.clone().unwrap_or_else(|| generate_mock_sample(job));
+        let sample = external
+            .clone()
+            .unwrap_or_else(|| generate_mock_sample(job));
         ingest_sample(job, sample);
     }
 }
@@ -492,7 +579,9 @@ fn advance_job_samples(state: &AppState, job_id: &str, n: u64, external: Option<
     let mut jobs = state.jobs.lock().unwrap();
     let job = jobs.get_mut(job_id).expect("job not found");
     for _ in 0..n {
-        let sample = external.clone().unwrap_or_else(|| generate_mock_sample(job));
+        let sample = external
+            .clone()
+            .unwrap_or_else(|| generate_mock_sample(job));
         ingest_sample(job, sample);
     }
 }
@@ -727,6 +816,115 @@ async fn main() {
     axum::serve(listener, app_with_state(state)).await.unwrap();
 }
 
+async fn get_provider_registry(State(state): State<AppState>) -> impl IntoResponse {
+    let registry = state
+        .provider_registry
+        .lock()
+        .expect("provider registry lock")
+        .clone();
+    (StatusCode::OK, Json(registry)).into_response()
+}
+
+async fn get_sell_orders(State(state): State<AppState>) -> impl IntoResponse {
+    let orders = state.sell_orders.lock().expect("sell orders lock").clone();
+    (StatusCode::OK, Json(orders)).into_response()
+}
+
+async fn get_match_records(State(state): State<AppState>) -> impl IntoResponse {
+    let records = state
+        .match_records
+        .lock()
+        .expect("match records lock")
+        .clone();
+    (StatusCode::OK, Json(records)).into_response()
+}
+
+async fn lock_sell_order(
+    State(state): State<AppState>,
+    Path(order_id): Path<String>,
+) -> impl IntoResponse {
+    let mut orders = state.sell_orders.lock().expect("sell orders lock");
+    let Some(order) = orders.iter_mut().find(|o| o.order_id == order_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(OrderActionResponse {
+                status: "order_not_found",
+                order_id,
+            }),
+        )
+            .into_response();
+    };
+
+    if order.status == ORDER_STATUS_OPEN {
+        order.status = ORDER_STATUS_LOCKED.to_string();
+    } else if order.status == ORDER_STATUS_LOCKED {
+        order.status = ORDER_STATUS_MATCHED.to_string();
+    }
+
+    (
+        StatusCode::OK,
+        Json(OrderActionResponse {
+            status: "locked",
+            order_id: order.order_id.clone(),
+        }),
+    )
+        .into_response()
+}
+
+async fn mark_sell_order_settling(
+    State(state): State<AppState>,
+    Path(order_id): Path<String>,
+) -> impl IntoResponse {
+    let mut orders = state.sell_orders.lock().expect("sell orders lock");
+    let Some(order) = orders.iter_mut().find(|o| o.order_id == order_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(OrderActionResponse {
+                status: "order_not_found",
+                order_id,
+            }),
+        )
+            .into_response();
+    };
+
+    order.status = ORDER_STATUS_SETTLING.to_string();
+    (
+        StatusCode::OK,
+        Json(OrderActionResponse {
+            status: "settling",
+            order_id: order.order_id.clone(),
+        }),
+    )
+        .into_response()
+}
+
+async fn mark_sell_order_settled(
+    State(state): State<AppState>,
+    Path(order_id): Path<String>,
+) -> impl IntoResponse {
+    let mut orders = state.sell_orders.lock().expect("sell orders lock");
+    let Some(order) = orders.iter_mut().find(|o| o.order_id == order_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(OrderActionResponse {
+                status: "order_not_found",
+                order_id,
+            }),
+        )
+            .into_response();
+    };
+
+    order.status = ORDER_STATUS_SETTLED.to_string();
+    (
+        StatusCode::OK,
+        Json(OrderActionResponse {
+            status: "settled",
+            order_id: order.order_id.clone(),
+        }),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -918,7 +1116,10 @@ mod tests {
         let jobs = state.jobs.lock().unwrap();
         let job = jobs.get("job-demo").unwrap();
         assert_eq!(job.telemetry_source, "telemetryd");
-        assert_eq!(job.telemetry_summary.active_samples, Some(SAMPLES_PER_WINDOW));
+        assert_eq!(
+            job.telemetry_summary.active_samples,
+            Some(SAMPLES_PER_WINDOW)
+        );
         assert_eq!(job.telemetry_summary.active_ratio, Some(1.0));
     }
 
@@ -965,7 +1166,12 @@ mod tests {
         };
 
         let low_state = AppState::with_benchmark_score(50.0);
-        advance_job_samples(&low_state, "job-demo", SAMPLES_PER_WINDOW, Some(external.clone()));
+        advance_job_samples(
+            &low_state,
+            "job-demo",
+            SAMPLES_PER_WINDOW,
+            Some(external.clone()),
+        );
         let (low_work, low_owed) = {
             let jobs = low_state.jobs.lock().unwrap();
             let job = jobs.get("job-demo").unwrap();
@@ -984,4 +1190,93 @@ mod tests {
         assert!(high_owed > low_owed);
     }
 
+    #[tokio::test]
+    async fn provider_registry_is_readable() {
+        let app = app();
+        let req = Request::builder()
+            .uri(MARKET_ROUTE_PROVIDERS)
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json[0]["provider_id"], "provider-demo");
+        assert_eq!(json[0]["status"], "online");
+        assert_eq!(json[0]["hardware"]["gpu_model"], "RTX-4090");
+    }
+
+    #[tokio::test]
+    async fn sell_orders_are_readable() {
+        let app = app();
+        let req = Request::builder()
+            .uri(MARKET_ROUTE_SELL_ORDERS)
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json[0]["order_id"], "sell-order-demo-1");
+        assert_eq!(json[0]["provider_id"], "provider-demo");
+    }
+
+    #[tokio::test]
+    async fn accepted_flow_locks_sell_order_not_open() {
+        let app = app();
+        let lock_req = Request::builder()
+            .uri("/internal/market/orders/sell/sell-order-demo-1/lock")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let lock_resp = app.clone().oneshot(lock_req).await.unwrap();
+        assert_eq!(lock_resp.status(), StatusCode::OK);
+
+        let list_req = Request::builder()
+            .uri(MARKET_ROUTE_SELL_ORDERS)
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let list_resp = app.oneshot(list_req).await.unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let body = to_bytes(list_resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let status = json[0]["status"].as_str().unwrap_or_default();
+        assert_ne!(status, ORDER_STATUS_OPEN);
+        assert!(status == ORDER_STATUS_LOCKED || status == ORDER_STATUS_MATCHED);
+    }
+
+    #[tokio::test]
+    async fn sell_order_progresses_settling_then_settled() {
+        let app = app();
+        let settling_req = Request::builder()
+            .uri("/internal/market/orders/sell/sell-order-demo-1/mark_settling")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let settling_resp = app.clone().oneshot(settling_req).await.unwrap();
+        assert_eq!(settling_resp.status(), StatusCode::OK);
+
+        let settled_req = Request::builder()
+            .uri("/internal/market/orders/sell/sell-order-demo-1/mark_settled")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let settled_resp = app.clone().oneshot(settled_req).await.unwrap();
+        assert_eq!(settled_resp.status(), StatusCode::OK);
+
+        let list_req = Request::builder()
+            .uri(MARKET_ROUTE_SELL_ORDERS)
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let list_resp = app.oneshot(list_req).await.unwrap();
+        let body = to_bytes(list_resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json[0]["status"], ORDER_STATUS_SETTLED);
+    }
 }

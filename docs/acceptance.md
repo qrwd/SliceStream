@@ -209,3 +209,40 @@ Binary-diff note:
 
 Environment note:
 - In Linux containers missing GTK/WebKit development packages, `cargo tauri dev`/`cargo check` can fail before runtime (e.g. missing `glib-2.0`). This is infra dependency limitation, not core logic regression.
+
+
+## Architecture consistency check (integration pass)
+
+```bash
+# optional quick grep checks for shared market naming usage
+rg "MARKET_ROUTE_(PROVIDERS|SELL_ORDERS|BUY_ORDERS|MATCHES)" apps/providerd/src/main.rs apps/agentd/src/main.rs apps/dashboard/src/main.rs
+rg "ORDER_STATUS_OPEN|MATCH_STATUS_PROPOSED" apps/providerd/src/main.rs apps/agentd/src/main.rs crates/common/src/market.rs
+```
+
+Expected:
+- Market routes/status naming is referenced from `common::market` constants, reducing cross-layer string drift.
+- Behavior remains unchanged (this is a structure/integration pass, not feature expansion).
+
+
+
+## Match acceptance + settlement binding (market-driven payment)
+
+```bash
+# check current market views
+curl -s http://127.0.0.1:4002/internal/market/orders/buy | jq
+curl -s http://127.0.0.1:4001/internal/market/orders/sell | jq
+curl -s http://127.0.0.1:4002/internal/market/matches | jq
+
+# accept a proposed match (or get already_accepted)
+curl -s -X POST http://127.0.0.1:4002/internal/market/matches/accept   -H 'content-type: application/json'   -d '{"buy_order_id":"buy-order-task-demo","sell_order_id":"sell-order-demo-1"}' | jq
+
+# settlement/evidence now carries match binding
+curl -s http://127.0.0.1:4002/v1/tasks/task-demo | jq
+curl -s http://127.0.0.1:4002/v1/tasks/task-demo/receipt | jq
+```
+
+Expected:
+- match status can be observed as `proposed/accepted/settling/settled/failed` (with rejected entries when explicitly rejected).
+- only accepted-bound task runtime proceeds through payment/receipt/evidence/reconciliation path.
+- receipt/payment metadata exposes match binding (`bound_match_id`, per-payment `match_id`, and evidence pricing input match reference).
+

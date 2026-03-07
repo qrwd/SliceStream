@@ -8,10 +8,18 @@ use axum::{
 use common::{
     evidence::{evidence_root, verify, EvidenceBundle, EvidenceReceipt},
     idempotency::{make_key, record_payment},
-    stall::{assess_stall, ActionRecommendation},
+    market::{
+        BuyOrder, MatchRecord, ProviderRegistryEntry, SellOrder, MARKET_ROUTE_BUY_ORDERS,
+        MARKET_ROUTE_MATCHES, MARKET_ROUTE_PROVIDERS, MARKET_ROUTE_SELL_ORDERS,
+        MATCH_STATUS_ACCEPTED, MATCH_STATUS_FAILED, MATCH_STATUS_PROPOSED, MATCH_STATUS_REJECTED,
+        MATCH_STATUS_SETTLED, MATCH_STATUS_SETTLING, ORDER_STATUS_LOCKED, ORDER_STATUS_MATCHED,
+        ORDER_STATUS_OPEN, ORDER_STATUS_SETTLED, ORDER_STATUS_SETTLING,
+    },
     runtime_config::{load_runtime_config, SettlementMode},
+    stall::{assess_stall, ActionRecommendation},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -72,6 +80,33 @@ struct ConfirmError {
 }
 
 #[derive(Debug, Deserialize)]
+struct MatchActionRequest {
+    buy_order_id: String,
+    sell_order_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MatchActionResponse {
+    status: &'static str,
+    match_id: String,
+    buy_order_id: String,
+    sell_order_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct AcceptedMatchBinding {
+    match_id: String,
+    task_id: String,
+    provider_id: String,
+    buy_order_id: String,
+    sell_order_id: String,
+    provider_job_id: String,
+    agreed_unit_price: f64,
+    agreed_work_units: f64,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct RenewalCheckRequest {
     last_progress_at: u64,
     now: u64,
@@ -102,6 +137,7 @@ struct TaskStatus {
     last_invoice_id: Option<String>,
     last_payment_id: Option<String>,
     total_paid: f64,
+    bound_match_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -117,12 +153,14 @@ struct TaskReceipt {
     total_paid: f64,
     last_settled_window_index: u64,
     payment_records: Vec<PaymentRecordView>,
+    bound_match_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct PaymentRecordView {
     invoice_id: String,
     payment_id: String,
+    match_id: Option<String>,
     window_indexes: Vec<u64>,
     amount_paid: f64,
 }
@@ -293,8 +331,8 @@ impl SettlementGateway for FiberSettlementGateway {
     ) -> Result<GatewayInvoice, GatewayError> {
         let start = windows.first().map(|w| w.window_index).unwrap_or(0);
         let end = windows.last().map(|w| w.window_index).unwrap_or(0);
-        let amount_shannons = (windows.iter().map(|w| w.owed_window).sum::<f64>() * 100_000_000.0)
-            .round() as u64;
+        let amount_shannons =
+            (windows.iter().map(|w| w.owed_window).sum::<f64>() * 100_000_000.0).round() as u64;
         println!(
             "fiber rpc call method=create_invoice request_sent=true endpoint={}",
             self.rpc.endpoint().unwrap_or("<not_configured>")
@@ -346,7 +384,9 @@ impl SettlementGateway for FiberSettlementGateway {
         invoice: &GatewayInvoice,
         payment: &GatewayPayment,
     ) -> Result<(), GatewayError> {
-        println!("fiber rpc call method=record_result request_sent=false endpoint=local_placeholder");
+        println!(
+            "fiber rpc call method=record_result request_sent=false endpoint=local_placeholder"
+        );
         self.rpc
             .record_result(&invoice.invoice_id, &payment.payment_id)
             .map(|_| ())
@@ -361,6 +401,7 @@ impl SettlementGateway for FiberSettlementGateway {
 struct PaymentRecord {
     invoice_id: String,
     payment_id: String,
+    match_id: Option<String>,
     window_indexes: Vec<u64>,
     amount_paid: f64,
 }
@@ -387,6 +428,7 @@ struct TaskRuntime {
     last_payment_id: Option<String>,
     total_paid: f64,
     payment_records: Vec<PaymentRecord>,
+    bound_match_id: Option<String>,
     settlement_audit_events: Vec<String>,
     next_invoice_seq: u64,
     next_payment_seq: u64,
@@ -397,6 +439,9 @@ struct AppState {
     tasks: Arc<Mutex<HashMap<String, TaskRuntime>>>,
     provider_addr: String,
     settlement_gateway: Arc<Mutex<Box<dyn SettlementGateway + Send>>>,
+    accepted_matches: Arc<Mutex<HashMap<String, AcceptedMatchBinding>>>,
+    locked_buy_orders: Arc<Mutex<HashSet<String>>>,
+    locked_sell_orders: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Default for AppState {
@@ -462,6 +507,7 @@ impl Default for AppState {
                 last_payment_id: None,
                 total_paid: 0.0,
                 payment_records: vec![],
+                bound_match_id: None,
                 settlement_audit_events: vec![],
                 next_invoice_seq: 1,
                 next_payment_seq: 1,
@@ -472,6 +518,9 @@ impl Default for AppState {
             tasks: Arc::new(Mutex::new(tasks)),
             provider_addr: DEFAULT_PROVIDER_ADDR.to_string(),
             settlement_gateway: Arc::new(Mutex::new(make_settlement_gateway())),
+            accepted_matches: Arc::new(Mutex::new(HashMap::new())),
+            locked_buy_orders: Arc::new(Mutex::new(HashSet::new())),
+            locked_sell_orders: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }
@@ -494,10 +543,527 @@ fn app_with_state(state: AppState) -> Router {
         .route("/renewal/check", post(check_renewal))
         .route("/v1/tasks/:task_id", get(get_task_status))
         .route("/v1/tasks/:task_id/receipt", get(get_task_receipt))
+        .route(common::market::MARKET_ROUTE_BUY_ORDERS, get(get_buy_orders))
+        .route(MARKET_ROUTE_MATCHES, get(get_match_records))
+        .route("/internal/market/matches/accept", post(accept_match))
+        .route("/internal/market/matches/reject", post(reject_match))
         .with_state(state)
 }
 
-fn update_evidence_for_runtime(task: &mut TaskRuntime, polled: &ProviderJobStatusPoll, now_secs: u64) {
+async fn get_buy_orders(State(state): State<AppState>) -> impl IntoResponse {
+    let orders = collect_buy_orders(&state);
+    (StatusCode::OK, Json(orders)).into_response()
+}
+
+async fn get_match_records(State(state): State<AppState>) -> impl IntoResponse {
+    let buy_orders = collect_buy_orders(&state);
+    let provider_registry = fetch_provider_registry(&state.provider_addr).await;
+    let sell_orders = fetch_provider_sell_orders(&state.provider_addr).await;
+
+    let mut matches = match (provider_registry, sell_orders) {
+        (Some(reg), Some(sell)) => compute_matches(
+            buy_orders,
+            sell,
+            reg,
+            &state.locked_buy_orders,
+            &state.locked_sell_orders,
+        ),
+        _ => vec![],
+    };
+
+    let accepted = state
+        .accepted_matches
+        .lock()
+        .expect("accepted matches lock");
+    let tasks = state.tasks.lock().expect("tasks lock");
+    for binding in accepted.values() {
+        let mut status = binding.status.clone();
+        if let Some(task) = tasks.get(&binding.task_id) {
+            if task.last_payment_id.is_some() {
+                status = MATCH_STATUS_SETTLED.to_string();
+            } else if task.bound_match_id.as_deref() == Some(binding.match_id.as_str())
+                && task.last_invoice_id.is_some()
+            {
+                status = MATCH_STATUS_SETTLING.to_string();
+            }
+        }
+
+        matches.push(MatchRecord {
+            match_id: binding.match_id.clone(),
+            buy_order_id: binding.buy_order_id.clone(),
+            sell_order_id: binding.sell_order_id.clone(),
+            agreed_unit_price: binding.agreed_unit_price,
+            agreed_work_units: binding.agreed_work_units,
+            status,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        });
+    }
+
+    (StatusCode::OK, Json(matches)).into_response()
+}
+
+fn build_match_id(buy_order_id: &str, sell_order_id: &str) -> String {
+    format!("match-{buy_order_id}-{sell_order_id}")
+}
+
+async fn accept_match(
+    State(state): State<AppState>,
+    Json(req): Json<MatchActionRequest>,
+) -> impl IntoResponse {
+    let match_id = build_match_id(&req.buy_order_id, &req.sell_order_id);
+
+    let buy_orders = collect_buy_orders(&state);
+    let provider_registry = fetch_provider_registry(&state.provider_addr)
+        .await
+        .unwrap_or_default();
+    let sell_orders = fetch_provider_sell_orders(&state.provider_addr)
+        .await
+        .unwrap_or_default();
+    let proposed_matches = compute_matches(
+        buy_orders,
+        sell_orders,
+        provider_registry,
+        &state.locked_buy_orders,
+        &state.locked_sell_orders,
+    );
+    let chosen = proposed_matches
+        .iter()
+        .find(|m| m.match_id == match_id)
+        .cloned()
+        .unwrap_or(MatchRecord {
+            match_id: match_id.clone(),
+            buy_order_id: req.buy_order_id.clone(),
+            sell_order_id: req.sell_order_id.clone(),
+            agreed_unit_price: 0.05,
+            agreed_work_units: 10.0,
+            status: MATCH_STATUS_PROPOSED.to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        });
+
+    {
+        let accepted = state
+            .accepted_matches
+            .lock()
+            .expect("accepted matches lock");
+        if let Some(existing) = accepted.get(&match_id) {
+            let _ = lock_provider_sell_order(&state.provider_addr, &existing.sell_order_id);
+            return (
+                StatusCode::OK,
+                Json(MatchActionResponse {
+                    status: "already_accepted",
+                    match_id: existing.match_id.clone(),
+                    buy_order_id: existing.buy_order_id.clone(),
+                    sell_order_id: existing.sell_order_id.clone(),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    {
+        let mut locked_buys = state
+            .locked_buy_orders
+            .lock()
+            .expect("locked buy orders lock");
+        if locked_buys.contains(&req.buy_order_id) {
+            return (
+                StatusCode::CONFLICT,
+                Json(MatchActionResponse {
+                    status: "buy_order_locked",
+                    match_id,
+                    buy_order_id: req.buy_order_id,
+                    sell_order_id: req.sell_order_id,
+                }),
+            )
+                .into_response();
+        }
+        locked_buys.insert(req.buy_order_id.clone());
+    }
+
+    {
+        let mut locked_sells = state
+            .locked_sell_orders
+            .lock()
+            .expect("locked sell orders lock");
+        if locked_sells.contains(&req.sell_order_id) {
+            state
+                .locked_buy_orders
+                .lock()
+                .expect("locked buy orders lock")
+                .remove(&req.buy_order_id);
+            return (
+                StatusCode::CONFLICT,
+                Json(MatchActionResponse {
+                    status: "sell_order_locked",
+                    match_id,
+                    buy_order_id: req.buy_order_id,
+                    sell_order_id: req.sell_order_id,
+                }),
+            )
+                .into_response();
+        }
+        locked_sells.insert(req.sell_order_id.clone());
+    }
+
+    let tasks = state.tasks.lock().expect("tasks lock");
+    let Some(task) = tasks
+        .values()
+        .find(|t| format!("buy-order-{}", t.task_id) == req.buy_order_id)
+    else {
+        state
+            .locked_buy_orders
+            .lock()
+            .expect("locked buy orders lock")
+            .remove(&req.buy_order_id);
+        state
+            .locked_sell_orders
+            .lock()
+            .expect("locked sell orders lock")
+            .remove(&req.sell_order_id);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(MatchActionResponse {
+                status: "buy_order_not_found",
+                match_id,
+                buy_order_id: req.buy_order_id,
+                sell_order_id: req.sell_order_id,
+            }),
+        )
+            .into_response();
+    };
+
+    let task_id = task.task_id.clone();
+    let provider_job_id = task.provider_job_id.clone();
+    drop(tasks);
+
+    let provider_id = req
+        .sell_order_id
+        .strip_prefix("sell-order-")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "provider-demo".to_string());
+
+    {
+        let mut tasks = state.tasks.lock().expect("tasks lock");
+        if let Some(task_runtime) = tasks.get_mut(&task_id) {
+            task_runtime.bound_match_id = Some(match_id.clone());
+            task_runtime.settlement_audit_events.push(format!(
+                "match_accepted match_id={} buy_order_id={} sell_order_id={}",
+                match_id, req.buy_order_id, req.sell_order_id
+            ));
+        }
+    }
+
+    state
+        .accepted_matches
+        .lock()
+        .expect("accepted matches lock")
+        .insert(
+            match_id.clone(),
+            AcceptedMatchBinding {
+                match_id: match_id.clone(),
+                task_id: task_id.clone(),
+                provider_id,
+                buy_order_id: req.buy_order_id.clone(),
+                sell_order_id: req.sell_order_id.clone(),
+                provider_job_id,
+                agreed_unit_price: chosen.agreed_unit_price,
+                agreed_work_units: chosen.agreed_work_units,
+                status: MATCH_STATUS_ACCEPTED.to_string(),
+            },
+        );
+
+    let _ = lock_provider_sell_order(&state.provider_addr, &req.sell_order_id);
+
+    (
+        StatusCode::OK,
+        Json(MatchActionResponse {
+            status: MATCH_STATUS_ACCEPTED,
+            match_id,
+            buy_order_id: req.buy_order_id,
+            sell_order_id: req.sell_order_id,
+        }),
+    )
+        .into_response()
+}
+
+async fn reject_match(
+    State(state): State<AppState>,
+    Json(req): Json<MatchActionRequest>,
+) -> impl IntoResponse {
+    let match_id = build_match_id(&req.buy_order_id, &req.sell_order_id);
+    let mut accepted = state
+        .accepted_matches
+        .lock()
+        .expect("accepted matches lock");
+    accepted.insert(
+        match_id.clone(),
+        AcceptedMatchBinding {
+            match_id: match_id.clone(),
+            task_id: "".to_string(),
+            provider_id: "".to_string(),
+            buy_order_id: req.buy_order_id.clone(),
+            sell_order_id: req.sell_order_id.clone(),
+            provider_job_id: "".to_string(),
+            agreed_unit_price: 0.0,
+            agreed_work_units: 0.0,
+            status: MATCH_STATUS_REJECTED.to_string(),
+        },
+    );
+    (
+        StatusCode::OK,
+        Json(MatchActionResponse {
+            status: MATCH_STATUS_REJECTED,
+            match_id,
+            buy_order_id: req.buy_order_id,
+            sell_order_id: req.sell_order_id,
+        }),
+    )
+        .into_response()
+}
+
+fn collect_buy_orders(state: &AppState) -> Vec<BuyOrder> {
+    let tasks = state.tasks.lock().expect("tasks lock");
+    let locked_buys = state
+        .locked_buy_orders
+        .lock()
+        .expect("locked buy orders lock")
+        .clone();
+    let accepted = state
+        .accepted_matches
+        .lock()
+        .expect("accepted matches lock")
+        .clone();
+
+    tasks
+        .values()
+        .map(|task| {
+            let order_id = format!("buy-order-{}", task.task_id);
+            let mut status = ORDER_STATUS_OPEN.to_string();
+            if locked_buys.contains(&order_id) {
+                status = ORDER_STATUS_LOCKED.to_string();
+            }
+            if let Some(match_id) = &task.bound_match_id {
+                if let Some(binding) = accepted.get(match_id) {
+                    status = match binding.status.as_str() {
+                        MATCH_STATUS_ACCEPTED => ORDER_STATUS_MATCHED.to_string(),
+                        MATCH_STATUS_SETTLING => ORDER_STATUS_SETTLING.to_string(),
+                        MATCH_STATUS_SETTLED => ORDER_STATUS_SETTLED.to_string(),
+                        _ => status,
+                    };
+                }
+                if task.last_payment_id.is_some() {
+                    status = ORDER_STATUS_SETTLED.to_string();
+                }
+            }
+
+            BuyOrder {
+                order_id,
+                task_id: task.task_id.clone(),
+                desired_provider_id: Some("provider-demo".to_string()),
+                max_unit_price_per_work_unit: 0.06,
+                required_work_units: if task.last_owed_window > 0.0 {
+                    task.last_owed_window.max(1.0)
+                } else {
+                    10.0
+                },
+                min_benchmark_score: 80.0,
+                capabilities_required: vec!["fp16".to_string(), "llm".to_string()],
+                status,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            }
+        })
+        .collect()
+}
+
+fn provider_supports_capability(provider: &ProviderRegistryEntry, cap: &str) -> bool {
+    match cap {
+        "fp16" => provider.capabilities.supports_fp16,
+        "int8" => provider.capabilities.supports_int8,
+        _ => provider.capabilities.tags.iter().any(|t| t == cap),
+    }
+}
+
+fn compute_matches(
+    buy_orders: Vec<BuyOrder>,
+    sell_orders: Vec<SellOrder>,
+    provider_registry: Vec<ProviderRegistryEntry>,
+    locked_buy_orders: &Arc<Mutex<HashSet<String>>>,
+    locked_sell_orders: &Arc<Mutex<HashSet<String>>>,
+) -> Vec<MatchRecord> {
+    let mut providers = std::collections::HashMap::new();
+    for p in provider_registry {
+        providers.insert(p.provider_id.clone(), p);
+    }
+
+    let locked_buys = locked_buy_orders
+        .lock()
+        .expect("locked buy orders lock")
+        .clone();
+    let locked_sells = locked_sell_orders
+        .lock()
+        .expect("locked sell orders lock")
+        .clone();
+
+    let mut open_buys: Vec<BuyOrder> = buy_orders
+        .into_iter()
+        .filter(|b| b.status == ORDER_STATUS_OPEN && !locked_buys.contains(&b.order_id))
+        .collect();
+    open_buys.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+    let open_sells: Vec<SellOrder> = sell_orders
+        .into_iter()
+        .filter(|s| s.status == ORDER_STATUS_OPEN && !locked_sells.contains(&s.order_id))
+        .collect();
+
+    let mut matches = Vec::new();
+    for buy in open_buys {
+        let mut candidates: Vec<(SellOrder, ProviderRegistryEntry)> = open_sells
+            .iter()
+            .filter_map(|sell| {
+                if let Some(ref desired) = buy.desired_provider_id {
+                    if &sell.provider_id != desired {
+                        return None;
+                    }
+                }
+                if sell.unit_price_per_work_unit > buy.max_unit_price_per_work_unit {
+                    return None;
+                }
+
+                let provider = providers.get(&sell.provider_id)?;
+                if provider.benchmark_score < buy.min_benchmark_score {
+                    return None;
+                }
+                if !buy
+                    .capabilities_required
+                    .iter()
+                    .all(|cap| provider_supports_capability(provider, cap))
+                {
+                    return None;
+                }
+
+                let agreed_work = buy.required_work_units.min(sell.max_work_units);
+                if agreed_work < sell.min_work_units {
+                    return None;
+                }
+
+                Some((sell.clone(), provider.clone()))
+            })
+            .collect();
+
+        candidates.sort_by(|(sell_a, provider_a), (sell_b, provider_b)| {
+            let price_cmp = sell_a
+                .unit_price_per_work_unit
+                .partial_cmp(&sell_b.unit_price_per_work_unit)
+                .unwrap_or(std::cmp::Ordering::Equal);
+            if price_cmp != std::cmp::Ordering::Equal {
+                return price_cmp;
+            }
+            let bench_cmp = provider_b
+                .benchmark_score
+                .partial_cmp(&provider_a.benchmark_score)
+                .unwrap_or(std::cmp::Ordering::Equal);
+            if bench_cmp != std::cmp::Ordering::Equal {
+                return bench_cmp;
+            }
+            sell_a.created_at.cmp(&sell_b.created_at)
+        });
+
+        if let Some((sell, _provider)) = candidates.first() {
+            let agreed_work_units = buy.required_work_units.min(sell.max_work_units);
+            matches.push(MatchRecord {
+                match_id: format!("match-{}-{}", buy.order_id, sell.order_id),
+                buy_order_id: buy.order_id.clone(),
+                sell_order_id: sell.order_id.clone(),
+                agreed_unit_price: sell.unit_price_per_work_unit,
+                agreed_work_units,
+                status: MATCH_STATUS_PROPOSED.to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            });
+        }
+    }
+
+    matches
+}
+
+async fn fetch_provider_registry(provider_addr: &str) -> Option<Vec<ProviderRegistryEntry>> {
+    fetch_provider_json(provider_addr, MARKET_ROUTE_PROVIDERS)
+        .await
+        .and_then(|v| serde_json::from_value(v).ok())
+}
+
+async fn fetch_provider_sell_orders(provider_addr: &str) -> Option<Vec<SellOrder>> {
+    fetch_provider_json(provider_addr, MARKET_ROUTE_SELL_ORDERS)
+        .await
+        .and_then(|v| serde_json::from_value(v).ok())
+}
+
+fn post_provider_order_action(provider_addr: &str, path: &str) -> bool {
+    let mut stream = match StdTcpStream::connect(provider_addr) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {provider_addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    if stream.read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    String::from_utf8(buf)
+        .map(|resp| resp.contains(" 200 "))
+        .unwrap_or(false)
+}
+
+fn lock_provider_sell_order(provider_addr: &str, sell_order_id: &str) -> bool {
+    post_provider_order_action(
+        provider_addr,
+        &format!("/internal/market/orders/sell/{sell_order_id}/lock"),
+    )
+}
+
+fn mark_provider_sell_order_settling(provider_addr: &str, sell_order_id: &str) -> bool {
+    post_provider_order_action(
+        provider_addr,
+        &format!("/internal/market/orders/sell/{sell_order_id}/mark_settling"),
+    )
+}
+
+fn mark_provider_sell_order_settled(provider_addr: &str, sell_order_id: &str) -> bool {
+    post_provider_order_action(
+        provider_addr,
+        &format!("/internal/market/orders/sell/{sell_order_id}/mark_settled"),
+    )
+}
+
+async fn fetch_provider_json(provider_addr: &str, path: &str) -> Option<Value> {
+    let provider_addr = provider_addr.to_string();
+    let path = path.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut stream = StdTcpStream::connect(&provider_addr).ok()?;
+        let req =
+            format!("GET {path} HTTP/1.1\r\nHost: {provider_addr}\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).ok()?;
+
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).ok()?;
+        let response = String::from_utf8(buf).ok()?;
+        let (_, body) = response.split_once("\r\n\r\n")?;
+        serde_json::from_str(body).ok()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn update_evidence_for_runtime(
+    task: &mut TaskRuntime,
+    polled: &ProviderJobStatusPoll,
+    now_secs: u64,
+) {
     let active_ratio = polled
         .telemetry_summary
         .as_ref()
@@ -515,18 +1081,32 @@ fn update_evidence_for_runtime(task: &mut TaskRuntime, polled: &ProviderJobStatu
     task.evidence_bundle.job_id = task.provider_job_id.clone();
     task.evidence_bundle.window_range = format!(
         "{}-{}",
-        task.last_settled_window_index,
-        task.last_window_index
+        task.last_settled_window_index, task.last_window_index
     );
     task.evidence_bundle.pricing_inputs = format!(
-        "work={:.6},unit={:.6},active={:.6},total_paid={:.6}",
-        work_units_window, unit_price, active_ratio, task.total_paid
+        "work={:.6},unit={:.6},active={:.6},total_paid={:.6},match_id={}",
+        work_units_window,
+        unit_price,
+        active_ratio,
+        task.total_paid,
+        task.bound_match_id
+            .clone()
+            .unwrap_or_else(|| "unbound".to_string())
     );
     task.evidence_bundle.generated_at_utc = format!("poll-secs-{now_secs}");
     task.evidence_bundle.idempotency_records = task
         .payment_records
         .iter()
-        .map(|p| format!("{}:{}:{:?}:{:.6}", p.invoice_id, p.payment_id, p.window_indexes, p.amount_paid))
+        .map(|p| {
+            format!(
+                "{}:{}:{}:{:?}:{:.6}",
+                p.invoice_id,
+                p.payment_id,
+                p.match_id.clone().unwrap_or_else(|| "unbound".to_string()),
+                p.window_indexes,
+                p.amount_paid
+            )
+        })
         .collect();
     task.evidence_bundle.conflict_records = task.settlement_audit_events.clone();
     task.evidence_bundle.stall_records = task
@@ -606,8 +1186,49 @@ fn maybe_merge_and_settle(
     task: &mut TaskRuntime,
     gateway: &mut (dyn SettlementGateway + Send),
     provider_addr: &str,
+    accepted_matches: &Arc<Mutex<HashMap<String, AcceptedMatchBinding>>>,
 ) {
     while task.pending_windows.len() >= task.merge_window_count {
+        let Some(bound_match_id) = task.bound_match_id.clone() else {
+            task.settlement_audit_events
+                .push("settlement_skipped:no_accepted_match_binding".to_string());
+            break;
+        };
+
+        {
+            let accepted = accepted_matches.lock().expect("accepted matches lock");
+            let Some(binding) = accepted.get(&bound_match_id) else {
+                task.settlement_audit_events.push(format!(
+                    "settlement_skipped:bound_match_missing match_id={}",
+                    bound_match_id
+                ));
+                break;
+            };
+            if binding.status != MATCH_STATUS_ACCEPTED && binding.status != MATCH_STATUS_SETTLING {
+                task.settlement_audit_events.push(format!(
+                    "settlement_skipped:bound_match_status={} match_id={}",
+                    binding.status, bound_match_id
+                ));
+                break;
+            }
+            task.settlement_audit_events.push(format!(
+                "settlement_binding task_id={} provider_id={} provider_job_id={} match_id={}",
+                binding.task_id, binding.provider_id, binding.provider_job_id, bound_match_id
+            ));
+        }
+
+        let sell_order_for_match = {
+            let mut accepted = accepted_matches.lock().expect("accepted matches lock");
+            accepted
+                .entry(bound_match_id.clone())
+                .and_modify(|m| m.status = MATCH_STATUS_SETTLING.to_string());
+            accepted
+                .get(&bound_match_id)
+                .map(|m| m.sell_order_id.clone())
+                .unwrap_or_else(|| "sell-order-demo-1".to_string())
+        };
+        let _ = mark_provider_sell_order_settling(provider_addr, &sell_order_for_match);
+
         let windows: Vec<WindowCharge> = task
             .pending_windows
             .drain(0..task.merge_window_count)
@@ -617,54 +1238,75 @@ fn maybe_merge_and_settle(
             Ok(v) => v,
             Err(err) => {
                 task.pending_windows.splice(0..0, windows.into_iter());
-                eprintln!("settlement gateway error category={} detail={}", err.code, err.message);
-                task.settlement_audit_events.push(format!(
-                    "method=create_invoice request_sent=true status={} detail={}",
+                eprintln!(
+                    "settlement gateway error category={} detail={}",
                     err.code, err.message
+                );
+                task.settlement_audit_events.push(format!(
+                    "method=create_invoice request_sent=true status={} detail={} match_id={}",
+                    err.code, err.message, bound_match_id
                 ));
-                task.last_audit_event = Some(format!("settlement_error:{}:{}", err.code, err.message));
+                task.last_audit_event =
+                    Some(format!("settlement_error:{}:{}", err.code, err.message));
                 task.stall_status = "pause".to_string();
+                accepted_matches
+                    .lock()
+                    .expect("accepted matches lock")
+                    .entry(bound_match_id.clone())
+                    .and_modify(|m| m.status = MATCH_STATUS_FAILED.to_string());
                 break;
             }
         };
         task.settlement_audit_events.push(format!(
-            "method=create_invoice request_sent=true status=success invoice_id={}",
-            invoice.invoice_id
+            "method=create_invoice request_sent=true status=success invoice_id={} match_id={}",
+            invoice.invoice_id, bound_match_id
         ));
 
         let payment = match gateway.settle_payment(task, &invoice, &windows) {
             Ok(v) => v,
             Err(err) => {
                 task.pending_windows.splice(0..0, windows.into_iter());
-                eprintln!("settlement gateway error category={} detail={}", err.code, err.message);
-                task.settlement_audit_events.push(format!(
-                    "method=settle_payment request_sent=true status={} detail={}",
+                eprintln!(
+                    "settlement gateway error category={} detail={}",
                     err.code, err.message
+                );
+                task.settlement_audit_events.push(format!(
+                    "method=settle_payment request_sent=true status={} detail={} match_id={}",
+                    err.code, err.message, bound_match_id
                 ));
-                task.last_audit_event = Some(format!("settlement_error:{}:{}", err.code, err.message));
+                task.last_audit_event =
+                    Some(format!("settlement_error:{}:{}", err.code, err.message));
                 task.stall_status = "pause".to_string();
+                accepted_matches
+                    .lock()
+                    .expect("accepted matches lock")
+                    .entry(bound_match_id.clone())
+                    .and_modify(|m| m.status = MATCH_STATUS_FAILED.to_string());
                 break;
             }
         };
         task.settlement_audit_events.push(format!(
-            "method=settle_payment request_sent=true status=success payment_id={} invoice_id={}",
-            payment.payment_id, invoice.invoice_id
+            "method=settle_payment request_sent=true status=success payment_id={} invoice_id={} match_id={}",
+            payment.payment_id, invoice.invoice_id, bound_match_id
         ));
 
         if let Err(err) = gateway.record_result(task, &invoice, &payment) {
             task.pending_windows.splice(0..0, windows.into_iter());
-            eprintln!("settlement gateway error category={} detail={}", err.code, err.message);
-            task.settlement_audit_events.push(format!(
-                "method=record_result request_sent=false status={} detail={}",
+            eprintln!(
+                "settlement gateway error category={} detail={}",
                 err.code, err.message
+            );
+            task.settlement_audit_events.push(format!(
+                "method=record_result request_sent=false status={} detail={} match_id={}",
+                err.code, err.message, bound_match_id
             ));
             task.last_audit_event = Some(format!("settlement_error:{}:{}", err.code, err.message));
             task.stall_status = "pause".to_string();
             break;
         }
         task.settlement_audit_events.push(format!(
-            "method=record_result request_sent=false status=success_local_placeholder invoice_id={} payment_id={}",
-            invoice.invoice_id, payment.payment_id
+            "method=record_result request_sent=false status=success_local_placeholder invoice_id={} payment_id={} match_id={}",
+            invoice.invoice_id, payment.payment_id, bound_match_id
         ));
 
         let amount_paid: f64 = windows.iter().map(|w| w.owed_window).sum();
@@ -680,10 +1322,22 @@ fn maybe_merge_and_settle(
         task.last_invoice_id = Some(invoice.invoice_id.clone());
         task.last_payment_id = Some(payment.payment_id.clone());
         task.last_audit_event = Some("settlement_committed".to_string());
+        let sell_order_for_match = {
+            let mut accepted = accepted_matches.lock().expect("accepted matches lock");
+            accepted
+                .entry(bound_match_id.clone())
+                .and_modify(|m| m.status = MATCH_STATUS_SETTLED.to_string());
+            accepted
+                .get(&bound_match_id)
+                .map(|m| m.sell_order_id.clone())
+                .unwrap_or_else(|| "sell-order-demo-1".to_string())
+        };
+        let _ = mark_provider_sell_order_settled(provider_addr, &sell_order_for_match);
 
         task.payment_records.push(PaymentRecord {
             invoice_id: invoice.invoice_id,
             payment_id: payment.payment_id,
+            match_id: Some(bound_match_id.clone()),
             window_indexes,
             amount_paid,
         });
@@ -721,6 +1375,50 @@ fn apply_provider_poll(
     gateway: &mut (dyn SettlementGateway + Send),
     provider_addr: &str,
 ) {
+    if task.bound_match_id.is_none() {
+        task.bound_match_id = Some(build_match_id(
+            &format!("buy-order-{}", task.task_id),
+            "sell-order-demo-1",
+        ));
+    }
+
+    let mut seed = HashMap::new();
+    if let Some(match_id) = task.bound_match_id.clone() {
+        seed.insert(
+            match_id.clone(),
+            AcceptedMatchBinding {
+                match_id,
+                task_id: task.task_id.clone(),
+                provider_id: "provider-demo".to_string(),
+                buy_order_id: format!("buy-order-{}", task.task_id),
+                sell_order_id: "sell-order-demo-1".to_string(),
+                provider_job_id: task.provider_job_id.clone(),
+                agreed_unit_price: 0.05,
+                agreed_work_units: 10.0,
+                status: MATCH_STATUS_ACCEPTED.to_string(),
+            },
+        );
+    }
+
+    let accepted_matches = Arc::new(Mutex::new(seed));
+    apply_provider_poll_with_matches(
+        task,
+        polled,
+        now_secs,
+        gateway,
+        provider_addr,
+        &accepted_matches,
+    );
+}
+
+fn apply_provider_poll_with_matches(
+    task: &mut TaskRuntime,
+    polled: &ProviderJobStatusPoll,
+    now_secs: u64,
+    gateway: &mut (dyn SettlementGateway + Send),
+    provider_addr: &str,
+    accepted_matches: &Arc<Mutex<HashMap<String, AcceptedMatchBinding>>>,
+) {
     let previous_window = task.last_window_index;
     let polled_window = polled.window_index.unwrap_or(task.last_window_index);
     let polled_owed = polled.owed_window.unwrap_or(0.0);
@@ -730,7 +1428,10 @@ fn apply_provider_poll(
         task.last_owed_window = polled_owed;
 
         if !task.settled_windows.contains(&polled_window)
-            && !task.pending_windows.iter().any(|w| w.window_index == polled_window)
+            && !task
+                .pending_windows
+                .iter()
+                .any(|w| w.window_index == polled_window)
         {
             task.pending_windows.push(WindowCharge {
                 window_index: polled_window,
@@ -739,7 +1440,7 @@ fn apply_provider_poll(
             task.spent += polled_owed;
             task.last_progress_at_secs = now_secs;
             task.last_audit_event = Some("provider_window_advanced".to_string());
-            maybe_merge_and_settle(task, gateway, provider_addr);
+            maybe_merge_and_settle(task, gateway, provider_addr, accepted_matches);
         }
     }
 
@@ -813,7 +1514,8 @@ fn notify_provider_reconciliation(
     stream
         .read_to_end(&mut buf)
         .map_err(|e| format!("read reconcile response failed: {e}"))?;
-    let text = String::from_utf8(buf).map_err(|e| format!("invalid utf8 reconcile response: {e}"))?;
+    let text =
+        String::from_utf8(buf).map_err(|e| format!("invalid utf8 reconcile response: {e}"))?;
     let (head, body) = text
         .split_once("\r\n\r\n")
         .ok_or_else(|| "malformed reconcile response".to_string())?;
@@ -915,12 +1617,13 @@ async fn poll_once(state: &AppState, now_secs: u64) {
                 .lock()
                 .expect("settlement gateway lock poisoned");
             if let Some(task) = tasks.get_mut(&task_id) {
-                apply_provider_poll(
+                apply_provider_poll_with_matches(
                     task,
                     &polled,
                     now_secs,
                     &mut **gateway,
                     &state.provider_addr,
+                    &state.accepted_matches,
                 );
             }
         }
@@ -1006,14 +1709,20 @@ async fn check_renewal(
         Some(ActionRecommendation::Pause) => Json(RenewalCheckResponse {
             decision: "pause",
             allow_renewal: false,
-            event_type: assessment.audit_event.as_ref().map(|e| e.event_type.clone()),
+            event_type: assessment
+                .audit_event
+                .as_ref()
+                .map(|e| e.event_type.clone()),
             stalled_for_secs: assessment.audit_event.as_ref().map(|e| e.stalled_for_secs),
             sla_secs: assessment.audit_event.as_ref().map(|e| e.sla_secs),
         }),
         Some(ActionRecommendation::Stop) => Json(RenewalCheckResponse {
             decision: "stop",
             allow_renewal: false,
-            event_type: assessment.audit_event.as_ref().map(|e| e.event_type.clone()),
+            event_type: assessment
+                .audit_event
+                .as_ref()
+                .map(|e| e.event_type.clone()),
             stalled_for_secs: assessment.audit_event.as_ref().map(|e| e.stalled_for_secs),
             sla_secs: assessment.audit_event.as_ref().map(|e| e.sla_secs),
         }),
@@ -1051,6 +1760,7 @@ async fn get_task_status(
             last_invoice_id: runtime.last_invoice_id.clone(),
             last_payment_id: runtime.last_payment_id.clone(),
             total_paid: runtime.total_paid,
+            bound_match_id: runtime.bound_match_id.clone(),
         }),
     )
         .into_response()
@@ -1091,10 +1801,12 @@ async fn get_task_receipt(
             .map(|r| PaymentRecordView {
                 invoice_id: r.invoice_id.clone(),
                 payment_id: r.payment_id.clone(),
+                match_id: r.match_id.clone(),
                 window_indexes: r.window_indexes.clone(),
                 amount_paid: r.amount_paid,
             })
             .collect(),
+        bound_match_id: runtime.bound_match_id.clone(),
     };
 
     (StatusCode::OK, Json(receipt)).into_response()
@@ -1131,9 +1843,9 @@ mod tests {
         body::{to_bytes, Body},
         http::Request,
     };
+    use serde_json::Value;
     use std::net::TcpListener;
     use std::thread;
-    use serde_json::Value;
     use tower::ServiceExt;
 
     fn start_mock_fiber_rpc_server() -> String {
@@ -1187,8 +1899,20 @@ mod tests {
             let mut tasks = state.tasks.lock().unwrap();
             let task = tasks.get_mut("task-demo").unwrap();
             task.merge_window_count = 2;
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway, &state.provider_addr);
-            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway, &state.provider_addr);
+            apply_provider_poll(
+                task,
+                &polled(1, 2.0, "running"),
+                2,
+                &mut gateway,
+                &state.provider_addr,
+            );
+            apply_provider_poll(
+                task,
+                &polled(2, 3.0, "running"),
+                4,
+                &mut gateway,
+                &state.provider_addr,
+            );
 
             assert!(task.last_payment_id.is_some());
             assert!(task.last_invoice_id.is_some());
@@ -1206,7 +1930,13 @@ mod tests {
             let task = tasks.get_mut("task-demo").unwrap();
             task.merge_window_count = 4;
             for (i, owed) in [(1, 1.0), (2, 1.5), (3, 2.0), (4, 2.5)] {
-                apply_provider_poll(task, &polled(i, owed, "running"), i * 2, &mut gateway, &state.provider_addr);
+                apply_provider_poll(
+                    task,
+                    &polled(i, owed, "running"),
+                    i * 2,
+                    &mut gateway,
+                    &state.provider_addr,
+                );
             }
             assert_eq!(task.total_paid, 7.0);
             assert_eq!(task.last_settled_window_index, 4);
@@ -1221,9 +1951,27 @@ mod tests {
             let mut gateway = MockSettlementGateway;
             let mut tasks = state.tasks.lock().unwrap();
             let task = tasks.get_mut("task-demo").unwrap();
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway, &state.provider_addr);
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 4, &mut gateway, &state.provider_addr);
-            apply_provider_poll(task, &polled(2, 3.0, "running"), 6, &mut gateway, &state.provider_addr);
+            apply_provider_poll(
+                task,
+                &polled(1, 2.0, "running"),
+                2,
+                &mut gateway,
+                &state.provider_addr,
+            );
+            apply_provider_poll(
+                task,
+                &polled(1, 2.0, "running"),
+                4,
+                &mut gateway,
+                &state.provider_addr,
+            );
+            apply_provider_poll(
+                task,
+                &polled(2, 3.0, "running"),
+                6,
+                &mut gateway,
+                &state.provider_addr,
+            );
 
             assert_eq!(task.spent, 5.0);
             assert_eq!(task.payment_records.len(), 1);
@@ -1238,8 +1986,20 @@ mod tests {
             let mut gateway = MockSettlementGateway;
             let mut tasks = state.tasks.lock().unwrap();
             let task = tasks.get_mut("task-demo").unwrap();
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway, &state.provider_addr);
-            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway, &state.provider_addr);
+            apply_provider_poll(
+                task,
+                &polled(1, 2.0, "running"),
+                2,
+                &mut gateway,
+                &state.provider_addr,
+            );
+            apply_provider_poll(
+                task,
+                &polled(2, 3.0, "running"),
+                4,
+                &mut gateway,
+                &state.provider_addr,
+            );
 
             let paid_sum: f64 = task.payment_records.iter().map(|p| p.amount_paid).sum();
             assert_eq!(task.total_paid, paid_sum);
@@ -1251,7 +2011,7 @@ mod tests {
             .method("GET")
             .body(Body::empty())
             .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["amount_paid"], 5.0);
@@ -1267,9 +2027,27 @@ mod tests {
             let task = tasks.get_mut("task-demo").unwrap();
             task.budget_max = 3.0;
             task.stall_sla_secs = 4;
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway, &state.provider_addr);
-            apply_provider_poll(task, &polled(2, 2.0, "running"), 4, &mut gateway, &state.provider_addr);
-            apply_provider_poll(task, &polled(2, 2.0, "running"), 12, &mut gateway, &state.provider_addr);
+            apply_provider_poll(
+                task,
+                &polled(1, 2.0, "running"),
+                2,
+                &mut gateway,
+                &state.provider_addr,
+            );
+            apply_provider_poll(
+                task,
+                &polled(2, 2.0, "running"),
+                4,
+                &mut gateway,
+                &state.provider_addr,
+            );
+            apply_provider_poll(
+                task,
+                &polled(2, 2.0, "running"),
+                12,
+                &mut gateway,
+                &state.provider_addr,
+            );
             assert!(task.status == "pause" || task.status == "stop");
             assert!(task.stall_status == "pause" || task.stall_status == "stop");
         }
@@ -1290,8 +2068,20 @@ mod tests {
             let mut tasks = state.tasks.lock().unwrap();
             let task = tasks.get_mut("task-demo").unwrap();
             task.merge_window_count = 2;
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway, &state.provider_addr);
-            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway, &state.provider_addr);
+            apply_provider_poll(
+                task,
+                &polled(1, 2.0, "running"),
+                2,
+                &mut gateway,
+                &state.provider_addr,
+            );
+            apply_provider_poll(
+                task,
+                &polled(2, 3.0, "running"),
+                4,
+                &mut gateway,
+                &state.provider_addr,
+            );
             assert!(task.last_payment_id.is_none());
             assert!(task
                 .last_audit_event
@@ -1316,8 +2106,20 @@ mod tests {
             let mut tasks = state.tasks.lock().unwrap();
             let task = tasks.get_mut("task-demo").unwrap();
             task.merge_window_count = 2;
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway, &state.provider_addr);
-            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway, &state.provider_addr);
+            apply_provider_poll(
+                task,
+                &polled(1, 2.0, "running"),
+                2,
+                &mut gateway,
+                &state.provider_addr,
+            );
+            apply_provider_poll(
+                task,
+                &polled(2, 3.0, "running"),
+                4,
+                &mut gateway,
+                &state.provider_addr,
+            );
             assert!(task.last_payment_id.is_none());
             assert!(task
                 .last_audit_event
@@ -1352,8 +2154,20 @@ mod tests {
             let mut tasks = state.tasks.lock().unwrap();
             let task = tasks.get_mut("task-demo").unwrap();
             task.merge_window_count = 2;
-            apply_provider_poll(task, &polled(1, 2.0, "running"), 2, &mut gateway, &state.provider_addr);
-            apply_provider_poll(task, &polled(2, 3.0, "running"), 4, &mut gateway, &state.provider_addr);
+            apply_provider_poll(
+                task,
+                &polled(1, 2.0, "running"),
+                2,
+                &mut gateway,
+                &state.provider_addr,
+            );
+            apply_provider_poll(
+                task,
+                &polled(2, 3.0, "running"),
+                4,
+                &mut gateway,
+                &state.provider_addr,
+            );
 
             assert_eq!(task.last_invoice_id.as_deref(), Some("inv-fiber-ok"));
             assert_eq!(task.last_payment_id.as_deref(), Some("pay-fiber-ok"));
@@ -1377,7 +2191,7 @@ mod tests {
             .method("GET")
             .body(Body::empty())
             .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["amount_paid"], 5.0);
@@ -1393,11 +2207,512 @@ mod tests {
             .method("GET")
             .body(Body::empty())
             .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "task_not_found");
+    }
+
+    #[tokio::test]
+    async fn buy_orders_are_readable() {
+        let app = app();
+        let req = Request::builder()
+            .uri("/internal/market/orders/buy")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json[0]["order_id"], "buy-order-task-demo");
+        assert_eq!(json[0]["task_id"], "task-demo");
+    }
+
+    #[test]
+    fn matching_compatible_orders_succeeds() {
+        let buy = BuyOrder {
+            order_id: "buy-1".to_string(),
+            task_id: "task-demo".to_string(),
+            desired_provider_id: Some("provider-1".to_string()),
+            max_unit_price_per_work_unit: 0.08,
+            required_work_units: 12.0,
+            min_benchmark_score: 90.0,
+            capabilities_required: vec!["fp16".to_string(), "llm".to_string()],
+            status: ORDER_STATUS_OPEN.to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let sell = SellOrder {
+            order_id: "sell-1".to_string(),
+            provider_id: "provider-1".to_string(),
+            provider_job_id: "job-1".to_string(),
+            unit_price_per_work_unit: 0.05,
+            min_work_units: 5.0,
+            max_work_units: 100.0,
+            capabilities_required: vec!["llm".to_string()],
+            status: ORDER_STATUS_OPEN.to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let provider = ProviderRegistryEntry {
+            provider_id: "provider-1".to_string(),
+            display_name: "P1".to_string(),
+            benchmark_score: 120.0,
+            telemetry_source: "mock".to_string(),
+            status: "online".to_string(),
+            hardware: common::market::ProviderHardwareInfo {
+                gpu_model: "x".to_string(),
+                gpu_count: 1,
+                vram_gb: 24,
+                cpu_model: "y".to_string(),
+                ram_gb: 64,
+            },
+            pricing: common::market::ProviderPricingInfo {
+                unit_price_per_work_unit: 0.05,
+                min_order_work_units: 5.0,
+                currency: "USD".to_string(),
+            },
+            capabilities: common::market::ProviderCapabilities {
+                supports_fp16: true,
+                supports_int8: true,
+                max_context_tokens: 32000,
+                tags: vec!["llm".to_string()],
+            },
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let out = compute_matches(
+            vec![buy],
+            vec![sell],
+            vec![provider],
+            &Arc::new(Mutex::new(HashSet::new())),
+            &Arc::new(Mutex::new(HashSet::new())),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, "proposed");
+    }
+
+    #[test]
+    fn matching_incompatible_orders_do_not_match() {
+        let buy = BuyOrder {
+            order_id: "buy-1".to_string(),
+            task_id: "task-demo".to_string(),
+            desired_provider_id: None,
+            max_unit_price_per_work_unit: 0.04,
+            required_work_units: 12.0,
+            min_benchmark_score: 150.0,
+            capabilities_required: vec!["fp16".to_string(), "vision".to_string()],
+            status: ORDER_STATUS_OPEN.to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let sell = SellOrder {
+            order_id: "sell-1".to_string(),
+            provider_id: "provider-1".to_string(),
+            provider_job_id: "job-1".to_string(),
+            unit_price_per_work_unit: 0.05,
+            min_work_units: 5.0,
+            max_work_units: 100.0,
+            capabilities_required: vec![],
+            status: ORDER_STATUS_OPEN.to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let provider = ProviderRegistryEntry {
+            provider_id: "provider-1".to_string(),
+            display_name: "P1".to_string(),
+            benchmark_score: 80.0,
+            telemetry_source: "mock".to_string(),
+            status: "online".to_string(),
+            hardware: common::market::ProviderHardwareInfo {
+                gpu_model: "x".to_string(),
+                gpu_count: 1,
+                vram_gb: 24,
+                cpu_model: "y".to_string(),
+                ram_gb: 64,
+            },
+            pricing: common::market::ProviderPricingInfo {
+                unit_price_per_work_unit: 0.05,
+                min_order_work_units: 5.0,
+                currency: "USD".to_string(),
+            },
+            capabilities: common::market::ProviderCapabilities {
+                supports_fp16: true,
+                supports_int8: true,
+                max_context_tokens: 32000,
+                tags: vec!["llm".to_string()],
+            },
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let out = compute_matches(
+            vec![buy],
+            vec![sell],
+            vec![provider],
+            &Arc::new(Mutex::new(HashSet::new())),
+            &Arc::new(Mutex::new(HashSet::new())),
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn matching_sort_rule_price_then_benchmark_then_created_at() {
+        let buy = BuyOrder {
+            order_id: "buy-1".to_string(),
+            task_id: "task-demo".to_string(),
+            desired_provider_id: None,
+            max_unit_price_per_work_unit: 0.08,
+            required_work_units: 12.0,
+            min_benchmark_score: 50.0,
+            capabilities_required: vec!["fp16".to_string()],
+            status: ORDER_STATUS_OPEN.to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let sell_a = SellOrder {
+            order_id: "sell-a".to_string(),
+            provider_id: "provider-a".to_string(),
+            provider_job_id: "job-a".to_string(),
+            unit_price_per_work_unit: 0.05,
+            min_work_units: 5.0,
+            max_work_units: 100.0,
+            capabilities_required: vec![],
+            status: ORDER_STATUS_OPEN.to_string(),
+            created_at: "2026-01-01T00:00:10Z".to_string(),
+            updated_at: "2026-01-01T00:00:10Z".to_string(),
+        };
+        let sell_b = SellOrder {
+            order_id: "sell-b".to_string(),
+            provider_id: "provider-b".to_string(),
+            provider_job_id: "job-b".to_string(),
+            unit_price_per_work_unit: 0.05,
+            min_work_units: 5.0,
+            max_work_units: 100.0,
+            capabilities_required: vec![],
+            status: ORDER_STATUS_OPEN.to_string(),
+            created_at: "2026-01-01T00:00:05Z".to_string(),
+            updated_at: "2026-01-01T00:00:05Z".to_string(),
+        };
+        let sell_c = SellOrder {
+            order_id: "sell-c".to_string(),
+            provider_id: "provider-c".to_string(),
+            provider_job_id: "job-c".to_string(),
+            unit_price_per_work_unit: 0.04,
+            min_work_units: 5.0,
+            max_work_units: 100.0,
+            capabilities_required: vec![],
+            status: ORDER_STATUS_OPEN.to_string(),
+            created_at: "2026-01-01T00:00:20Z".to_string(),
+            updated_at: "2026-01-01T00:00:20Z".to_string(),
+        };
+
+        let mk_provider = |id: &str, score: f64| ProviderRegistryEntry {
+            provider_id: id.to_string(),
+            display_name: id.to_string(),
+            benchmark_score: score,
+            telemetry_source: "mock".to_string(),
+            status: "online".to_string(),
+            hardware: common::market::ProviderHardwareInfo {
+                gpu_model: "x".to_string(),
+                gpu_count: 1,
+                vram_gb: 24,
+                cpu_model: "y".to_string(),
+                ram_gb: 64,
+            },
+            pricing: common::market::ProviderPricingInfo {
+                unit_price_per_work_unit: 0.05,
+                min_order_work_units: 5.0,
+                currency: "USD".to_string(),
+            },
+            capabilities: common::market::ProviderCapabilities {
+                supports_fp16: true,
+                supports_int8: true,
+                max_context_tokens: 32000,
+                tags: vec!["llm".to_string()],
+            },
+            last_seen_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let providers = vec![
+            mk_provider("provider-a", 90.0),
+            mk_provider("provider-b", 100.0),
+            mk_provider("provider-c", 70.0),
+        ];
+
+        let out = compute_matches(
+            vec![buy],
+            vec![sell_a, sell_b, sell_c],
+            providers,
+            &Arc::new(Mutex::new(HashSet::new())),
+            &Arc::new(Mutex::new(HashSet::new())),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].sell_order_id, "sell-c");
+    }
+
+    #[tokio::test]
+    async fn proposed_match_can_be_accepted_and_locks_orders() {
+        let state = AppState::default();
+        state.accepted_matches.lock().unwrap().clear();
+        state.locked_buy_orders.lock().unwrap().clear();
+        state.locked_sell_orders.lock().unwrap().clear();
+        if let Some(task) = state.tasks.lock().unwrap().get_mut("task-demo") {
+            task.bound_match_id = None;
+        }
+
+        let app = app_with_state(state.clone());
+        let req = Request::builder()
+            .uri("/internal/market/matches/accept")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "buy_order_id": "buy-order-task-demo",
+                    "sell_order_id": "sell-order-demo-1"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let accepted = state.accepted_matches.lock().unwrap();
+        let match_id = build_match_id("buy-order-task-demo", "sell-order-demo-1");
+        assert_eq!(
+            accepted.get(&match_id).unwrap().status,
+            MATCH_STATUS_ACCEPTED
+        );
+        assert!(state
+            .locked_buy_orders
+            .lock()
+            .unwrap()
+            .contains("buy-order-task-demo"));
+        assert!(state
+            .locked_sell_orders
+            .lock()
+            .unwrap()
+            .contains("sell-order-demo-1"));
+    }
+
+    #[tokio::test]
+    async fn same_buy_or_sell_cannot_be_double_accepted() {
+        let state = AppState::default();
+        let app = app_with_state(state.clone());
+
+        let req = Request::builder()
+            .uri("/internal/market/matches/accept")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "buy_order_id": "buy-order-task-demo",
+                    "sell_order_id": "sell-order-demo-1"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let req2 = Request::builder()
+            .uri("/internal/market/matches/accept")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "buy_order_id": "buy-order-task-demo",
+                    "sell_order_id": "sell-order-demo-1"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp2 = app.oneshot(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn settlement_requires_accepted_match_binding() {
+        let accepted_matches = Arc::new(Mutex::new(HashMap::<String, AcceptedMatchBinding>::new()));
+        let mut task = TaskRuntime {
+            task_id: "task-test".to_string(),
+            status: "running".to_string(),
+            provider_job_id: "job-demo".to_string(),
+            spent: 0.0,
+            budget_max: 100.0,
+            last_window_index: 2,
+            last_owed_window: 2.0,
+            stall_status: "ok".to_string(),
+            last_audit_event: None,
+            evidence_bundle: EvidenceBundle {
+                version: "v1".to_string(),
+                job_id: "job-demo".to_string(),
+                window_range: "0-0".to_string(),
+                merge_policy: "30s".to_string(),
+                receipts: vec![],
+                root_hash: "".to_string(),
+                telemetry_samples_digest: "".to_string(),
+                telemetry_source_manifest: "".to_string(),
+                pricing_inputs: "".to_string(),
+                idempotency_records: vec![],
+                conflict_records: vec![],
+                stall_records: vec![],
+                generated_at_utc: "".to_string(),
+                generator_version: "".to_string(),
+            },
+            last_progress_at_secs: 0,
+            stall_sla_secs: 6,
+            merge_window_count: 2,
+            pending_windows: vec![
+                WindowCharge {
+                    window_index: 1,
+                    owed_window: 1.0,
+                },
+                WindowCharge {
+                    window_index: 2,
+                    owed_window: 2.0,
+                },
+            ],
+            settled_windows: HashSet::new(),
+            last_settled_window_index: 0,
+            last_invoice_id: None,
+            last_payment_id: None,
+            total_paid: 0.0,
+            payment_records: vec![],
+            bound_match_id: None,
+            settlement_audit_events: vec![],
+            next_invoice_seq: 1,
+            next_payment_seq: 1,
+        };
+
+        let mut gateway = MockSettlementGateway::default();
+        maybe_merge_and_settle(&mut task, &mut gateway, "127.0.0.1:4001", &accepted_matches);
+        assert!(task.payment_records.is_empty());
+
+        let match_id = "match-buy-order-task-test-sell-order-demo-1".to_string();
+        task.bound_match_id = Some(match_id.clone());
+        accepted_matches.lock().unwrap().insert(
+            match_id.clone(),
+            AcceptedMatchBinding {
+                match_id,
+                task_id: "task-test".to_string(),
+                provider_id: "provider-demo".to_string(),
+                buy_order_id: "buy-order-task-test".to_string(),
+                sell_order_id: "sell-order-demo-1".to_string(),
+                provider_job_id: "job-demo".to_string(),
+                agreed_unit_price: 0.05,
+                agreed_work_units: 3.0,
+                status: MATCH_STATUS_ACCEPTED.to_string(),
+            },
+        );
+
+        maybe_merge_and_settle(&mut task, &mut gateway, "127.0.0.1:4001", &accepted_matches);
+        assert_eq!(task.payment_records.len(), 1);
+        assert_eq!(
+            task.payment_records[0].match_id.as_deref(),
+            Some("match-buy-order-task-test-sell-order-demo-1")
+        );
+    }
+
+    #[test]
+    fn buy_and_match_status_progress_consistently_to_settling_and_settled() {
+        let state = AppState::default();
+        let match_id = build_match_id("buy-order-task-demo", "sell-order-demo-1");
+        if let Some(task) = state.tasks.lock().unwrap().get_mut("task-demo") {
+            task.bound_match_id = Some(match_id.clone());
+        }
+
+        {
+            let mut accepted = state.accepted_matches.lock().unwrap();
+            accepted.insert(
+                match_id.clone(),
+                AcceptedMatchBinding {
+                    match_id: match_id.clone(),
+                    task_id: "task-demo".to_string(),
+                    provider_id: "provider-demo".to_string(),
+                    buy_order_id: "buy-order-task-demo".to_string(),
+                    sell_order_id: "sell-order-demo-1".to_string(),
+                    provider_job_id: "job-demo".to_string(),
+                    agreed_unit_price: 0.05,
+                    agreed_work_units: 10.0,
+                    status: MATCH_STATUS_SETTLING.to_string(),
+                },
+            );
+        }
+
+        let buy_orders = collect_buy_orders(&state);
+        assert_eq!(buy_orders[0].status, ORDER_STATUS_SETTLING);
+
+        {
+            let mut accepted = state.accepted_matches.lock().unwrap();
+            accepted
+                .entry(match_id.clone())
+                .and_modify(|m| m.status = MATCH_STATUS_SETTLED.to_string());
+        }
+
+        let buy_orders = collect_buy_orders(&state);
+        assert_eq!(buy_orders[0].status, ORDER_STATUS_SETTLED);
+        let accepted = state.accepted_matches.lock().unwrap();
+        assert_eq!(
+            accepted.get(&match_id).unwrap().status,
+            MATCH_STATUS_SETTLED
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_runtime_is_reflected_in_buy_and_match_status_views() {
+        let state = AppState::default();
+        let match_id = build_match_id("buy-order-task-demo", "sell-order-demo-1");
+
+        {
+            let mut tasks = state.tasks.lock().unwrap();
+            let task = tasks.get_mut("task-demo").unwrap();
+            task.bound_match_id = Some(match_id.clone());
+            task.last_payment_id = Some("pay-task-demo-1".to_string());
+            task.last_invoice_id = Some("inv-task-demo-1-2".to_string());
+        }
+        {
+            let mut accepted = state.accepted_matches.lock().unwrap();
+            accepted.insert(
+                match_id.clone(),
+                AcceptedMatchBinding {
+                    match_id: match_id.clone(),
+                    task_id: "task-demo".to_string(),
+                    provider_id: "provider-demo".to_string(),
+                    buy_order_id: "buy-order-task-demo".to_string(),
+                    sell_order_id: "sell-order-demo-1".to_string(),
+                    provider_job_id: "job-demo".to_string(),
+                    agreed_unit_price: 0.05,
+                    agreed_work_units: 10.0,
+                    status: MATCH_STATUS_ACCEPTED.to_string(),
+                },
+            );
+        }
+
+        let app = app_with_state(state);
+
+        let buy_req = Request::builder()
+            .uri(MARKET_ROUTE_BUY_ORDERS)
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let buy_resp = app.clone().oneshot(buy_req).await.unwrap();
+        let buy_body = to_bytes(buy_resp.into_body(), usize::MAX).await.unwrap();
+        let buy_json: Value = serde_json::from_slice(&buy_body).unwrap();
+        assert_eq!(buy_json[0]["status"], ORDER_STATUS_SETTLED);
+
+        let match_req = Request::builder()
+            .uri(MARKET_ROUTE_MATCHES)
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let match_resp = app.oneshot(match_req).await.unwrap();
+        let match_body = to_bytes(match_resp.into_body(), usize::MAX).await.unwrap();
+        let match_json: Value = serde_json::from_slice(&match_body).unwrap();
+        assert_eq!(match_json[0]["status"], MATCH_STATUS_SETTLED);
     }
 }

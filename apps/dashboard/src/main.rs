@@ -4,7 +4,13 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use common::runtime_config::load_runtime_config;
+use common::{
+    market::{
+        MARKET_ROUTE_BUY_ORDERS, MARKET_ROUTE_MATCHES, MARKET_ROUTE_PROVIDERS,
+        MARKET_ROUTE_SELL_ORDERS,
+    },
+    runtime_config::load_runtime_config,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,8 +18,7 @@ use std::sync::Arc;
 
 const PROVIDER_TELEMETRY_FALLBACK_HINT: &str = "fallback 提示：provider telemetry_source=mock";
 const API_UNREACHABLE_HINT: &str = "API 不可达：请确认 providerd/agentd 正在运行";
-const FIBER_UNAVAILABLE_HINT: &str =
-    "fiber unavailable: 当前显示可能处于安全降级/失败记录路径";
+const FIBER_UNAVAILABLE_HINT: &str = "fiber unavailable: 当前显示可能处于安全降级/失败记录路径";
 
 #[derive(Clone)]
 struct AppState {
@@ -56,10 +61,15 @@ struct DashboardPayload {
     task_status: Option<String>,
     total_paid: Option<f64>,
     total_confirmed_paid: Option<f64>,
+    bound_match_id: Option<String>,
     reconciliation: ReconciliationPanel,
     live_settlement: LiveSettlement,
     telemetry: TelemetryPanel,
     receipt_evidence: ReceiptEvidencePanel,
+    provider_pool: Vec<Value>,
+    sell_orders: Vec<Value>,
+    buy_orders: Vec<Value>,
+    match_records: Vec<Value>,
     warnings: Vec<String>,
     api_error: Option<String>,
 }
@@ -129,9 +139,7 @@ async fn main() {
             agent_base: "http://127.0.0.1:4002".to_string(),
         }));
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:4003")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:4003").await.unwrap();
     println!("dashboard listening on http://127.0.0.1:4003");
     axum::serve(listener, app).await.unwrap();
 }
@@ -174,6 +182,7 @@ async fn index() -> Html<&'static str> {
 <body>
   <div class='header'>
     <h1>SliceStream Desktop Client</h1>
+    <p class='mono' style='margin:6px 0 0 0;color:#7da6c4'>architecture: market (registry/orders/matches) + settlement/evidence bridge</p>
     <span class='hint'>Desktop-first view · Auto-refresh every 2 seconds</span>
   </div>
 
@@ -220,6 +229,14 @@ async fn index() -> Html<&'static str> {
       <dl id='receipt'></dl>
       <div><h4>payment_records</h4><pre id='paymentRecords' class='mono'></pre></div>
       <div><h4>conflict_records</h4><pre id='conflictRecords' class='mono'></pre></div>
+    </section>
+
+    <section class='card'>
+      <h3>Provider Pool / Order Schema</h3>
+      <div><h4>provider_registry</h4><pre id='providerPool' class='mono'></pre></div>
+      <div><h4>sell_orders</h4><pre id='sellOrders' class='mono'></pre></div>
+      <div><h4>buy_orders</h4><pre id='buyOrders' class='mono'></pre></div>
+      <div><h4>match_records</h4><pre id='matchRecords' class='mono'></pre></div>
     </section>
   </div>
 
@@ -292,6 +309,7 @@ async function refresh() {
       ['benchmark_score', data.benchmark_score],
       ['selected_task_id', data.selected_task_id],
       ['selected_provider_id', data.selected_provider_id],
+      ['bound_match_id', data.bound_match_id],
     ]);
 
     renderDl('reconcile', [
@@ -334,6 +352,10 @@ async function refresh() {
 
     document.getElementById('paymentRecords').textContent = JSON.stringify(data.receipt_evidence.payment_records || [], null, 2);
     document.getElementById('conflictRecords').textContent = JSON.stringify(data.receipt_evidence.conflict_records || [], null, 2);
+    document.getElementById('providerPool').textContent = JSON.stringify(data.provider_pool || [], null, 2);
+    document.getElementById('sellOrders').textContent = JSON.stringify(data.sell_orders || [], null, 2);
+    document.getElementById('buyOrders').textContent = JSON.stringify(data.buy_orders || [], null, 2);
+    document.getElementById('matchRecords').textContent = JSON.stringify(data.match_records || [], null, 2);
 
     renderAlerts(data.warnings || [], data.api_error);
   } catch (e) {
@@ -386,9 +408,10 @@ async fn meta(State(state): State<Arc<AppState>>) -> Json<Value> {
             .map(|p| p.id.clone())
             .unwrap_or_else(|| "provider-demo".to_string()),
     };
-    Json(serde_json::to_value(payload).unwrap_or_else(
-        |_| serde_json::json!({ "error": "serialize_failed" }),
-    ))
+    Json(
+        serde_json::to_value(payload)
+            .unwrap_or_else(|_| serde_json::json!({ "error": "serialize_failed" })),
+    )
 }
 
 async fn live_dashboard(
@@ -430,17 +453,29 @@ async fn live_dashboard(
     );
     let agent_status_url = format!("{}/v1/tasks/{}", state.agent_base, task_id);
     let agent_receipt_url = format!("{}/v1/tasks/{}/receipt", state.agent_base, task_id);
+    let provider_registry_url = format!("{}{}", provider.base_url, MARKET_ROUTE_PROVIDERS);
+    let sell_orders_url = format!("{}{}", provider.base_url, MARKET_ROUTE_SELL_ORDERS);
+    let buy_orders_url = format!("{}{}", state.agent_base, MARKET_ROUTE_BUY_ORDERS);
+    let match_records_url = format!("{}{}", state.agent_base, MARKET_ROUTE_MATCHES);
 
     let provider_status = get_json(&state.http, &provider_status_url).await;
     let provider_result = get_json(&state.http, &provider_result_url).await;
     let agent_status = get_json(&state.http, &agent_status_url).await;
     let agent_receipt = get_json(&state.http, &agent_receipt_url).await;
+    let provider_registry = get_json(&state.http, &provider_registry_url).await;
+    let sell_orders = get_json(&state.http, &sell_orders_url).await;
+    let buy_orders = get_json(&state.http, &buy_orders_url).await;
+    let match_records = get_json(&state.http, &match_records_url).await;
 
     let mut warnings = collect_request_warnings(
         &provider_status,
         &provider_result,
         &agent_status,
         &agent_receipt,
+        &provider_registry,
+        &sell_orders,
+        &buy_orders,
+        &match_records,
     );
 
     let fatal_api_error = has_fatal_api_error(&warnings);
@@ -457,6 +492,15 @@ async fn live_dashboard(
     let provider_result_v = provider_result.unwrap_or(Value::Null);
     let agent_status_v = agent_status.unwrap_or(Value::Null);
     let agent_receipt_v = agent_receipt.unwrap_or(Value::Null);
+    let provider_registry_v = provider_registry.unwrap_or(Value::Null);
+    let sell_orders_v = sell_orders.unwrap_or(Value::Null);
+    let buy_orders_v = buy_orders.unwrap_or(Value::Null);
+
+    let provider_pool = provider_registry_v.as_array().cloned().unwrap_or_default();
+    let sell_orders_list = sell_orders_v.as_array().cloned().unwrap_or_default();
+    let buy_orders_list = buy_orders_v.as_array().cloned().unwrap_or_default();
+    let match_records_v = match_records.unwrap_or(Value::Null);
+    let match_records_list = match_records_v.as_array().cloned().unwrap_or_default();
 
     let conflict_records = read_string_array(&agent_receipt_v, "/evidence_bundle/conflict_records");
 
@@ -489,6 +533,7 @@ async fn live_dashboard(
         task_status: read_str(&agent_status_v, "status").map(str::to_string),
         total_paid: agent_total_paid,
         total_confirmed_paid: provider_total_confirmed_paid,
+        bound_match_id: read_str(&agent_status_v, "bound_match_id").map(str::to_string),
         reconciliation: ReconciliationPanel {
             agent_total_paid,
             provider_total_confirmed_paid,
@@ -527,13 +572,18 @@ async fn live_dashboard(
                 .unwrap_or_default(),
             conflict_records,
         },
+        provider_pool,
+        sell_orders: sell_orders_list,
+        buy_orders: buy_orders_list,
+        match_records: match_records_list,
         warnings,
         api_error,
     };
 
-    Json(serde_json::to_value(payload).unwrap_or_else(
-        |_| serde_json::json!({ "error": "serialize_failed" }),
-    ))
+    Json(
+        serde_json::to_value(payload)
+            .unwrap_or_else(|_| serde_json::json!({ "error": "serialize_failed" })),
+    )
 }
 
 fn read_str<'a>(obj: &'a Value, key: &str) -> Option<&'a str> {
@@ -576,6 +626,10 @@ fn collect_request_warnings(
     provider_result: &Result<Value, String>,
     agent_status: &Result<Value, String>,
     agent_receipt: &Result<Value, String>,
+    provider_registry: &Result<Value, String>,
+    sell_orders: &Result<Value, String>,
+    buy_orders: &Result<Value, String>,
+    match_records: &Result<Value, String>,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
     if let Err(err) = provider_status {
@@ -589,6 +643,18 @@ fn collect_request_warnings(
     }
     if let Err(err) = agent_receipt {
         warnings.push(format!("agent receipt error: {err}"));
+    }
+    if let Err(err) = provider_registry {
+        warnings.push(format!("provider registry error: {err}"));
+    }
+    if let Err(err) = sell_orders {
+        warnings.push(format!("sell orders error: {err}"));
+    }
+    if let Err(err) = buy_orders {
+        warnings.push(format!("buy orders error: {err}"));
+    }
+    if let Err(err) = match_records {
+        warnings.push(format!("match records error: {err}"));
     }
     warnings
 }
@@ -608,8 +674,8 @@ async fn get_json(http: &Client, url: &str) -> Result<Value, String> {
     let response = http.get(url).send().await.map_err(|e| e.to_string())?;
     let status = response.status();
     let body = response.text().await.map_err(|e| e.to_string())?;
-    let json: Value = serde_json::from_str(&body)
-        .map_err(|e| format!("json_parse_error={e} body={}", body))?;
+    let json: Value =
+        serde_json::from_str(&body).map_err(|e| format!("json_parse_error={e} body={}", body))?;
     if !status.is_success() {
         return Err(format!("http_status={} body={}", status, json));
     }

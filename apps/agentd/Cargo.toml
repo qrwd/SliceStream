@@ -8,6 +8,7 @@ license.workspace = true
 axum.workspace = true
 tokio.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 common = { path = "../../crates/common" }
 
 [dev-dependencies]

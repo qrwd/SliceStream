@@ -96,3 +96,36 @@ Known limitation:
 - `icons/icon.svg` is the SS brand source; build can generate bundle icons via `cargo tauri icon`.
 
 This keeps protocol and backend behavior unchanged while upgrading the operator-facing UX to installable desktop form.
+
+
+## 10) Architecture integration pass (layered responsibilities)
+
+The repo is now explicitly aligned to a 7-layer architecture documented in `docs/system-architecture.md`:
+
+1. Infrastructure
+2. Observation & metering
+3. Provider registry
+4. Orders
+5. Matching
+6. Settlement & evidence
+7. Desktop/UI
+
+This pass is structural only:
+- no metering formula changes,
+- no evidence/idempotency/stall semantic changes,
+- no Fiber protocol behavior changes,
+- no existing API contract path/required changes.
+
+It also normalizes market naming via shared constants in `common::market` for route/status references used by `providerd`, `agentd`, and `dashboard`.
+
+
+## 11) Match acceptance + settlement binding
+
+Settlement is now market-driven at runtime:
+- orders are represented as buy/sell market records,
+- matching yields `proposed` records,
+- only `accepted` matches are allowed into the existing settlement chain,
+- payment/receipt/evidence surfaces carry `match_id` binding for traceability.
+
+This keeps the core metering/evidence/fiber semantics unchanged while enforcing
+`order -> match(accepted) -> settlement` execution discipline.
