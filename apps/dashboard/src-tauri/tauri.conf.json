@@ -1,0 +1,47 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SliceStream",
+  "version": "0.1.0",
+  "identifier": "com.slicestream.desktop",
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "",
+    "frontendDist": "ui"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "SliceStream",
+        "width": 1440,
+        "height": 960,
+        "minWidth": 1200,
+        "minHeight": 760,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "shortDescription": "SliceStream Desktop Client",
+    "longDescription": "SliceStream desktop app for live settlement, telemetry, and evidence visualization.",
+    "windows": {
+      "wix": {
+        "language": "en-US"
+      },
+      "nsis": {
+        "displayLanguageSelector": false,
+        "installMode": "currentUser",
+        "createDesktopShortcut": true,
+        "startMenuFolder": "SliceStream"
+      }
+    },
+    "icon": [
+      "icons/icon.svg"
+    ]
+  }
+}

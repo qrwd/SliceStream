@@ -14,7 +14,7 @@ cpp/telemetryd (250ms exported samples)
 
 cpp/qualify -> benchmark_score -> providerd runtime scaling
 
-dashboard (SSR placeholder) reads status/result endpoints.
+SliceStream Desktop Client (Tauri shell + dashboard data bridge) reads status/result endpoints.
 ```
 
 ## Default network profile (contest baseline)
@@ -46,11 +46,23 @@ cargo run -p providerd
 cargo run -p agentd
 ```
 
-### 3) Optional UI placeholder
+### 3) Desktop Client (official UI entry)
 
 ```bash
+# start local dashboard data bridge
 cargo run -p dashboard
+
+# launch desktop shell (Windows-first)
+cd apps/dashboard/src-tauri
+cargo tauri dev
 ```
+
+> Note: the web view served by `cargo run -p dashboard` is retained as internal debug bridge; external demo/main UX is the desktop client window.
+
+
+Desktop runtime dependencies:
+- **Windows (recommended)**: WebView2 runtime + Visual Studio C++ build tools (for local Tauri builds).
+- **Linux container/CI**: Tauri may fail to compile without GTK/WebKit development libs (e.g. `glib-2.0`, `webkit2gtk`). This is an environment limitation, not SliceStream protocol/business-logic failure.
 
 ## Settlement modes
 
@@ -103,3 +115,29 @@ Before final handoff, verify this package is complete:
 - **Summary**: short problem/solution/value summary for judges.
 - **Technical breakdown**: attach/link `docs/technical-breakdown.md` in submission materials.
 
+
+
+## Desktop packaging (Windows)
+
+```bash
+cd apps/dashboard/src-tauri
+# optional icon generation from SS svg
+cargo tauri icon icons/icon.svg
+
+# create NSIS installer with desktop + start-menu shortcuts
+cargo tauri build --bundles nsis
+```
+
+Desktop branding assets live under `apps/dashboard/src-tauri/icons/` and use the `SS` mark (`icon.svg`) as source.
+
+
+> Repo note: to keep PR diff text-friendly, we do **not** commit generated binary icon artifacts (`.png/.ico`).
+> If your local packager requires them, generate locally with:
+> `cargo tauri icon icons/icon.svg`
+
+
+## Desktop client status (current)
+
+- **Already usable in desktop client**: bridge connection status, settlement mode, network/prefix badges, and embedded full dashboard panels (overview/live settlement/telemetry/receipt-evidence).
+- **Still depends on dashboard bridge**: desktop shell reads from local `apps/dashboard` HTTP bridge (`127.0.0.1:4003`).
+- **Future polish**: richer installer assets/signing and deeper native integrations remain future optimization.

@@ -86,3 +86,13 @@ Known limitation:
 - Treat Fiber `record_result` as current minimal placeholder (known limitation), not full finalization logic.
 - For live demo reliability, prefer mock main path and fiber as optional capability segment.
 
+
+
+## 9) Desktop client conversion (Tauri)
+
+- Official UI entry is now a Tauri desktop shell named **SliceStream** (`apps/dashboard/src-tauri`).
+- Existing dashboard Rust service is reused as an internal data bridge (`cargo run -p dashboard`) so current API aggregation logic is preserved.
+- Desktop shell enforces app-like window defaults (1440x960, min size guard) and package metadata/shortcuts through NSIS config.
+- `icons/icon.svg` is the SS brand source; build can generate bundle icons via `cargo tauri icon`.
+
+This keeps protocol and backend behavior unchanged while upgrading the operator-facing UX to installable desktop form.

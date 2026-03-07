@@ -30,8 +30,8 @@ cargo run -p agentd
 ### Verify Agent task/receipt view
 
 ```bash
-curl -s http://127.0.0.1:4002/v1/agent/tasks/task-demo | jq
-curl -s http://127.0.0.1:4002/v1/agent/tasks/task-demo/receipt | jq
+curl -s http://127.0.0.1:4002/v1/tasks/task-demo | jq
+curl -s http://127.0.0.1:4002/v1/tasks/task-demo/receipt | jq
 ```
 
 Expected:
@@ -100,8 +100,8 @@ cargo run -p providerd
 cargo run -p agentd
 
 # terminal-3 (observe)
-curl -s http://127.0.0.1:4002/v1/agent/tasks/task-demo | jq
-curl -s http://127.0.0.1:4002/v1/agent/tasks/task-demo/receipt | jq
+curl -s http://127.0.0.1:4002/v1/tasks/task-demo | jq
+curl -s http://127.0.0.1:4002/v1/tasks/task-demo/receipt | jq
 curl -s http://127.0.0.1:4001/v1/provider/jobs/job-demo | jq
 curl -s http://127.0.0.1:4001/v1/provider/jobs/job-demo/result | jq
 ```
@@ -123,8 +123,8 @@ cargo run -p providerd
 cargo run -p agentd
 
 # 3) observe agent/provider views (terminal-3)
-curl -s http://127.0.0.1:4002/v1/agent/tasks/task-demo | jq
-curl -s http://127.0.0.1:4002/v1/agent/tasks/task-demo/receipt | jq
+curl -s http://127.0.0.1:4002/v1/tasks/task-demo | jq
+curl -s http://127.0.0.1:4002/v1/tasks/task-demo/receipt | jq
 curl -s http://127.0.0.1:4001/v1/provider/jobs/job-demo | jq
 curl -s http://127.0.0.1:4001/v1/provider/jobs/job-demo/result | jq
 
@@ -144,3 +144,68 @@ Expected:
 - Step 4 demonstrates fiber error categorization without panic.
 - Step 5 is the rapid fallback path to keep demo continuity.
 
+
+
+---
+
+
+## Desktop Client (Tauri, Windows-first)
+
+Desktop app is now the primary presentation entry. Start Provider/Agent first, then launch desktop:
+
+```bash
+# terminal-1
+cargo run -p providerd
+
+# terminal-2
+cargo run -p agentd
+
+# terminal-3 (internal dashboard data bridge)
+cargo run -p dashboard
+
+# terminal-4 (desktop shell)
+cd apps/dashboard/src-tauri
+cargo tauri dev
+```
+
+Expected:
+- Window title is `SliceStream` with 1440x960 default size.
+- Desktop shell status row explicitly shows:
+  - `bridge: connected` / `bridge: disconnected`
+  - `mode: mock|fiber`
+  - `network/prefix: ...`
+- If dashboard bridge is not started, client shows a clear retry/help card (`cargo run -p dashboard`) instead of blank content.
+- When bridge reconnects, embedded dashboard loads automatically.
+
+### Desktop smoke-check (minimal)
+
+```bash
+python apps/dashboard/src-tauri/scripts/smoke_check.py
+```
+
+Expected:
+- Tauri config / UI markers exist and are consistent.
+
+### Windows packaging (NSIS installer)
+
+```bash
+cd apps/dashboard/src-tauri
+# optional: generate png/ico variants from the bundled SS svg
+cargo tauri icon icons/icon.svg
+
+# build installer + desktop/start-menu shortcuts
+cargo tauri build --bundles nsis
+```
+
+Expected:
+- Installer/product name is `SliceStream`.
+- Desktop/start-menu shortcuts are created by NSIS bundle settings.
+
+
+Binary-diff note:
+- This repo intentionally keeps desktop icon source as text (`icon.svg`) in git.
+- Generate `.png/.ico` locally only when needed for packaging to avoid PR binary-diff limitations.
+
+
+Environment note:
+- In Linux containers missing GTK/WebKit development packages, `cargo tauri dev`/`cargo check` can fail before runtime (e.g. missing `glib-2.0`). This is infra dependency limitation, not core logic regression.

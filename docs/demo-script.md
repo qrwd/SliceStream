@@ -31,12 +31,32 @@ Expected:
 
 ---
 
-### 35–60s: Show mock merged settlement evolution
+
+### 35–55s: Launch Desktop Client (official UI)
 Run:
 
 ```bash
-curl -s http://127.0.0.1:4002/v1/agent/tasks/task-demo | jq
-curl -s http://127.0.0.1:4002/v1/agent/tasks/task-demo/receipt | jq
+# terminal-3
+cargo run -p dashboard
+
+# terminal-4
+cd apps/dashboard/src-tauri
+cargo tauri dev
+```
+
+Expected:
+- SliceStream desktop window opens with status row showing bridge/mode/network.
+- If bridge is up, status becomes `bridge: connected` and embedded dashboard panels are visible.
+- If bridge is down, a non-blank retry/help card appears (`cargo run -p dashboard`) until reconnect.
+
+---
+
+### 55–75s: Show mock merged settlement evolution
+Run:
+
+```bash
+curl -s http://127.0.0.1:4002/v1/tasks/task-demo | jq
+curl -s http://127.0.0.1:4002/v1/tasks/task-demo/receipt | jq
 ```
 
 Expected:
@@ -45,7 +65,7 @@ Expected:
 
 ---
 
-### 60–80s: Show Provider reconciliation consistency
+### 75–92s: Show Provider reconciliation consistency
 Run:
 
 ```bash
@@ -58,7 +78,7 @@ Expected:
 
 ---
 
-### 80–100s: Show Fiber mode graceful behavior (minimal real RPC)
+### 92–108s: Show Fiber mode graceful behavior (minimal real RPC)
 Run (quick restart or separate prepared terminal):
 
 ```bash
@@ -73,7 +93,7 @@ Expected:
 
 ---
 
-### 100–115s: Close with “done vs next”
+### 108–120s: Close with “done vs next”
 Say:
 - Done: deterministic metering, merge settlement, telemetry+benchmark integration, reconciliation and evidence path.
 - Next: fuller on-chain record/result semantics and production dashboard/indexing.
