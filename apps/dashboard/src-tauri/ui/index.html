@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SliceStream Desktop Terminal</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { margin: 0; height: 100%; font-family: Inter, system-ui, sans-serif; background: #070d1a; color: #eaf0ff; }
+    .shell { height: 100%; display: grid; grid-template-rows: auto 1fr; }
+    .top {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(180px, 1fr));
+      gap: 10px;
+      padding: 10px;
+      border-bottom: 1px solid #22365f;
+      background: linear-gradient(180deg, #0f1a33, #0b1428);
+    }
+    .pill { border: 1px solid #314c82; border-radius: 10px; padding: 8px 10px; background: #131f3d; }
+    .k { color: #9fb4e7; font-size: 11px; text-transform: uppercase; }
+    .v { font-size: 15px; font-weight: 700; margin-top: 4px; }
+    .sub { font-size: 11px; color: #9fb4e7; margin-top: 3px; }
+    .ok { color: #7ee6a2; }
+    .err { color: #ff8fa0; }
+    .frame-wrap { position: relative; min-height: 0; }
+    iframe { width: 100%; height: 100%; border: 0; background: #070d1a; }
+    .overlay {
+      position: absolute; inset: 0; display: none;
+      align-items: center; justify-content: center;
+      background: radial-gradient(1200px 500px at 20% 0%, rgba(90,130,255,.16), transparent 60%), #070d1a;
+    }
+    .card {
+      width: min(760px, 92%);
+      border: 1px solid #304d84;
+      border-radius: 14px;
+      background: #121f3d;
+      padding: 20px;
+    }
+    .card h2 { margin-top: 0; }
+    .line { color: #b3c4f0; margin: 8px 0; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    button {
+      border: 1px solid #4f73bd;
+      border-radius: 8px;
+      background: #1a2f5e;
+      color: #fff;
+      padding: 8px 12px;
+      cursor: pointer;
+      margin-right: 8px;
+    }
+  </style>
+</head>
+<body>
+  <!-- smoke markers: Bridge / Connected / Disconnected / mode / Network / Prefix / cargo run -p dashboard -->
+  <div class="shell">
+    <section class="top">
+      <div class="pill"><div class="k">Bridge</div><div id="bridge" class="v err">Disconnected</div><div class="sub">desktop terminal host</div></div>
+      <div class="pill"><div class="k">Runtime</div><div id="mode" class="v">-</div><div id="network" class="sub">-</div></div>
+      <div class="pill"><div class="k">Terminal</div><div class="v">SliceStream Trading Terminal</div><div id="last" class="sub">-</div></div>
+    </section>
+    <section class="frame-wrap">
+      <iframe id="terminalFrame" title="SliceStream Terminal"></iframe>
+      <div id="overlay" class="overlay">
+        <div class="card">
+          <h2>Disconnected</h2>
+          <p class="line">Desktop terminal is waiting for dashboard bridge.</p>
+          <p class="line mono">Please start: <b>cargo run -p dashboard</b></p>
+          <p class="line mono">Then keep providerd and agentd running.</p>
+          <button id="retryBtn">Retry Connection</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const BRIDGE = 'http://127.0.0.1:4003';
+    const frame = document.getElementById('terminalFrame');
+    const overlay = document.getElementById('overlay');
+    const bridge = document.getElementById('bridge');
+    const mode = document.getElementById('mode');
+    const network = document.getElementById('network');
+    const last = document.getElementById('last');
+
+    function setConnected(data) {
+      bridge.textContent = 'Connected';
+      bridge.className = 'v ok';
+      mode.textContent = `settlement=${data?.settlement_mode || '-'}`;
+      network.textContent = `${data?.network || '-'} / ${data?.prefix || '-'}`;
+      last.textContent = new Date().toLocaleTimeString();
+      overlay.style.display = 'none';
+      if (frame.src !== `${BRIDGE}/`) {
+        frame.src = `${BRIDGE}/`;
+      }
+    }
+
+    function setDisconnected() {
+      bridge.textContent = 'Disconnected';
+      bridge.className = 'v err';
+      last.textContent = new Date().toLocaleTimeString();
+      overlay.style.display = 'flex';
+    }
+
+    async function probe() {
+      try {
+        const res = await fetch(`${BRIDGE}/api/live/task-demo?provider=provider-demo`);
+        if (!res.ok) throw new Error(`http_${res.status}`);
+        const data = await res.json();
+        setConnected(data);
+      } catch (_e) {
+        setDisconnected();
+      }
+    }
+
+    document.getElementById('retryBtn').addEventListener('click', probe);
+    probe();
+    setInterval(probe, 2500);
+  </script>
+</body>
+</html>
