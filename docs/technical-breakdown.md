@@ -76,7 +76,7 @@ Known limitation:
 ### Future
 - stronger production persistence/indexing
 - deeper on-chain result-finalization semantics
-- dashboard UX beyond placeholder scope
+- terminal-style dashboard/desktop UX is implemented (release-closing pass)
 
 
 ## 8) Pre-submit boundary reminders
@@ -123,9 +123,22 @@ It also normalizes market naming via shared constants in `common::market` for ro
 
 Settlement is now market-driven at runtime:
 - orders are represented as buy/sell market records,
-- matching yields `proposed` records,
+- matching yields `proposed` records and can transition to `accepted/rejected/settling/settled`,
 - only `accepted` matches are allowed into the existing settlement chain,
 - payment/receipt/evidence surfaces carry `match_id` binding for traceability.
 
 This keeps the core metering/evidence/fiber semantics unchanged while enforcing
 `order -> match(accepted) -> settlement` execution discipline.
+
+
+## 12) Release closing pass alignment
+
+This pass is scope-limited to release alignment and does **not** change core protocol behavior:
+- documentation now matches current runtime facts for market/matching states and terminal UX,
+- `docs/api-contract.yaml` includes internal market/pricing/action extension docs,
+- Tauri desktop entry now consistently hosts the same terminal experience through the dashboard bridge path.
+
+Unchanged by design:
+- metering constants/formula semantics,
+- evidence/idempotency/stall semantics,
+- fiber error taxonomy and reconciliation core behavior.

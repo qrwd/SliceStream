@@ -170,12 +170,9 @@ cargo tauri dev
 
 Expected:
 - Window title is `SliceStream` with 1440x960 default size.
-- Desktop shell status row explicitly shows:
-  - `bridge: connected` / `bridge: disconnected`
-  - `mode: mock|fiber`
-  - `network/prefix: ...`
-- If dashboard bridge is not started, client shows a clear retry/help card (`cargo run -p dashboard`) instead of blank content.
-- When bridge reconnects, embedded dashboard loads automatically.
+- Desktop shell top strip shows bridge + mode + network/prefix and continuously probes the bridge.
+- If dashboard bridge is not started, the shell stays in terminal-styled disconnected state with retry guidance (`cargo run -p dashboard`).
+- After bridge recovery, Tauri window naturally switches to the same terminal UI served by `apps/dashboard` (`http://127.0.0.1:4003/`).
 
 ### Desktop smoke-check (minimal)
 
@@ -246,3 +243,26 @@ Expected:
 - only accepted-bound task runtime proceeds through payment/receipt/evidence/reconciliation path.
 - receipt/payment metadata exposes match binding (`bound_match_id`, per-payment `match_id`, and evidence pricing input match reference).
 
+
+
+## Desktop terminal unified entry (release closing pass)
+
+```bash
+# 1) provider
+cargo run -p providerd
+
+# 2) agent
+cargo run -p agentd
+
+# 3) dashboard bridge (terminal source)
+cargo run -p dashboard
+
+# 4) tauri shell (single official desktop entry)
+cd apps/dashboard/src-tauri
+cargo tauri dev
+```
+
+Expected:
+- Tauri desktop entry is a single shell that carries the official market terminal experience.
+- The shell no longer has a separate, style-divergent bridge-only homepage.
+- Bridge disconnected/connected states are rendered in the same terminal style and transition automatically.

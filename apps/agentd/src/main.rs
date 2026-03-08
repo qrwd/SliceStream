@@ -9,11 +9,12 @@ use common::{
     evidence::{evidence_root, verify, EvidenceBundle, EvidenceReceipt},
     idempotency::{make_key, record_payment},
     market::{
-        BuyOrder, MatchRecord, ProviderRegistryEntry, SellOrder, MARKET_ROUTE_BUY_ORDERS,
-        MARKET_ROUTE_MATCHES, MARKET_ROUTE_PROVIDERS, MARKET_ROUTE_SELL_ORDERS,
-        MATCH_STATUS_ACCEPTED, MATCH_STATUS_FAILED, MATCH_STATUS_PROPOSED, MATCH_STATUS_REJECTED,
-        MATCH_STATUS_SETTLED, MATCH_STATUS_SETTLING, ORDER_STATUS_LOCKED, ORDER_STATUS_MATCHED,
-        ORDER_STATUS_OPEN, ORDER_STATUS_SETTLED, ORDER_STATUS_SETTLING,
+        BuyOrder, MatchRecord, ProviderRegistryEntry, SellOrder, MARKET_MODE_AUTO,
+        MARKET_MODE_HYBRID, MARKET_MODE_MANUAL, MARKET_ROUTE_MATCHES, MARKET_ROUTE_PROVIDERS,
+        MARKET_ROUTE_SELL_ORDERS, MATCH_STATUS_ACCEPTED, MATCH_STATUS_FAILED,
+        MATCH_STATUS_PROPOSED, MATCH_STATUS_REJECTED, MATCH_STATUS_SETTLED, MATCH_STATUS_SETTLING,
+        ORDER_STATUS_LOCKED, ORDER_STATUS_MATCHED, ORDER_STATUS_OPEN, ORDER_STATUS_SETTLED,
+        ORDER_STATUS_SETTLING, PRICE_MODE_BAND, PRICE_MODE_FIXED, PRICE_MODE_RECOMMENDED_BAND,
     },
     runtime_config::{load_runtime_config, SettlementMode},
     stall::{assess_stall, ActionRecommendation},
@@ -91,6 +92,34 @@ struct MatchActionResponse {
     match_id: String,
     buy_order_id: String,
     sell_order_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MarketModePayload {
+    mode: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct PriceBandConfig {
+    min: f64,
+    max: f64,
+    target: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct MarketPricingPayload {
+    price_mode: String,
+    fixed_price: Option<f64>,
+    band: Option<PriceBandConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManualBuyOrderRequest {
+    task_id: String,
+    max_unit_price_per_work_unit: f64,
+    required_work_units: f64,
+    min_benchmark_score: f64,
+    capabilities_required: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -442,6 +471,14 @@ struct AppState {
     accepted_matches: Arc<Mutex<HashMap<String, AcceptedMatchBinding>>>,
     locked_buy_orders: Arc<Mutex<HashSet<String>>>,
     locked_sell_orders: Arc<Mutex<HashSet<String>>>,
+    market_mode: Arc<Mutex<String>>,
+    market_audit: Arc<Mutex<Vec<String>>>,
+    manual_buy_orders: Arc<Mutex<Vec<BuyOrder>>>,
+    pricing_mode: Arc<Mutex<String>>,
+    fixed_price: Arc<Mutex<f64>>,
+    band_price: Arc<Mutex<PriceBandConfig>>,
+    recommended_band: Arc<Mutex<PriceBandConfig>>,
+    recommended_confirmed: Arc<Mutex<bool>>,
 }
 
 impl Default for AppState {
@@ -521,6 +558,25 @@ impl Default for AppState {
             accepted_matches: Arc::new(Mutex::new(HashMap::new())),
             locked_buy_orders: Arc::new(Mutex::new(HashSet::new())),
             locked_sell_orders: Arc::new(Mutex::new(HashSet::new())),
+            market_mode: Arc::new(Mutex::new(
+                std::env::var("SLICESTREAM_MARKET_MODE")
+                    .unwrap_or_else(|_| MARKET_MODE_AUTO.to_string()),
+            )),
+            market_audit: Arc::new(Mutex::new(vec![])),
+            manual_buy_orders: Arc::new(Mutex::new(vec![])),
+            pricing_mode: Arc::new(Mutex::new(PRICE_MODE_FIXED.to_string())),
+            fixed_price: Arc::new(Mutex::new(0.06)),
+            band_price: Arc::new(Mutex::new(PriceBandConfig {
+                min: 0.05,
+                max: 0.09,
+                target: 0.06,
+            })),
+            recommended_band: Arc::new(Mutex::new(PriceBandConfig {
+                min: 0.052,
+                max: 0.085,
+                target: 0.062,
+            })),
+            recommended_confirmed: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -547,6 +603,24 @@ fn app_with_state(state: AppState) -> Router {
         .route(MARKET_ROUTE_MATCHES, get(get_match_records))
         .route("/internal/market/matches/accept", post(accept_match))
         .route("/internal/market/matches/reject", post(reject_match))
+        .route(
+            "/internal/market/mode",
+            get(get_market_mode).post(set_market_mode),
+        )
+        .route("/internal/market/audit", get(get_market_audit))
+        .route(
+            "/internal/market/orders/buy/manual",
+            post(create_manual_buy_order),
+        )
+        .route(
+            "/internal/market/pricing",
+            get(get_market_pricing).post(set_market_pricing),
+        )
+        .route(
+            "/internal/market/pricing/recommended/confirm",
+            post(confirm_recommended_band),
+        )
+        .route("/internal/market/bidding/start", post(start_auto_bidding))
         .with_state(state)
 }
 
@@ -774,6 +848,18 @@ async fn accept_match(
 
     let _ = lock_provider_sell_order(&state.provider_addr, &req.sell_order_id);
 
+    let mode = state.market_mode.lock().expect("market mode lock").clone();
+    let tag = if mode == MARKET_MODE_AUTO {
+        "auto_accepted_match"
+    } else {
+        "manual_override"
+    };
+    state
+        .market_audit
+        .lock()
+        .expect("market audit lock")
+        .push(format!("{} match_id={}", tag, match_id));
+
     (
         StatusCode::OK,
         Json(MatchActionResponse {
@@ -821,7 +907,241 @@ async fn reject_match(
         .into_response()
 }
 
+async fn get_market_mode(State(state): State<AppState>) -> impl IntoResponse {
+    let mode = state.market_mode.lock().expect("market mode lock").clone();
+    (StatusCode::OK, Json(MarketModePayload { mode })).into_response()
+}
+
+async fn set_market_mode(
+    State(state): State<AppState>,
+    Json(req): Json<MarketModePayload>,
+) -> impl IntoResponse {
+    let mode = match req.mode.as_str() {
+        MARKET_MODE_MANUAL => MARKET_MODE_MANUAL,
+        MARKET_MODE_AUTO => MARKET_MODE_AUTO,
+        MARKET_MODE_HYBRID => MARKET_MODE_HYBRID,
+        _ => MARKET_MODE_MANUAL,
+    }
+    .to_string();
+    *state.market_mode.lock().expect("market mode lock") = mode.clone();
+    state
+        .market_audit
+        .lock()
+        .expect("market audit lock")
+        .push(format!("manual_override market_mode={mode}"));
+    (StatusCode::OK, Json(MarketModePayload { mode })).into_response()
+}
+
+async fn get_market_audit(State(state): State<AppState>) -> impl IntoResponse {
+    let audit = state
+        .market_audit
+        .lock()
+        .expect("market audit lock")
+        .clone();
+    (StatusCode::OK, Json(audit)).into_response()
+}
+
+async fn get_market_pricing(State(state): State<AppState>) -> impl IntoResponse {
+    let payload = MarketPricingPayload {
+        price_mode: state
+            .pricing_mode
+            .lock()
+            .expect("pricing mode lock")
+            .clone(),
+        fixed_price: Some(*state.fixed_price.lock().expect("fixed price lock")),
+        band: Some(state.band_price.lock().expect("band price lock").clone()),
+    };
+    (StatusCode::OK, Json(payload)).into_response()
+}
+
+async fn set_market_pricing(
+    State(state): State<AppState>,
+    Json(req): Json<MarketPricingPayload>,
+) -> impl IntoResponse {
+    let mode = match req.price_mode.as_str() {
+        PRICE_MODE_FIXED => PRICE_MODE_FIXED,
+        PRICE_MODE_BAND => PRICE_MODE_BAND,
+        PRICE_MODE_RECOMMENDED_BAND => PRICE_MODE_RECOMMENDED_BAND,
+        _ => PRICE_MODE_FIXED,
+    }
+    .to_string();
+    *state.pricing_mode.lock().expect("pricing mode lock") = mode.clone();
+
+    if let Some(v) = req.fixed_price {
+        *state.fixed_price.lock().expect("fixed price lock") = v.max(0.0001);
+    }
+    if let Some(b) = req.band {
+        let normalized = PriceBandConfig {
+            min: b.min.min(b.max),
+            max: b.max.max(b.min),
+            target: b.target.clamp(b.min.min(b.max), b.max.max(b.min)),
+        };
+        *state.band_price.lock().expect("band price lock") = normalized.clone();
+        if mode == PRICE_MODE_RECOMMENDED_BAND {
+            *state
+                .recommended_band
+                .lock()
+                .expect("recommended band lock") = normalized;
+        }
+    } else if mode == PRICE_MODE_RECOMMENDED_BAND {
+        let budget = state
+            .tasks
+            .lock()
+            .expect("tasks lock")
+            .values()
+            .next()
+            .map(|t| t.budget_max)
+            .unwrap_or(20.0);
+        let suggested = PriceBandConfig {
+            min: (budget / 600.0).clamp(0.03, 0.08),
+            max: (budget / 300.0).clamp(0.05, 0.12),
+            target: (budget / 420.0).clamp(0.04, 0.1),
+        };
+        *state
+            .recommended_band
+            .lock()
+            .expect("recommended band lock") = suggested.clone();
+        *state.band_price.lock().expect("band price lock") = suggested.clone();
+        state
+            .market_audit
+            .lock()
+            .expect("market audit lock")
+            .push(format!(
+                "recommended_band_suggested min={:.4} max={:.4} target={:.4}",
+                suggested.min, suggested.max, suggested.target
+            ));
+    }
+    if mode == PRICE_MODE_RECOMMENDED_BAND {
+        *state
+            .recommended_confirmed
+            .lock()
+            .expect("recommended confirm lock") = false;
+        state
+            .market_audit
+            .lock()
+            .expect("market audit lock")
+            .push("manual_override recommended_band_pending_confirmation".to_string());
+    }
+
+    state
+        .market_audit
+        .lock()
+        .expect("market audit lock")
+        .push(format!("manual_override buyer_price_mode={mode}"));
+
+    get_market_pricing(State(state)).await
+}
+
+async fn confirm_recommended_band(State(state): State<AppState>) -> impl IntoResponse {
+    *state
+        .recommended_confirmed
+        .lock()
+        .expect("recommended confirm lock") = true;
+    state
+        .market_audit
+        .lock()
+        .expect("market audit lock")
+        .push("manual_override recommended_band_confirmed".to_string());
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status":"confirmed"})),
+    )
+        .into_response()
+}
+
+async fn start_auto_bidding(State(state): State<AppState>) -> impl IntoResponse {
+    state
+        .market_audit
+        .lock()
+        .expect("market audit lock")
+        .push("manual_override start_auto_bidding".to_string());
+    poll_once(&state, 0).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status":"bidding_started"})),
+    )
+        .into_response()
+}
+
+async fn create_manual_buy_order(
+    State(state): State<AppState>,
+    Json(req): Json<ManualBuyOrderRequest>,
+) -> impl IntoResponse {
+    let order = BuyOrder {
+        order_id: format!("manual-buy-order-{}", req.task_id),
+        task_id: req.task_id,
+        desired_provider_id: Some("provider-demo".to_string()),
+        max_unit_price_per_work_unit: req.max_unit_price_per_work_unit,
+        required_work_units: req.required_work_units,
+        min_benchmark_score: req.min_benchmark_score,
+        capabilities_required: req.capabilities_required,
+        status: ORDER_STATUS_OPEN.to_string(),
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        updated_at: "2026-01-01T00:00:00Z".to_string(),
+    };
+    state
+        .manual_buy_orders
+        .lock()
+        .expect("manual buy orders lock")
+        .push(order.clone());
+    state
+        .market_audit
+        .lock()
+        .expect("market audit lock")
+        .push(format!(
+            "manual_override created_manual_buy_order={}",
+            order.order_id
+        ));
+    (StatusCode::OK, Json(order)).into_response()
+}
+
+fn configured_buy_price(state: &AppState) -> Option<f64> {
+    let mode = state
+        .pricing_mode
+        .lock()
+        .expect("pricing mode lock")
+        .clone();
+    match mode.as_str() {
+        PRICE_MODE_FIXED => Some(*state.fixed_price.lock().expect("fixed price lock")),
+        PRICE_MODE_BAND => {
+            let band = state.band_price.lock().expect("band price lock").clone();
+            Some(band.target.clamp(band.min, band.max))
+        }
+        PRICE_MODE_RECOMMENDED_BAND => {
+            if !*state
+                .recommended_confirmed
+                .lock()
+                .expect("recommended confirm lock")
+            {
+                return None;
+            }
+            let band = state
+                .recommended_band
+                .lock()
+                .expect("recommended band lock")
+                .clone();
+            Some(band.target.clamp(band.min, band.max))
+        }
+        _ => Some(*state.fixed_price.lock().expect("fixed price lock")),
+    }
+}
+
 fn collect_buy_orders(state: &AppState) -> Vec<BuyOrder> {
+    let mode = state.market_mode.lock().expect("market mode lock").clone();
+    if mode == MARKET_MODE_MANUAL {
+        return state
+            .manual_buy_orders
+            .lock()
+            .expect("manual buy orders lock")
+            .clone();
+    }
+
+    let selected_price = configured_buy_price(state);
+    if selected_price.is_none() {
+        return vec![];
+    }
+    let selected_price = selected_price.unwrap_or(0.06);
+
     let tasks = state.tasks.lock().expect("tasks lock");
     let locked_buys = state
         .locked_buy_orders
@@ -834,7 +1154,7 @@ fn collect_buy_orders(state: &AppState) -> Vec<BuyOrder> {
         .expect("accepted matches lock")
         .clone();
 
-    tasks
+    let orders: Vec<BuyOrder> = tasks
         .values()
         .map(|task| {
             let order_id = format!("buy-order-{}", task.task_id);
@@ -860,7 +1180,7 @@ fn collect_buy_orders(state: &AppState) -> Vec<BuyOrder> {
                 order_id,
                 task_id: task.task_id.clone(),
                 desired_provider_id: Some("provider-demo".to_string()),
-                max_unit_price_per_work_unit: 0.06,
+                max_unit_price_per_work_unit: selected_price,
                 required_work_units: if task.last_owed_window > 0.0 {
                     task.last_owed_window.max(1.0)
                 } else {
@@ -873,7 +1193,14 @@ fn collect_buy_orders(state: &AppState) -> Vec<BuyOrder> {
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
             }
         })
-        .collect()
+        .collect();
+
+    state
+        .market_audit
+        .lock()
+        .expect("market audit lock")
+        .push("auto_created_buy_order".to_string());
+    orders
 }
 
 fn provider_supports_capability(provider: &ProviderRegistryEntry, cap: &str) -> bool {
@@ -975,7 +1302,13 @@ fn compute_matches(
                 match_id: format!("match-{}-{}", buy.order_id, sell.order_id),
                 buy_order_id: buy.order_id.clone(),
                 sell_order_id: sell.order_id.clone(),
-                agreed_unit_price: sell.unit_price_per_work_unit,
+                agreed_unit_price: ((sell.unit_price_per_work_unit
+                    + buy.max_unit_price_per_work_unit)
+                    / 2.0)
+                    .clamp(
+                        sell.unit_price_per_work_unit,
+                        buy.max_unit_price_per_work_unit,
+                    ),
                 agreed_work_units,
                 status: MATCH_STATUS_PROPOSED.to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -1611,20 +1944,59 @@ async fn poll_once(state: &AppState, now_secs: u64) {
 
     for (task_id, provider_job_id) in tasks_to_poll {
         if let Some(polled) = fetch_provider_status(&state.provider_addr, &provider_job_id).await {
-            let mut tasks = state.tasks.lock().expect("tasks lock poisoned");
-            let mut gateway = state
-                .settlement_gateway
-                .lock()
-                .expect("settlement gateway lock poisoned");
-            if let Some(task) = tasks.get_mut(&task_id) {
-                apply_provider_poll_with_matches(
-                    task,
-                    &polled,
-                    now_secs,
-                    &mut **gateway,
-                    &state.provider_addr,
-                    &state.accepted_matches,
-                );
+            {
+                let mut tasks = state.tasks.lock().expect("tasks lock poisoned");
+                let mut gateway = state
+                    .settlement_gateway
+                    .lock()
+                    .expect("settlement gateway lock poisoned");
+                if let Some(task) = tasks.get_mut(&task_id) {
+                    apply_provider_poll_with_matches(
+                        task,
+                        &polled,
+                        now_secs,
+                        &mut **gateway,
+                        &state.provider_addr,
+                        &state.accepted_matches,
+                    );
+                }
+            }
+
+            let mode = state.market_mode.lock().expect("market mode lock").clone();
+            if mode == MARKET_MODE_AUTO {
+                let has_bound = {
+                    let tasks = state.tasks.lock().expect("tasks lock");
+                    tasks
+                        .get(&task_id)
+                        .and_then(|t| t.bound_match_id.clone())
+                        .is_some()
+                };
+                if !has_bound {
+                    let buy_orders = collect_buy_orders(state);
+                    let provider_registry = fetch_provider_registry(&state.provider_addr)
+                        .await
+                        .unwrap_or_default();
+                    let sell_orders = fetch_provider_sell_orders(&state.provider_addr)
+                        .await
+                        .unwrap_or_default();
+                    let matches = compute_matches(
+                        buy_orders,
+                        sell_orders,
+                        provider_registry,
+                        &state.locked_buy_orders,
+                        &state.locked_sell_orders,
+                    );
+                    if let Some(m) = matches.first() {
+                        let _ = accept_match(
+                            State(state.clone()),
+                            Json(MatchActionRequest {
+                                buy_order_id: m.buy_order_id.clone(),
+                                sell_order_id: m.sell_order_id.clone(),
+                            }),
+                        )
+                        .await;
+                    }
+                }
             }
         }
     }
@@ -1843,6 +2215,7 @@ mod tests {
         body::{to_bytes, Body},
         http::Request,
     };
+    use common::market::MARKET_ROUTE_BUY_ORDERS;
     use serde_json::Value;
     use std::net::TcpListener;
     use std::thread;
@@ -2661,6 +3034,109 @@ mod tests {
             accepted.get(&match_id).unwrap().status,
             MATCH_STATUS_SETTLED
         );
+    }
+
+    #[test]
+    fn manual_mode_does_not_auto_generate_buy_orders() {
+        let state = AppState::default();
+        *state.market_mode.lock().unwrap() = MARKET_MODE_MANUAL.to_string();
+        let buy_orders = collect_buy_orders(&state);
+        assert!(buy_orders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_mode_generates_buy_orders_and_tags_auto_accept() {
+        let state = AppState::default();
+        *state.market_mode.lock().unwrap() = MARKET_MODE_AUTO.to_string();
+
+        let buy_orders = collect_buy_orders(&state);
+        assert!(!buy_orders.is_empty());
+
+        let app = app_with_state(state.clone());
+        let req = Request::builder()
+            .uri("/internal/market/matches/accept")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "buy_order_id": "buy-order-task-demo",
+                    "sell_order_id": "sell-order-demo-1"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let audit = state.market_audit.lock().unwrap();
+        assert!(audit.iter().any(|e| e.contains("auto_created_buy_order")));
+        assert!(audit.iter().any(|e| e.contains("auto_accepted_match")));
+    }
+
+    #[tokio::test]
+    async fn hybrid_mode_keeps_manual_control_point_for_acceptance() {
+        let state = AppState::default();
+        *state.market_mode.lock().unwrap() = MARKET_MODE_HYBRID.to_string();
+
+        let buy_orders = collect_buy_orders(&state);
+        assert!(!buy_orders.is_empty());
+
+        poll_once(&state, 2).await;
+        assert!(state.accepted_matches.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fixed_band_and_recommended_pricing_behave_as_expected() {
+        let state = AppState::default();
+        let app = app_with_state(state.clone());
+
+        let fixed_req = Request::builder()
+            .uri("/internal/market/pricing")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"price_mode":"fixed","fixed_price":0.061}).to_string(),
+            ))
+            .unwrap();
+        let _ = app.clone().oneshot(fixed_req).await.unwrap();
+        assert_eq!(
+            collect_buy_orders(&state)[0].max_unit_price_per_work_unit,
+            0.061
+        );
+
+        let band_req = Request::builder()
+            .uri("/internal/market/pricing")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"price_mode":"band","band":{"min":0.05,"max":0.08,"target":0.07}})
+                    .to_string(),
+            ))
+            .unwrap();
+        let _ = app.clone().oneshot(band_req).await.unwrap();
+        assert_eq!(
+            collect_buy_orders(&state)[0].max_unit_price_per_work_unit,
+            0.07
+        );
+
+        let rec_req = Request::builder()
+            .uri("/internal/market/pricing")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"price_mode":"recommended_band"}).to_string(),
+            ))
+            .unwrap();
+        let _ = app.clone().oneshot(rec_req).await.unwrap();
+        assert!(collect_buy_orders(&state).is_empty());
+
+        let confirm_req = Request::builder()
+            .uri("/internal/market/pricing/recommended/confirm")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.clone().oneshot(confirm_req).await.unwrap();
+        assert!(!collect_buy_orders(&state).is_empty());
     }
 
     #[tokio::test]

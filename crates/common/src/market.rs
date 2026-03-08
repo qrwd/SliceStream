@@ -22,6 +22,14 @@ pub const MARKET_ROUTE_SELL_ORDERS: &str = "/internal/market/orders/sell";
 pub const MARKET_ROUTE_BUY_ORDERS: &str = "/internal/market/orders/buy";
 pub const MARKET_ROUTE_MATCHES: &str = "/internal/market/matches";
 
+pub const MARKET_MODE_MANUAL: &str = "manual";
+pub const MARKET_MODE_AUTO: &str = "auto";
+pub const MARKET_MODE_HYBRID: &str = "hybrid";
+
+pub const PRICE_MODE_FIXED: &str = "fixed";
+pub const PRICE_MODE_BAND: &str = "band";
+pub const PRICE_MODE_RECOMMENDED_BAND: &str = "recommended_band";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderHardwareInfo {
     pub gpu_model: String,

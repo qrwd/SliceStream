@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     response::Html,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use common::{
@@ -70,6 +70,12 @@ struct DashboardPayload {
     sell_orders: Vec<Value>,
     buy_orders: Vec<Value>,
     match_records: Vec<Value>,
+    provider_market_mode: Option<String>,
+    agent_market_mode: Option<String>,
+    provider_market_audit: Vec<String>,
+    agent_market_audit: Vec<String>,
+    provider_pricing: Value,
+    agent_pricing: Value,
     warnings: Vec<String>,
     api_error: Option<String>,
 }
@@ -114,12 +120,32 @@ struct LiveQuery {
     provider: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ModeSetRequest {
+    mode: String,
+}
+
+#[derive(Deserialize)]
+struct PricingSetRequest {
+    price_mode: String,
+    fixed_price: Option<f64>,
+    band: Option<Value>,
+}
+
 #[tokio::main]
 async fn main() {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/meta", get(meta))
         .route("/api/live/:task_id", get(live_dashboard))
+        .route("/api/action/mode", post(action_set_mode))
+        .route("/api/action/pricing", post(action_set_pricing))
+        .route(
+            "/api/action/confirm_recommended",
+            post(action_confirm_recommended),
+        )
+        .route("/api/action/manual_buy/:task_id", post(action_manual_buy))
+        .route("/api/action/start_bidding", post(action_start_bidding))
         .with_state(Arc::new(AppState {
             http: Client::builder()
                 .no_proxy()
@@ -150,236 +176,108 @@ async fn index() -> Html<&'static str> {
 <html>
 <head>
   <meta charset='utf-8' />
-  <title>SliceStream Desktop Console</title>
+  <title>SliceStream Market Terminal</title>
   <style>
-    body { font-family: Inter, system-ui, sans-serif; margin: 20px; background: #0b1020; color: #e8ecff; }
-    h1 { margin: 0; }
-    .header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 12px; }
-    .header .hint { font-size: 12px; color: #9db0ef; }
-    .topbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 12px 0; }
-    .status-strip { display: grid; grid-template-columns: repeat(5, minmax(160px, 1fr)); gap: 10px; margin: 12px 0; }
-    .status-pill { background: #101935; border: 1px solid #2e3f75; border-radius: 8px; padding: 10px; }
-    .status-pill .k { font-size: 11px; color: #9db0ef; }
-    .status-pill .v { font-size: 15px; font-weight: 700; margin-top: 4px; }
-    .grid { display: grid; grid-template-columns: repeat(2, minmax(320px, 1fr)); gap: 14px; margin-top: 12px; }
-    .card { background: #151d36; border-radius: 10px; padding: 14px; border: 1px solid #23305a; }
-    .card h3 { margin: 0 0 10px; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-    .err { color: #ff7575; }
-    .ok { color: #7ee787; }
-    .match { color: #7ee787; font-weight: 700; }
-    .mismatch { color: #ff7575; font-weight: 700; }
-    dt { font-weight: 600; }
-    dd { margin: 0 0 6px 0; }
-    select, button { background: #0f1730; color: #fff; border: 1px solid #31447f; border-radius: 8px; padding: 6px 10px; }
-    button:hover { border-color: #4f75da; cursor: pointer; }
-    .alerts { background: #21142a; border: 1px solid #52305f; border-radius: 10px; padding: 12px; margin-top: 12px; }
-    .alerts ul { margin: 8px 0 0 18px; }
-    pre { white-space: pre-wrap; word-break: break-word; }
-    @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } .status-strip { grid-template-columns: 1fr 1fr; } }
+    :root { color-scheme: dark; }
+    body { margin:0; font-family: Inter, system-ui, sans-serif; background:#050914; color:#eaf0ff; }
+    .terminal { display:grid; grid-template-rows:76px 1fr 170px; height:100vh; }
+    .top { display:grid; grid-template-columns: repeat(7,1fr) 220px; gap:8px; padding:10px; background:#0a1225; border-bottom:1px solid #1f325a; }
+    .pill { background:#121f3d; border:1px solid #29457e; border-radius:8px; padding:8px; }
+    .k{font-size:11px;color:#90a7df} .v{font-size:18px;font-weight:700}
+    .layout { display:grid; grid-template-columns: 34% 36% 30%; gap:10px; padding:10px; overflow:hidden; }
+    .panel { background:#0f1931; border:1px solid #223b6c; border-radius:10px; padding:10px; overflow:auto; }
+    .panel h3{margin:0 0 8px 0}
+    table{width:100%; border-collapse:collapse; font-size:12px}
+    th,td{padding:6px; border-bottom:1px solid #203458; text-align:left}
+    .tag{padding:2px 8px; border-radius:999px; font-size:11px; display:inline-block}
+    .ok{background:#123b24;color:#84f5a2} .bad{background:#4a1e2b;color:#ff9bad}
+    .btn{background:#1e325f; border:1px solid #4a6db8; color:#fff; border-radius:8px; padding:6px 8px; margin:2px; cursor:pointer}
+    .controls label{display:block;font-size:12px;margin-top:8px;color:#a3b7e5}
+    .controls input,.controls select{width:100%;background:#0a1225;color:#fff;border:1px solid #35518c;border-radius:6px;padding:6px}
+    .bottom{display:grid; grid-template-columns:2fr 1fr; gap:10px; padding:0 10px 10px}
+    ul{margin:0;padding-left:18px}
   </style>
 </head>
 <body>
-  <div class='header'>
-    <h1>SliceStream Desktop Client</h1>
-    <p class='mono' style='margin:6px 0 0 0;color:#7da6c4'>architecture: market (registry/orders/matches) + settlement/evidence bridge</p>
-    <span class='hint'>Desktop-first view · Auto-refresh every 2 seconds</span>
+<div class='terminal'>
+  <div class='top'>
+    <div class='pill'><div class='k'>network/prefix</div><div id='net' class='v'>-</div></div>
+    <div class='pill'><div class='k'>market mode</div><div id='marketMode' class='v'>-</div></div>
+    <div class='pill'><div class='k'>settlement mode</div><div id='settleMode' class='v'>-</div></div>
+    <div class='pill'><div class='k'>task/provider</div><div id='selection' class='v'>-</div></div>
+    <div class='pill'><div class='k'>benchmark</div><div id='benchmark' class='v'>-</div></div>
+    <div class='pill'><div class='k'>reconciliation</div><div id='recon' class='v'>-</div></div>
+    <div class='pill'><div class='k'>last refresh</div><div id='refreshAt' class='v'>-</div></div>
+    <div class='pill'><label class='k'>task</label><select id='taskSelect'></select><label class='k'>provider</label><select id='providerSelect'></select></div>
   </div>
-
-  <div class='topbar'>
-    <label class='mono'>Task: <select id='taskSelect'></select></label>
-    <label class='mono'>Provider: <select id='providerSelect'></select></label>
-    <button id='refreshBtn' class='mono'>Refresh</button>
-    <button id='demoBtn' class='mono'>Demo</button>
-    <span id='statusLine' class='mono'></span>
-  </div>
-
-  <div class='status-strip'>
-    <div class='status-pill'><div class='k'>network / prefix</div><div id='pillNetwork' class='v'>-</div></div>
-    <div class='status-pill'><div class='k'>settlement_mode</div><div id='pillMode' class='v'>-</div></div>
-    <div class='status-pill'><div class='k'>benchmark_score</div><div id='pillBenchmark' class='v'>-</div></div>
-    <div class='status-pill'><div class='k'>agent total_paid</div><div id='pillPaid' class='v'>-</div></div>
-    <div class='status-pill'><div class='k'>provider total_confirmed_paid</div><div id='pillConfirmed' class='v'>-</div></div>
-  </div>
-
-  <div class='grid'>
-    <section class='card'>
-      <h3>Overview</h3>
-      <dl id='home'></dl>
-    </section>
-
-    <section class='card'>
-      <h3>Reconciliation</h3>
-      <dl id='reconcile'></dl>
-      <p id='reconcileFlag' class='mono'></p>
-    </section>
-
-    <section class='card'>
+  <div class='layout'>
+    <div class='panel'>
+      <h3>Market</h3>
+      <h4>Provider Pool</h4><table><thead><tr><th>Provider</th><th>Bench</th><th>Status</th><th>Price</th></tr></thead><tbody id='providers'></tbody></table>
+      <h4>Sell / Buy Order Book</h4><table><thead><tr><th>Side</th><th>Order</th><th>Price</th><th>Units</th><th>Status</th></tr></thead><tbody id='book'></tbody></table>
+      <h4>Match Queue</h4><table><thead><tr><th>Match</th><th>Buy</th><th>Sell</th><th>Price</th><th>Status</th></tr></thead><tbody id='matches'></tbody></table>
+    </div>
+    <div class='panel'>
+      <h3>Current Deal Ticket</h3>
+      <div id='ticket'></div>
       <h3>Live Settlement</h3>
-      <dl id='settlement'></dl>
-    </section>
-
-    <section class='card'>
-      <h3>Telemetry</h3>
-      <dl id='telemetry'></dl>
-    </section>
-
-    <section class='card'>
-      <h3>Receipt / Evidence</h3>
-      <dl id='receipt'></dl>
-      <div><h4>payment_records</h4><pre id='paymentRecords' class='mono'></pre></div>
-      <div><h4>conflict_records</h4><pre id='conflictRecords' class='mono'></pre></div>
-    </section>
-
-    <section class='card'>
-      <h3>Provider Pool / Order Schema</h3>
-      <div><h4>provider_registry</h4><pre id='providerPool' class='mono'></pre></div>
-      <div><h4>sell_orders</h4><pre id='sellOrders' class='mono'></pre></div>
-      <div><h4>buy_orders</h4><pre id='buyOrders' class='mono'></pre></div>
-      <div><h4>match_records</h4><pre id='matchRecords' class='mono'></pre></div>
-    </section>
+      <table><tbody id='settlement'></tbody></table>
+      <h3>Reconciliation</h3>
+      <table><tbody id='reconcile'></tbody></table>
+    </div>
+    <div class='panel controls'>
+      <h3>Trading Controls</h3>
+      <label>Market Mode</label><select id='modeSel'><option>manual</option><option>auto</option><option>hybrid</option></select>
+      <label>Price Mode</label><select id='priceModeSel'><option>fixed</option><option>band</option><option>recommended_band</option></select>
+      <label>Fixed Price</label><input id='fixedPrice' value='0.06'/>
+      <label>Band Min / Max / Target</label><input id='bandMin' value='0.05'/><input id='bandMax' value='0.09'/><input id='bandTarget' value='0.06'/>
+      <button class='btn' id='applyMode'>Apply Mode</button>
+      <button class='btn' id='applyPricing'>Apply Pricing</button>
+      <button class='btn' id='confirmRecommended'>Confirm Recommended</button>
+      <button class='btn' id='manualBuy'>Place Manual Buy</button>
+      <button class='btn' id='startBidding'>Start Auto Bidding</button>
+      <button class='btn' id='refreshBtn'>Refresh</button>
+      <h4>Pricing Context</h4>
+      <table><tbody id='pricing'></tbody></table>
+    </div>
   </div>
-
-  <section class='alerts'>
-    <h3 style='margin:0'>Alerts / Hints</h3>
-    <ul id='alertsList' class='mono'></ul>
-  </section>
-
+  <div class='bottom'>
+    <div class='panel'><h3>Audit Events</h3><ul id='audit'></ul></div>
+    <div class='panel'><h3>Warnings / Evidence</h3><ul id='warnings'></ul><div id='evidenceShort'></div></div>
+  </div>
+</div>
 <script>
-let taskId = 'task-demo';
-let providerId = 'provider-demo';
-
-function renderDl(id, items) {
-  const el = document.getElementById(id);
-  el.innerHTML = items.map(([k,v]) => `<dt>${k}</dt><dd class='mono'>${v ?? '-'}</dd>`).join('');
+let taskId='task-demo'; let providerId='provider-demo';
+const el=id=>document.getElementById(id);
+const row=(k,v)=>`<tr><th>${k}</th><td>${v??'-'}</td></tr>`;
+async function j(url,opts){const r=await fetch(url,opts); return [r.status, await r.json()];}
+async function loadMeta(){const [,m]=await j('/api/meta'); el('taskSelect').innerHTML=(m.task_ids||[]).map(x=>`<option>${x}</option>`).join(''); el('providerSelect').innerHTML=(m.providers||[]).map(x=>`<option value="${x.id}">${x.label}</option>`).join(''); taskId=m.default_task_id||taskId; providerId=m.default_provider_id||providerId; el('taskSelect').value=taskId; el('providerSelect').value=providerId; el('taskSelect').onchange=()=>{taskId=el('taskSelect').value; refresh();}; el('providerSelect').onchange=()=>{providerId=el('providerSelect').value; refresh();}; }
+function tag(v){const ok=['matched','accepted','settled','MATCH','online'].includes(String(v)); return `<span class='tag ${ok?'ok':'bad'}'>${v}</span>`;}
+async function refresh(){
+  const [status,data]=await j(`/api/live/${taskId}?provider=${encodeURIComponent(providerId)}`); if(status>=400)return;
+  el('net').textContent=`${data.network}/${data.prefix}`; el('marketMode').textContent=`P:${data.provider_market_mode||'-'} A:${data.agent_market_mode||'-'}`; el('settleMode').textContent=data.settlement_mode; el('selection').textContent=`${data.selected_task_id}/${data.selected_provider_id}`; el('benchmark').textContent=data.benchmark_score??'-'; el('recon').innerHTML=tag(data.reconciliation.status); el('refreshAt').textContent=new Date().toLocaleTimeString();
+  el('providers').innerHTML=(data.provider_pool||[]).map(p=>`<tr><td>${p.provider_id}</td><td>${p.benchmark_score}</td><td>${tag(p.status)}</td><td>${p.pricing?.unit_price_per_work_unit??'-'}</td></tr>`).join('');
+  const sells=(data.sell_orders||[]).map(o=>`<tr><td>SELL</td><td>${o.order_id}</td><td>${o.unit_price_per_work_unit}</td><td>${o.max_work_units??o.min_work_units}</td><td>${tag(o.status)}</td></tr>`).join('');
+  const buys=(data.buy_orders||[]).map(o=>`<tr><td>BUY</td><td>${o.order_id}</td><td>${o.max_unit_price_per_work_unit}</td><td>${o.required_work_units}</td><td>${tag(o.status)}</td></tr>`).join('');
+  el('book').innerHTML=sells+buys;
+  el('matches').innerHTML=(data.match_records||[]).map(m=>`<tr><td>${m.match_id}</td><td>${m.buy_order_id}</td><td>${m.sell_order_id}</td><td>${m.agreed_unit_price}</td><td>${tag(m.status)}</td></tr>`).join('');
+  el('ticket').innerHTML=`<div>bound_match_id: <b>${data.bound_match_id||'-'}</b></div><div>task_status: ${data.task_status||'-'}</div><div>total_paid: ${data.total_paid??'-'} / provider_confirmed: ${data.total_confirmed_paid??'-'}</div>`;
+  el('settlement').innerHTML=[row('window',data.live_settlement.window_index),row('work_units',data.live_settlement.work_units_window),row('active_ratio',data.live_settlement.active_ratio),row('owed_window',data.live_settlement.owed_window),row('invoice',data.live_settlement.last_invoice_id),row('payment',data.live_settlement.last_payment_id)].join('');
+  el('reconcile').innerHTML=[row('agent_total_paid',data.reconciliation.agent_total_paid),row('provider_total_confirmed_paid',data.reconciliation.provider_total_confirmed_paid),row('status',tag(data.reconciliation.status))].join('');
+  el('pricing').innerHTML=[row('provider mode',data.provider_pricing?.price_mode),row('provider fixed',data.provider_pricing?.fixed_price),row('agent mode',data.agent_pricing?.price_mode),row('agent fixed',data.agent_pricing?.fixed_price),row('agent band',JSON.stringify(data.agent_pricing?.band||{}))].join('');
+  const audit=[...(data.provider_market_audit||[]),...(data.agent_market_audit||[])].slice(-20).reverse(); el('audit').innerHTML=audit.map(a=>`<li>${a}</li>`).join('')||'<li>none</li>';
+  el('warnings').innerHTML=(data.warnings||[]).map(w=>`<li>${w}</li>`).join('')||'<li>none</li>';
+  el('evidenceShort').textContent=`evidence_root=${data.receipt_evidence?.evidence_root||'-'} verify=${data.receipt_evidence?.evidence_verify_ok}`;
+  el('modeSel').value=data.agent_market_mode||'manual';
 }
-
-function setText(id, value) {
-  document.getElementById(id).textContent = value ?? '-';
-}
-
-function renderAlerts(warnings = [], apiError = null) {
-  const el = document.getElementById('alertsList');
-  const rows = [];
-  if (apiError) rows.push(`api_error: ${apiError}`);
-  for (const w of warnings) rows.push(w);
-  el.innerHTML = rows.length ? rows.map(r => `<li>${r}</li>`).join('') : '<li>none</li>';
-}
-
-async function loadMeta() {
-  const res = await fetch('/api/meta');
-  const meta = await res.json();
-  const taskSelect = document.getElementById('taskSelect');
-  const providerSelect = document.getElementById('providerSelect');
-
-  taskSelect.innerHTML = (meta.task_ids || []).map(t => `<option value="${t}">${t}</option>`).join('');
-  providerSelect.innerHTML = (meta.providers || []).map(p => `<option value="${p.id}">${p.label}</option>`).join('');
-
-  taskId = meta.default_task_id || taskId;
-  providerId = meta.default_provider_id || providerId;
-
-  taskSelect.value = taskId;
-  providerSelect.value = providerId;
-
-  taskSelect.onchange = () => { taskId = taskSelect.value; refresh(); };
-  providerSelect.onchange = () => { providerId = providerSelect.value; refresh(); };
-}
-
-async function refresh() {
-  const statusLine = document.getElementById('statusLine');
-  try {
-    const res = await fetch(`/api/live/${taskId}?provider=${encodeURIComponent(providerId)}`);
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || `http_${res.status}`);
-
-    statusLine.className = 'mono ok';
-    statusLine.textContent = `last update: ${new Date().toISOString()} | task=${data.selected_task_id} provider=${data.selected_provider_id}`;
-
-    setText('pillNetwork', `${data.network}/${data.prefix}`);
-    setText('pillMode', data.settlement_mode);
-    setText('pillBenchmark', data.benchmark_score);
-    setText('pillPaid', data.total_paid);
-    setText('pillConfirmed', data.total_confirmed_paid);
-
-    renderDl('home', [
-      ['task_status', data.task_status],
-      ['network', data.network],
-      ['prefix', data.prefix],
-      ['settlement_mode', data.settlement_mode],
-      ['benchmark_score', data.benchmark_score],
-      ['selected_task_id', data.selected_task_id],
-      ['selected_provider_id', data.selected_provider_id],
-      ['bound_match_id', data.bound_match_id],
-    ]);
-
-    renderDl('reconcile', [
-      ['agent_total_paid', data.reconciliation.agent_total_paid],
-      ['provider_total_confirmed_paid', data.reconciliation.provider_total_confirmed_paid],
-      ['status', data.reconciliation.status],
-    ]);
-
-    const flag = document.getElementById('reconcileFlag');
-    if (data.reconciliation.status === 'MATCH') {
-      flag.className = 'match';
-      flag.textContent = 'MATCH';
-    } else {
-      flag.className = 'mismatch';
-      flag.textContent = 'MISMATCH';
-    }
-
-    renderDl('settlement', [
-      ['window_index', data.live_settlement.window_index],
-      ['work_units_window', data.live_settlement.work_units_window],
-      ['active_ratio', data.live_settlement.active_ratio],
-      ['owed_window', data.live_settlement.owed_window],
-      ['last_invoice_id', data.live_settlement.last_invoice_id],
-      ['last_payment_id', data.live_settlement.last_payment_id],
-      ['paid_window_indexes', JSON.stringify(data.live_settlement.paid_window_indexes)],
-    ]);
-
-    renderDl('telemetry', [
-      ['telemetry_source', data.telemetry.telemetry_source],
-      ['active_samples', data.telemetry.active_samples],
-      ['total_samples', data.telemetry.total_samples],
-      ['sampled_at', data.telemetry.sampled_at],
-      ['window_seconds', data.telemetry.window_seconds],
-    ]);
-
-    renderDl('receipt', [
-      ['evidence_root', data.receipt_evidence.evidence_root],
-      ['evidence_verify_ok', data.receipt_evidence.evidence_verify_ok],
-    ]);
-
-    document.getElementById('paymentRecords').textContent = JSON.stringify(data.receipt_evidence.payment_records || [], null, 2);
-    document.getElementById('conflictRecords').textContent = JSON.stringify(data.receipt_evidence.conflict_records || [], null, 2);
-    document.getElementById('providerPool').textContent = JSON.stringify(data.provider_pool || [], null, 2);
-    document.getElementById('sellOrders').textContent = JSON.stringify(data.sell_orders || [], null, 2);
-    document.getElementById('buyOrders').textContent = JSON.stringify(data.buy_orders || [], null, 2);
-    document.getElementById('matchRecords').textContent = JSON.stringify(data.match_records || [], null, 2);
-
-    renderAlerts(data.warnings || [], data.api_error);
-  } catch (e) {
-    statusLine.className = 'mono err';
-    statusLine.textContent = `API unreachable: ${e.message}`;
-    renderAlerts([`dashboard_fetch_error: ${e.message}`], 'dashboard_unreachable');
-  }
-}
-
-(async function boot() {
-  await loadMeta();
-  await refresh();
-
-  document.getElementById('refreshBtn').addEventListener('click', refresh);
-  document.getElementById('demoBtn').addEventListener('click', async () => {
-    taskId = 'task-demo';
-    providerId = 'provider-demo';
-    document.getElementById('taskSelect').value = taskId;
-    document.getElementById('providerSelect').value = providerId;
-    await refresh();
-  });
-
-  setInterval(refresh, 2000);
-})();
+async function postJson(url,obj){return j(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(obj)});}
+el('applyMode').onclick=async()=>{await postJson('/api/action/mode',{mode:el('modeSel').value}); refresh();};
+el('applyPricing').onclick=async()=>{const payload={price_mode:el('priceModeSel').value,fixed_price:parseFloat(el('fixedPrice').value),band:{min:parseFloat(el('bandMin').value),max:parseFloat(el('bandMax').value),target:parseFloat(el('bandTarget').value)}}; await postJson('/api/action/pricing',payload); refresh();};
+el('confirmRecommended').onclick=async()=>{await j('/api/action/confirm_recommended',{method:'POST'}); refresh();};
+el('manualBuy').onclick=async()=>{await j(`/api/action/manual_buy/${taskId}`,{method:'POST'}); refresh();};
+el('startBidding').onclick=async()=>{await j('/api/action/start_bidding',{method:'POST'}); refresh();};
+el('refreshBtn').onclick=refresh;
+(async()=>{await loadMeta(); await refresh(); setInterval(refresh,3000);})();
 </script>
 </body>
 </html>"#,
@@ -412,6 +310,135 @@ async fn meta(State(state): State<Arc<AppState>>) -> Json<Value> {
         serde_json::to_value(payload)
             .unwrap_or_else(|_| serde_json::json!({ "error": "serialize_failed" })),
     )
+}
+
+async fn post_json(http: &Client, url: &str, body: Value) -> Result<Value, String> {
+    let resp = http
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("request_failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let txt = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
+        return Err(format!("status_{}: {}", status.as_u16(), txt));
+    }
+    resp.json::<Value>()
+        .await
+        .map_err(|e| format!("decode_failed: {e}"))
+}
+
+async fn action_set_mode(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ModeSetRequest>,
+) -> Json<Value> {
+    let provider = state.providers.first().cloned();
+    if let Some(p) = provider {
+        let _ = post_json(
+            &state.http,
+            &format!("{}/internal/market/mode", p.base_url),
+            serde_json::json!({"mode": req.mode}),
+        )
+        .await;
+    }
+    let agent = post_json(
+        &state.http,
+        &format!("{}/internal/market/mode", state.agent_base),
+        serde_json::json!({"mode": req.mode}),
+    )
+    .await;
+    Json(agent.unwrap_or_else(|e| serde_json::json!({"error": e})))
+}
+
+async fn action_set_pricing(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PricingSetRequest>,
+) -> Json<Value> {
+    let payload = serde_json::json!({
+        "price_mode": req.price_mode,
+        "fixed_price": req.fixed_price,
+        "band": req.band
+    });
+    if let Some(p) = state.providers.first().cloned() {
+        let _ = post_json(
+            &state.http,
+            &format!("{}/internal/market/pricing", p.base_url),
+            payload.clone(),
+        )
+        .await;
+    }
+    let agent = post_json(
+        &state.http,
+        &format!("{}/internal/market/pricing", state.agent_base),
+        payload,
+    )
+    .await;
+    Json(agent.unwrap_or_else(|e| serde_json::json!({"error": e})))
+}
+
+async fn action_confirm_recommended(State(state): State<Arc<AppState>>) -> Json<Value> {
+    if let Some(p) = state.providers.first().cloned() {
+        let _ = state
+            .http
+            .post(format!(
+                "{}/internal/market/pricing/recommended/confirm",
+                p.base_url
+            ))
+            .send()
+            .await;
+    }
+    let agent = state
+        .http
+        .post(format!(
+            "{}/internal/market/pricing/recommended/confirm",
+            state.agent_base
+        ))
+        .send()
+        .await;
+    Json(match agent {
+        Ok(_) => serde_json::json!({"status":"confirmed"}),
+        Err(e) => serde_json::json!({"error": format!("{e}")}),
+    })
+}
+
+async fn action_manual_buy(
+    State(state): State<Arc<AppState>>,
+    Path(task_id): Path<String>,
+) -> Json<Value> {
+    let price = 0.06;
+    let body = serde_json::json!({
+        "task_id": task_id,
+        "max_unit_price_per_work_unit": price,
+        "required_work_units": 10.0,
+        "min_benchmark_score": 80.0,
+        "capabilities_required": ["fp16", "llm"]
+    });
+    let result = post_json(
+        &state.http,
+        &format!("{}/internal/market/orders/buy/manual", state.agent_base),
+        body,
+    )
+    .await;
+    Json(result.unwrap_or_else(|e| serde_json::json!({"error": e})))
+}
+
+async fn action_start_bidding(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let resp = state
+        .http
+        .post(format!(
+            "{}/internal/market/bidding/start",
+            state.agent_base
+        ))
+        .send()
+        .await;
+    Json(match resp {
+        Ok(_) => serde_json::json!({"status":"started"}),
+        Err(e) => serde_json::json!({"error": format!("{e}")}),
+    })
 }
 
 async fn live_dashboard(
@@ -457,6 +484,12 @@ async fn live_dashboard(
     let sell_orders_url = format!("{}{}", provider.base_url, MARKET_ROUTE_SELL_ORDERS);
     let buy_orders_url = format!("{}{}", state.agent_base, MARKET_ROUTE_BUY_ORDERS);
     let match_records_url = format!("{}{}", state.agent_base, MARKET_ROUTE_MATCHES);
+    let provider_mode_url = format!("{}/internal/market/mode", provider.base_url);
+    let provider_audit_url = format!("{}/internal/market/audit", provider.base_url);
+    let agent_mode_url = format!("{}/internal/market/mode", state.agent_base);
+    let agent_audit_url = format!("{}/internal/market/audit", state.agent_base);
+    let provider_pricing_url = format!("{}/internal/market/pricing", provider.base_url);
+    let agent_pricing_url = format!("{}/internal/market/pricing", state.agent_base);
 
     let provider_status = get_json(&state.http, &provider_status_url).await;
     let provider_result = get_json(&state.http, &provider_result_url).await;
@@ -466,6 +499,12 @@ async fn live_dashboard(
     let sell_orders = get_json(&state.http, &sell_orders_url).await;
     let buy_orders = get_json(&state.http, &buy_orders_url).await;
     let match_records = get_json(&state.http, &match_records_url).await;
+    let provider_mode = get_json(&state.http, &provider_mode_url).await;
+    let provider_audit = get_json(&state.http, &provider_audit_url).await;
+    let agent_mode = get_json(&state.http, &agent_mode_url).await;
+    let agent_audit = get_json(&state.http, &agent_audit_url).await;
+    let provider_pricing = get_json(&state.http, &provider_pricing_url).await;
+    let agent_pricing = get_json(&state.http, &agent_pricing_url).await;
 
     let mut warnings = collect_request_warnings(
         &provider_status,
@@ -477,6 +516,26 @@ async fn live_dashboard(
         &buy_orders,
         &match_records,
     );
+
+    if let Err(err) = &provider_mode {
+        warnings.push(format!("provider market mode error: {err}"));
+    }
+    if let Err(err) = &provider_audit {
+        warnings.push(format!("provider market audit error: {err}"));
+    }
+    if let Err(err) = &agent_mode {
+        warnings.push(format!("agent market mode error: {err}"));
+    }
+    if let Err(err) = &agent_audit {
+        warnings.push(format!("agent market audit error: {err}"));
+    }
+
+    if let Err(err) = &provider_pricing {
+        warnings.push(format!("provider pricing error: {err}"));
+    }
+    if let Err(err) = &agent_pricing {
+        warnings.push(format!("agent pricing error: {err}"));
+    }
 
     let fatal_api_error = has_fatal_api_error(&warnings);
     let api_error = if fatal_api_error {
@@ -576,6 +635,32 @@ async fn live_dashboard(
         sell_orders: sell_orders_list,
         buy_orders: buy_orders_list,
         match_records: match_records_list,
+        provider_market_mode: provider_mode.ok().and_then(|v| {
+            v.get("mode")
+                .and_then(|m| m.as_str())
+                .map(|m| m.to_string())
+        }),
+        agent_market_mode: agent_mode.ok().and_then(|v| {
+            v.get("mode")
+                .and_then(|m| m.as_str())
+                .map(|m| m.to_string())
+        }),
+        provider_market_audit: provider_audit
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        agent_market_audit: agent_audit
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        provider_pricing: provider_pricing.unwrap_or(Value::Null),
+        agent_pricing: agent_pricing.unwrap_or(Value::Null),
         warnings,
         api_error,
     };

@@ -57,7 +57,7 @@ cd apps/dashboard/src-tauri
 cargo tauri dev
 ```
 
-> Note: the web view served by `cargo run -p dashboard` is retained as internal debug bridge; external demo/main UX is the desktop client window.
+> Note: `apps/dashboard` now serves the official market terminal UI. Tauri is the single desktop entry that hosts this same terminal experience via the local bridge.
 
 
 Desktop runtime dependencies:
@@ -92,10 +92,12 @@ cargo run -p agentd
 - Provider qualification tri-test (`cpp/qualify`) and benchmark-score scaling in Provider runtime.
 - Mock/Fiber gateway branching with structured Fiber failure categories.
 - Receipt/evidence/audit and Provider-Agent reconciliation flow.
+- Market runtime includes match transitions (`proposed/accepted/rejected/settling/settled`), market modes (`manual/auto/hybrid`), and pricing modes (`fixed/band/recommended_band`).
 
 ### Future extension
 - Fiber `record_result` remains minimal/placeholder-oriented and can be expanded to full on-chain writeback semantics.
-- Production-grade dashboard UX and long-term storage/indexing are not finalized in this repo stage.
+- Terminal-style desktop/dashboard UX is now implemented and is the primary operator interface.
+- Long-term persistence/indexing and further strategy sophistication remain future optimization.
 
 ## Demo + acceptance docs
 
@@ -138,6 +140,7 @@ Desktop branding assets live under `apps/dashboard/src-tauri/icons/` and use the
 
 ## Desktop client status (current)
 
-- **Already usable in desktop client**: bridge connection status, settlement mode, network/prefix badges, and embedded full dashboard panels (overview/live settlement/telemetry/receipt-evidence).
+- **Primary UX now**: market terminal layout (top status strip, provider/order/match panels, deal ticket, controls, audit/warnings).
+- **Supported runtime controls**: market mode (`manual/auto/hybrid`) and pricing mode (`fixed/band/recommended_band`) via dashboard action APIs.
 - **Still depends on dashboard bridge**: desktop shell reads from local `apps/dashboard` HTTP bridge (`127.0.0.1:4003`).
-- **Future polish**: richer installer assets/signing and deeper native integrations remain future optimization.
+- **Future polish**: richer installer assets/signing, persistence/indexing, and deeper native integrations remain future optimization.
