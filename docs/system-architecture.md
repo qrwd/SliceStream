@@ -74,7 +74,16 @@ This document aligns architecture wording with the current implementation, witho
 7. **Receipt/evidence are generated** via existing evidence + receipt path.
 8. **Reconciliation confirms paid windows/amounts** across provider and agent views.
 
-## 5) Completed now vs next extension boundary
+
+## 6) P0 hardening deltas (audit reconciliation pass)
+
+- `accept_match` is now strict: only `proposed` matches can transition to `accepted`; no default/fallback match construction is used for acceptance.
+- Repeated accept no longer causes sell-side lock advancement side effects in `already_accepted` handling.
+- Settlement failure branches now apply convergence/compensation: match -> `failed`, lock release (buy/sell), provider sell release, and retry-ready task unbinding.
+- Provider reconciliation now treats duplicate `(invoice_id,payment_id)` replays as idempotent (no double increment).
+- `recommended_band` confirmation now stores a context hash snapshot and is invalidated when pricing context is updated, forcing re-confirmation before recommendation takes effect.
+
+## 7) Completed now vs next extension boundary
 
 ### Completed now
 - Match acceptance + settlement binding is present.
@@ -84,6 +93,6 @@ This document aligns architecture wording with the current implementation, witho
 - Existing settlement/evidence/reconciliation behavior remains preserved.
 
 ### Natural next extension boundary
-- Extract monolithic runtime files into modules (market/pricing/settlement/ui handlers).
+- Continue incremental module extraction beyond the current maintainability pass (already extracted market support modules from monolithic runtime files).
 - Add stronger persistence/indexing for long-running order/match history.
 - Add richer matching strategy (still without changing core settlement/evidence semantics).

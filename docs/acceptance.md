@@ -266,3 +266,56 @@ Expected:
 - Tauri desktop entry is a single shell that carries the official market terminal experience.
 - The shell no longer has a separate, style-divergent bridge-only homepage.
 - Bridge disconnected/connected states are rendered in the same terminal style and transition automatically.
+
+## P0 audit reconciliation validation (targeted)
+
+```bash
+# strict accept: only proposed can be accepted
+cargo test -p agentd accept_non_proposed_match_is_rejected -- --exact
+
+# no already_accepted lock side effects
+cargo test -p agentd already_accepted_branch_has_no_lock_side_effects -- --exact
+
+# settlement failure compensation converges state and releases locks
+cargo test -p agentd settlement_failure_releases_locks_and_converges_state -- --exact
+
+# reconcile replay idempotency
+cargo test -p providerd reconcile_payment_is_idempotent_for_same_invoice_payment_pair -- --exact
+
+# recommended_band re-confirm requirement after context change
+cargo test -p agentd recommended_band_requires_reconfirm_after_context_change -- --exact
+cargo test -p providerd recommended_band_requires_reconfirm_after_context_change -- --exact
+```
+
+Expected:
+- non-proposed accept is rejected,
+- repeated/already-accepted path does not re-advance lock state,
+- settlement failure pushes compensation and makes runtime retry-ready,
+- replayed reconciliation pair does not double-count paid amount,
+- recommended-band must be confirmed again after context changes.
+
+## P1 mode/lifecycle hardening quick checks
+
+```bash
+# mode switch convergence (agent)
+curl -s -X POST http://127.0.0.1:4002/internal/market/mode \
+  -H 'content-type: application/json' -d '{"mode":"manual"}' | jq
+curl -s http://127.0.0.1:4002/internal/market/matches | jq
+curl -s http://127.0.0.1:4002/internal/market/audit | jq '.[-8:]'
+
+# lifecycle cancel / expire / retry
+curl -s -X POST http://127.0.0.1:4002/internal/market/matches/cancel \
+  -H 'content-type: application/json' -d '{"buy_order_id":"buy-order-task-demo","sell_order_id":"sell-order-demo-1"}' | jq
+curl -s -X POST http://127.0.0.1:4002/internal/market/matches/retry \
+  -H 'content-type: application/json' -d '{"buy_order_id":"buy-order-task-demo","sell_order_id":"sell-order-demo-1"}' | jq
+
+# provider order lifecycle
+curl -s -X POST http://127.0.0.1:4001/internal/market/orders/sell/sell-order-demo-1/cancel | jq
+curl -s -X POST http://127.0.0.1:4001/internal/market/orders/sell/sell-order-demo-1/retry | jq
+curl -s -X POST http://127.0.0.1:4001/internal/market/orders/sell/sell-order-demo-1/expire | jq
+```
+
+Example summary (expected):
+- mode switch leaves no dirty lock residue (`locked_buy_orders`/`locked_sell_orders` cleared, bound match released with lifecycle audit).
+- manual override adds `hold_auto_until_tick=*` audit so auto path does not instantly overwrite human actions.
+- cancel/expire/retry transitions are visible through status + audit events and return resources for next matching cycle.

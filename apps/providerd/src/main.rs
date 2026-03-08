@@ -11,19 +11,29 @@ use common::{
         MatchRecord, ProviderCapabilities, ProviderHardwareInfo, ProviderPricingInfo,
         ProviderRegistryEntry, SellOrder, MARKET_MODE_AUTO, MARKET_MODE_HYBRID, MARKET_MODE_MANUAL,
         MARKET_ROUTE_MATCHES, MARKET_ROUTE_PROVIDERS, MARKET_ROUTE_SELL_ORDERS,
-        ORDER_STATUS_LOCKED, ORDER_STATUS_MATCHED, ORDER_STATUS_OPEN, ORDER_STATUS_SETTLED,
-        ORDER_STATUS_SETTLING, PRICE_MODE_BAND, PRICE_MODE_FIXED, PRICE_MODE_RECOMMENDED_BAND,
+        ORDER_STATUS_CANCELLED, ORDER_STATUS_EXPIRED, ORDER_STATUS_LOCKED, ORDER_STATUS_OPEN,
+        ORDER_STATUS_SETTLED, ORDER_STATUS_SETTLING, PRICE_MODE_BAND, PRICE_MODE_FIXED,
+        PRICE_MODE_RECOMMENDED_BAND,
     },
+    market_persistence::{MarketEvent, MarketPersistence},
     runtime_config::load_runtime_config,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+mod market_support;
+
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{BufRead, BufReader},
     process::{Command, Stdio},
     sync::{mpsc, Arc, Mutex},
     thread,
     time::Duration,
+};
+
+use market_support::{
+    auto_actions_allowed, cancel_sell_order, converge_mode_state, current_recommended_context_hash,
+    expire_sell_order, retry_sell_order, set_auto_pause_for_manual_override,
 };
 
 const SAMPLE_PERIOD_MS: u64 = 250;
@@ -189,6 +199,7 @@ struct JobRuntime {
     total_confirmed_paid: f64,
     reconciliation_audit: Vec<String>,
     reconciliation_last_error: Option<String>,
+    reconciled_pairs: HashSet<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -227,6 +238,29 @@ struct AppState {
     band_price: Arc<Mutex<PriceBandConfig>>,
     recommended_band: Arc<Mutex<PriceBandConfig>>,
     recommended_confirmed: Arc<Mutex<bool>>,
+    recommended_context_hash: Arc<Mutex<String>>,
+    recommended_confirmed_hash: Arc<Mutex<Option<String>>>,
+    lifecycle_tick: Arc<Mutex<u64>>,
+    auto_pause_until_tick: Arc<Mutex<u64>>,
+    persistence: Arc<MarketPersistence>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ProviderSettlementRecord {
+    job_id: String,
+    invoice_id: Option<String>,
+    payment_id: Option<String>,
+    total_confirmed_paid: f64,
+    paid_window_indexes: Vec<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ProviderPersistedState {
+    provider_registry: Vec<ProviderRegistryEntry>,
+    sell_orders: Vec<SellOrder>,
+    match_records: Vec<MatchRecord>,
+    settlement_records: Vec<ProviderSettlementRecord>,
+    market_audit: Vec<String>,
 }
 
 impl AppState {
@@ -268,6 +302,7 @@ impl AppState {
                 total_confirmed_paid: 0.0,
                 reconciliation_audit: vec![],
                 reconciliation_last_error: None,
+                reconciled_pairs: HashSet::new(),
             },
         );
         let provider_registry = vec![ProviderRegistryEntry {
@@ -310,7 +345,7 @@ impl AppState {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }];
 
-        Self {
+        let state = Self {
             jobs: Arc::new(Mutex::new(jobs)),
             provider_registry: Arc::new(Mutex::new(provider_registry)),
             sell_orders: Arc::new(Mutex::new(sell_orders.clone())),
@@ -343,8 +378,93 @@ impl AppState {
                 target: 0.055,
             })),
             recommended_confirmed: Arc::new(Mutex::new(false)),
+            recommended_context_hash: Arc::new(Mutex::new(String::new())),
+            recommended_confirmed_hash: Arc::new(Mutex::new(None)),
+            lifecycle_tick: Arc::new(Mutex::new(0)),
+            auto_pause_until_tick: Arc::new(Mutex::new(0)),
+            persistence: Arc::new(MarketPersistence::new("providerd")),
+        };
+
+        if !cfg!(test) {
+            load_provider_state(&state);
+            append_market_event(
+                &state,
+                "provider_registered",
+                "provider-demo",
+                serde_json::json!({"source":"startup"}),
+            );
+            append_market_event(
+                &state,
+                "sell_order_created",
+                "sell-order-demo-1",
+                serde_json::json!({"source":"startup_or_restore"}),
+            );
+            persist_provider_state(&state);
+        }
+        state
+    }
+}
+
+fn persist_provider_state(state: &AppState) {
+    let settlement_records = state
+        .jobs
+        .lock()
+        .expect("jobs lock")
+        .values()
+        .map(|j| ProviderSettlementRecord {
+            job_id: j.job_id.clone(),
+            invoice_id: j.last_confirmed_invoice_id.clone(),
+            payment_id: j.last_confirmed_payment_id.clone(),
+            total_confirmed_paid: j.total_confirmed_paid,
+            paid_window_indexes: j.paid_window_indexes.clone(),
+        })
+        .collect();
+    let snapshot = ProviderPersistedState {
+        provider_registry: state
+            .provider_registry
+            .lock()
+            .expect("provider registry lock")
+            .clone(),
+        sell_orders: state.sell_orders.lock().expect("sell orders lock").clone(),
+        match_records: state
+            .match_records
+            .lock()
+            .expect("match records lock")
+            .clone(),
+        settlement_records,
+        market_audit: state
+            .market_audit
+            .lock()
+            .expect("market audit lock")
+            .clone(),
+    };
+    let _ = state.persistence.save_state(&snapshot);
+}
+
+fn load_provider_state(state: &AppState) {
+    let Some(snapshot) = state.persistence.load_state::<ProviderPersistedState>() else {
+        return;
+    };
+    *state
+        .provider_registry
+        .lock()
+        .expect("provider registry lock") = snapshot.provider_registry;
+    *state.sell_orders.lock().expect("sell orders lock") = snapshot.sell_orders;
+    *state.match_records.lock().expect("match records lock") = snapshot.match_records;
+    *state.market_audit.lock().expect("market audit lock") = snapshot.market_audit;
+    for rec in snapshot.settlement_records {
+        if let Some(job) = state.jobs.lock().expect("jobs lock").get_mut(&rec.job_id) {
+            job.last_confirmed_invoice_id = rec.invoice_id;
+            job.last_confirmed_payment_id = rec.payment_id;
+            job.total_confirmed_paid = rec.total_confirmed_paid;
+            job.paid_window_indexes = rec.paid_window_indexes;
         }
     }
+}
+
+fn append_market_event(state: &AppState, event_type: &str, entity_id: &str, details: Value) {
+    let event = MarketEvent::now("providerd", event_type, entity_id, details);
+    let _ = state.persistence.append_event(&event);
 }
 
 impl Default for AppState {
@@ -383,10 +503,27 @@ fn app_with_state(state: AppState) -> Router {
             post(mark_sell_order_settled),
         )
         .route(
+            "/internal/market/orders/sell/:order_id/release",
+            post(release_sell_order),
+        )
+        .route(
+            "/internal/market/orders/sell/:order_id/cancel",
+            post(cancel_sell_order),
+        )
+        .route(
+            "/internal/market/orders/sell/:order_id/expire",
+            post(expire_sell_order),
+        )
+        .route(
+            "/internal/market/orders/sell/:order_id/retry",
+            post(retry_sell_order),
+        )
+        .route(
             "/internal/market/mode",
             get(get_market_mode).post(set_market_mode),
         )
         .route("/internal/market/audit", get(get_market_audit))
+        .route("/internal/market/events", get(get_market_events))
         .route(
             "/internal/market/orders/sell/suggested",
             get(get_suggested_sell_orders),
@@ -769,6 +906,31 @@ async fn reconcile_payment(
             .into_response();
     }
 
+    let reconcile_key = format!("{}::{}", req.invoice_id, req.payment_id);
+    if runtime.reconciled_pairs.contains(&reconcile_key) {
+        runtime.reconciliation_audit.push(format!(
+            "status=duplicate_ignored invoice_id={} payment_id={}",
+            req.invoice_id, req.payment_id
+        ));
+        return (
+            StatusCode::OK,
+            Json(ReconcilePaymentResponse {
+                status: "ok",
+                last_confirmed_invoice_id: runtime
+                    .last_confirmed_invoice_id
+                    .clone()
+                    .unwrap_or_else(|| req.invoice_id.clone()),
+                last_confirmed_payment_id: runtime
+                    .last_confirmed_payment_id
+                    .clone()
+                    .unwrap_or_else(|| req.payment_id.clone()),
+                total_confirmed_paid: runtime.total_confirmed_paid,
+            }),
+        )
+            .into_response();
+    }
+
+    runtime.reconciled_pairs.insert(reconcile_key);
     runtime.last_confirmed_invoice_id = Some(req.invoice_id.clone());
     runtime.last_confirmed_payment_id = Some(req.payment_id.clone());
     runtime.total_confirmed_paid += req.amount_paid;
@@ -784,6 +946,17 @@ async fn reconcile_payment(
         "status=success invoice_id={} payment_id={} windows={:?} amount_paid={:.6}",
         req.invoice_id, req.payment_id, req.window_indexes, req.amount_paid
     ));
+    let job_id = runtime.job_id.clone();
+    let total_confirmed_paid = runtime.total_confirmed_paid;
+    drop(jobs);
+
+    append_market_event(
+        &state,
+        "reconciliation_confirmed",
+        &job_id,
+        serde_json::json!({"invoice_id": req.invoice_id, "payment_id": req.payment_id, "amount_paid": req.amount_paid}),
+    );
+    persist_provider_state(&state);
 
     (
         StatusCode::OK,
@@ -791,7 +964,7 @@ async fn reconcile_payment(
             status: "ok",
             last_confirmed_invoice_id: req.invoice_id,
             last_confirmed_payment_id: req.payment_id,
-            total_confirmed_paid: runtime.total_confirmed_paid,
+            total_confirmed_paid,
         }),
     )
         .into_response()
@@ -902,6 +1075,42 @@ async fn get_provider_registry(State(state): State<AppState>) -> impl IntoRespon
     (StatusCode::OK, Json(registry)).into_response()
 }
 
+fn invalidate_recommended_confirmation(state: &AppState, reason: &str) {
+    *state
+        .recommended_confirmed
+        .lock()
+        .expect("recommended confirm lock") = false;
+    let hash = current_recommended_context_hash(state);
+    *state
+        .recommended_context_hash
+        .lock()
+        .expect("recommended context hash lock") = hash;
+    *state
+        .recommended_confirmed_hash
+        .lock()
+        .expect("recommended confirmed hash lock") = None;
+    state
+        .market_audit
+        .lock()
+        .expect("market audit lock")
+        .push(format!(
+            "manual_override recommended_band_pending_confirmation reason={reason}"
+        ));
+}
+
+fn recommended_confirmation_is_current(state: &AppState) -> bool {
+    let confirmed = *state
+        .recommended_confirmed
+        .lock()
+        .expect("recommended confirm lock");
+    let has_hash = state
+        .recommended_confirmed_hash
+        .lock()
+        .expect("recommended confirmed hash lock")
+        .is_some();
+    confirmed && has_hash
+}
+
 fn configured_provider_price(state: &AppState, benchmark_score: f64) -> Option<f64> {
     let price_mode = state
         .pricing_mode
@@ -915,11 +1124,7 @@ fn configured_provider_price(state: &AppState, benchmark_score: f64) -> Option<f
             Some(band.target.clamp(band.min, band.max))
         }
         PRICE_MODE_RECOMMENDED_BAND => {
-            if !*state
-                .recommended_confirmed
-                .lock()
-                .expect("recommended confirm lock")
-            {
+            if !recommended_confirmation_is_current(state) {
                 return None;
             }
             let mut rec = state
@@ -936,6 +1141,10 @@ fn configured_provider_price(state: &AppState, benchmark_score: f64) -> Option<f
 }
 
 async fn get_sell_orders(State(state): State<AppState>) -> impl IntoResponse {
+    {
+        let mut tick = state.lifecycle_tick.lock().expect("lifecycle tick lock");
+        *tick = tick.saturating_add(1);
+    }
     let mode = state.market_mode.lock().expect("market mode lock").clone();
     let base_orders = state.sell_orders.lock().expect("sell orders lock").clone();
     let benchmark = state
@@ -977,12 +1186,21 @@ async fn get_sell_orders(State(state): State<AppState>) -> impl IntoResponse {
         }
         orders
     } else {
-        state
-            .market_audit
-            .lock()
-            .expect("market audit lock")
-            .push("auto_created_sell_order".to_string());
-        adjusted_orders
+        if !auto_actions_allowed(&state) {
+            state
+                .market_audit
+                .lock()
+                .expect("market audit lock")
+                .push("auto_paused_due_to_manual_override".to_string());
+            adjusted_orders
+        } else {
+            state
+                .market_audit
+                .lock()
+                .expect("market audit lock")
+                .push("auto_created_sell_order".to_string());
+            adjusted_orders
+        }
     };
     (StatusCode::OK, Json(orders)).into_response()
 }
@@ -1003,15 +1221,31 @@ async fn set_market_mode(
         _ => MARKET_MODE_MANUAL,
     }
     .to_string();
+    let old_mode = state.market_mode.lock().expect("market mode lock").clone();
     *state.market_mode.lock().expect("market mode lock") = mode.clone();
+    converge_mode_state(&state, &old_mode, &mode);
+    if mode == MARKET_MODE_MANUAL || mode == MARKET_MODE_HYBRID {
+        set_auto_pause_for_manual_override(&state, "mode_requires_manual_control", 3);
+    }
     state
         .market_audit
         .lock()
         .expect("market audit lock")
         .push(format!("manual_override provider_market_mode={mode}"));
+    append_market_event(
+        &state,
+        "manual_override",
+        "provider-mode",
+        serde_json::json!({"mode": mode}),
+    );
+    persist_provider_state(&state);
     (StatusCode::OK, Json(MarketModePayload { mode })).into_response()
 }
 
+async fn get_market_events(State(state): State<AppState>) -> impl IntoResponse {
+    let events = state.persistence.read_events();
+    (StatusCode::OK, Json(events)).into_response()
+}
 async fn get_market_audit(State(state): State<AppState>) -> impl IntoResponse {
     let events = state
         .market_audit
@@ -1022,6 +1256,26 @@ async fn get_market_audit(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn get_suggested_sell_orders(State(state): State<AppState>) -> impl IntoResponse {
+    let mode = state.market_mode.lock().expect("market mode lock").clone();
+    if mode == MARKET_MODE_HYBRID
+        && state
+            .suggested_sell_orders
+            .lock()
+            .expect("suggested sell orders lock")
+            .is_empty()
+    {
+        let base_orders = state.sell_orders.lock().expect("sell orders lock").clone();
+        state
+            .suggested_sell_orders
+            .lock()
+            .expect("suggested sell orders lock")
+            .extend(base_orders.iter().map(|o| SellOrder {
+                order_id: format!("suggested-{}", o.order_id),
+                status: "suggested".to_string(),
+                ..o.clone()
+            }));
+    }
+
     let orders = state
         .suggested_sell_orders
         .lock()
@@ -1057,6 +1311,7 @@ async fn confirm_suggested_sell_order(
         .lock()
         .expect("sell orders lock")
         .push(order.clone());
+    set_auto_pause_for_manual_override(&state, "confirm_suggested_sell_order", 3);
     state
         .market_audit
         .lock()
@@ -1144,17 +1399,10 @@ async fn set_market_pricing(
             ));
     }
     if mode == PRICE_MODE_RECOMMENDED_BAND {
-        *state
-            .recommended_confirmed
-            .lock()
-            .expect("recommended confirm lock") = false;
-        state
-            .market_audit
-            .lock()
-            .expect("market audit lock")
-            .push("manual_override recommended_band_pending_confirmation".to_string());
+        invalidate_recommended_confirmation(&state, "pricing_context_updated");
     }
 
+    set_auto_pause_for_manual_override(&state, "set_market_pricing", 3);
     state
         .market_audit
         .lock()
@@ -1165,15 +1413,27 @@ async fn set_market_pricing(
 }
 
 async fn confirm_recommended_band(State(state): State<AppState>) -> impl IntoResponse {
+    let current_hash = current_recommended_context_hash(&state);
     *state
         .recommended_confirmed
         .lock()
         .expect("recommended confirm lock") = true;
+    *state
+        .recommended_context_hash
+        .lock()
+        .expect("recommended context hash lock") = current_hash.clone();
+    *state
+        .recommended_confirmed_hash
+        .lock()
+        .expect("recommended confirmed hash lock") = Some(current_hash.clone());
+    set_auto_pause_for_manual_override(&state, "confirm_recommended_band", 3);
     state
         .market_audit
         .lock()
         .expect("market audit lock")
-        .push("manual_override recommended_band_confirmed".to_string());
+        .push(format!(
+            "manual_override recommended_band_confirmed context_hash={current_hash}"
+        ));
     (
         StatusCode::OK,
         Json(ConfirmOk {
@@ -1210,8 +1470,6 @@ async fn lock_sell_order(
 
     if order.status == ORDER_STATUS_OPEN {
         order.status = ORDER_STATUS_LOCKED.to_string();
-    } else if order.status == ORDER_STATUS_LOCKED {
-        order.status = ORDER_STATUS_MATCHED.to_string();
     }
 
     (
@@ -1272,6 +1530,35 @@ async fn mark_sell_order_settled(
         StatusCode::OK,
         Json(OrderActionResponse {
             status: "settled",
+            order_id: order.order_id.clone(),
+        }),
+    )
+        .into_response()
+}
+
+async fn release_sell_order(
+    State(state): State<AppState>,
+    Path(order_id): Path<String>,
+) -> impl IntoResponse {
+    let mut orders = state.sell_orders.lock().expect("sell orders lock");
+    let Some(order) = orders.iter_mut().find(|o| o.order_id == order_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(OrderActionResponse {
+                status: "order_not_found",
+                order_id,
+            }),
+        )
+            .into_response();
+    };
+
+    if order.status != ORDER_STATUS_SETTLED {
+        order.status = ORDER_STATUS_OPEN.to_string();
+    }
+    (
+        StatusCode::OK,
+        Json(OrderActionResponse {
+            status: "released",
             order_id: order.order_id.clone(),
         }),
     )
@@ -1412,6 +1699,34 @@ mod tests {
         assert_eq!(result_json["last_confirmed_invoice_id"], "inv-1");
         assert_eq!(result_json["last_confirmed_payment_id"], "pay-1");
         assert_eq!(result_json["total_confirmed_paid"], 5.0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_payment_is_idempotent_for_same_invoice_payment_pair() {
+        let app = app();
+
+        for _ in 0..2 {
+            let reconcile_req = Request::builder()
+                .uri("/internal/provider/reconcile")
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"job_id":"job-demo","invoice_id":"inv-repeat","payment_id":"pay-repeat","window_indexes":[1,2],"amount_paid":5.0}"#,
+                ))
+                .unwrap();
+            let reconcile_resp = app.clone().oneshot(reconcile_req).await.unwrap();
+            assert_eq!(reconcile_resp.status(), StatusCode::OK);
+        }
+
+        let status_req = Request::builder()
+            .uri("/v1/provider/jobs/job-demo")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let status_resp = app.oneshot(status_req).await.unwrap();
+        let status_body = to_bytes(status_resp.into_body(), usize::MAX).await.unwrap();
+        let status_json: Value = serde_json::from_slice(&status_body).unwrap();
+        assert_eq!(status_json["total_confirmed_paid"], 5.0);
     }
 
     #[tokio::test]
@@ -1600,7 +1915,7 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         let status = json[0]["status"].as_str().unwrap_or_default();
         assert_ne!(status, ORDER_STATUS_OPEN);
-        assert!(status == ORDER_STATUS_LOCKED || status == ORDER_STATUS_MATCHED);
+        assert_eq!(status, ORDER_STATUS_LOCKED);
     }
 
     #[tokio::test]
@@ -1645,6 +1960,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recommended_band_requires_reconfirm_after_context_change() {
+        let app = app();
+
+        let rec_req = Request::builder()
+            .uri("/internal/market/pricing")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"price_mode":"recommended_band"}).to_string(),
+            ))
+            .unwrap();
+        let _ = app.clone().oneshot(rec_req).await.unwrap();
+
+        let confirm_req = Request::builder()
+            .uri("/internal/market/pricing/recommended/confirm")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.clone().oneshot(confirm_req).await.unwrap();
+
+        let sell_req = Request::builder()
+            .uri(MARKET_ROUTE_SELL_ORDERS)
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let sell_resp = app.clone().oneshot(sell_req).await.unwrap();
+        let body = to_bytes(sell_resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(json[0]["unit_price_per_work_unit"].as_f64().unwrap() > 0.0);
+
+        let mutate_req = Request::builder()
+            .uri("/internal/market/pricing")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"price_mode":"recommended_band","band":{"min":0.05,"max":0.09,"target":0.074}})
+                    .to_string(),
+            ))
+            .unwrap();
+        let _ = app.clone().oneshot(mutate_req).await.unwrap();
+
+        let sell_req2 = Request::builder()
+            .uri(MARKET_ROUTE_SELL_ORDERS)
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let sell_resp2 = app.oneshot(sell_req2).await.unwrap();
+        let body2 = to_bytes(sell_resp2.into_body(), usize::MAX).await.unwrap();
+        let json2: Value = serde_json::from_slice(&body2).unwrap();
+        assert_eq!(json2[0]["unit_price_per_work_unit"], 0.05);
+    }
+
+    #[tokio::test]
     async fn sell_order_progresses_settling_then_settled() {
         let app = app();
         let settling_req = Request::builder()
@@ -1673,6 +2041,35 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json[0]["status"], ORDER_STATUS_SETTLED);
     }
+    #[tokio::test]
+    async fn lock_sell_order_is_idempotent_without_state_advance() {
+        let app = app();
+
+        let lock_req = Request::builder()
+            .uri("/internal/market/orders/sell/sell-order-demo-1/lock")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.clone().oneshot(lock_req).await.unwrap();
+
+        let lock_req_2 = Request::builder()
+            .uri("/internal/market/orders/sell/sell-order-demo-1/lock")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.clone().oneshot(lock_req_2).await.unwrap();
+
+        let list_req = Request::builder()
+            .uri(MARKET_ROUTE_SELL_ORDERS)
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let list_resp = app.oneshot(list_req).await.unwrap();
+        let body = to_bytes(list_resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json[0]["status"], ORDER_STATUS_LOCKED);
+    }
+
     #[tokio::test]
     async fn auto_mode_records_auto_created_sell_order_audit() {
         let app = app();
@@ -1703,6 +2100,116 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("auto_created_sell_order")));
+    }
+
+    #[tokio::test]
+    async fn mode_switch_converges_suggested_and_confirmation_state() {
+        let state = AppState::default();
+        let app = app_with_state(state.clone());
+
+        let hybrid_req = Request::builder()
+            .uri("/internal/market/mode")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"mode":"hybrid"}"#))
+            .unwrap();
+        let _ = app.clone().oneshot(hybrid_req).await.unwrap();
+
+        let suggested_req = Request::builder()
+            .uri("/internal/market/orders/sell/suggested")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let suggested_resp = app.clone().oneshot(suggested_req).await.unwrap();
+        let body = to_bytes(suggested_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(!json.as_array().unwrap().is_empty());
+
+        let manual_req = Request::builder()
+            .uri("/internal/market/mode")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"mode":"manual"}"#))
+            .unwrap();
+        let _ = app.clone().oneshot(manual_req).await.unwrap();
+        assert!(state.suggested_sell_orders.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_override_is_not_immediately_overridden_in_auto_mode() {
+        let state = AppState::default();
+        let app = app_with_state(state.clone());
+
+        let set_mode_req = Request::builder()
+            .uri("/internal/market/mode")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"mode":"auto"}"#))
+            .unwrap();
+        let _ = app.clone().oneshot(set_mode_req).await.unwrap();
+
+        let set_price_req = Request::builder()
+            .uri("/internal/market/pricing")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"price_mode":"fixed","fixed_price":0.072}).to_string(),
+            ))
+            .unwrap();
+        let _ = app.clone().oneshot(set_price_req).await.unwrap();
+
+        let sell_req = Request::builder()
+            .uri(MARKET_ROUTE_SELL_ORDERS)
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.clone().oneshot(sell_req).await.unwrap();
+
+        let audit = state.market_audit.lock().unwrap().clone();
+        assert!(audit
+            .iter()
+            .any(|v| v.contains("auto_paused_due_to_manual_override")));
+    }
+
+    #[tokio::test]
+    async fn cancel_expire_retry_sell_order_lifecycle() {
+        let app = app();
+
+        let cancel_req = Request::builder()
+            .uri("/internal/market/orders/sell/sell-order-demo-1/cancel")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let cancel_resp = app.clone().oneshot(cancel_req).await.unwrap();
+        assert_eq!(cancel_resp.status(), StatusCode::OK);
+
+        let retry_req = Request::builder()
+            .uri("/internal/market/orders/sell/sell-order-demo-1/retry")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let retry_resp = app.clone().oneshot(retry_req).await.unwrap();
+        assert_eq!(retry_resp.status(), StatusCode::OK);
+
+        let expire_req = Request::builder()
+            .uri("/internal/market/orders/sell/sell-order-demo-1/expire")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let expire_resp = app.clone().oneshot(expire_req).await.unwrap();
+        assert_eq!(expire_resp.status(), StatusCode::OK);
+
+        let list_req = Request::builder()
+            .uri(MARKET_ROUTE_SELL_ORDERS)
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let list_resp = app.oneshot(list_req).await.unwrap();
+        let body = to_bytes(list_resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json[0]["status"], ORDER_STATUS_EXPIRED);
     }
 
     #[tokio::test]
@@ -1751,5 +2258,45 @@ mod tests {
             .unwrap()
             .iter()
             .any(|v| v.as_str().unwrap_or_default().contains("manual_override")));
+    }
+
+    #[test]
+    fn provider_state_persists_and_recovers() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "slicestream-provider-{}-{uniq}",
+            std::process::id()
+        ));
+        let mut state = AppState::with_benchmark_score(DEFAULT_BENCHMARK_SCORE);
+        state.persistence = Arc::new(MarketPersistence::new_in(
+            base.to_string_lossy().as_ref(),
+            "providerd",
+        ));
+        {
+            let mut orders = state.sell_orders.lock().unwrap();
+            orders[0].status = ORDER_STATUS_SETTLED.to_string();
+        }
+        append_market_event(
+            &state,
+            "sell_order_updated",
+            "sell-order-demo-1",
+            serde_json::json!({"status":"settled"}),
+        );
+        persist_provider_state(&state);
+
+        let mut recovered = AppState::with_benchmark_score(DEFAULT_BENCHMARK_SCORE);
+        recovered.persistence = Arc::new(MarketPersistence::new_in(
+            base.to_string_lossy().as_ref(),
+            "providerd",
+        ));
+        load_provider_state(&recovered);
+
+        let status = recovered.sell_orders.lock().unwrap()[0].status.clone();
+        assert_eq!(status, ORDER_STATUS_SETTLED);
+        let events = recovered.persistence.read_events();
+        assert!(!events.is_empty());
     }
 }

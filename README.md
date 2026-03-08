@@ -99,6 +99,11 @@ cargo run -p agentd
 - Terminal-style desktop/dashboard UX is now implemented and is the primary operator interface.
 - Long-term persistence/indexing and further strategy sophistication remain future optimization.
 
+
+## P0 audit reconciliation status
+
+Release closing P0 reconciliation (audit vs code vs historical requirements) is tracked in `docs/audit-reconciliation.md`, including classification by `still_open`, `fixed_after_audit`, and `doc_drift_only`, plus concrete closure actions.
+
 ## Demo + acceptance docs
 
 - 90–120s operator script: `docs/demo-script.md`

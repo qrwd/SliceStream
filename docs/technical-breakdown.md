@@ -142,3 +142,25 @@ Unchanged by design:
 - metering constants/formula semantics,
 - evidence/idempotency/stall semantics,
 - fiber error taxonomy and reconciliation core behavior.
+
+
+## 13) P0 audit reconciliation closures
+
+This pass closes P0 gaps without changing protocol semantics:
+- strict proposed-only match acceptance (no acceptance fallback construction),
+- duplicate accept side-effect removal (sell lock idempotency path),
+- settlement-failure compensation with lock release + retry-ready convergence,
+- reconciliation replay idempotency on `(invoice_id,payment_id)`,
+- `recommended_band` confirmation bound to context hash with re-confirm on context updates.
+
+See `docs/audit-reconciliation.md` for full issue calibration (`still_open` / `fixed_after_audit` / `doc_drift_only`).
+
+
+## 13) P2 structure/maintainability pass (behavior-preserving)
+
+This pass keeps routes/status codes/JSON payloads unchanged while reducing monolithic file pressure:
+- `apps/providerd/src/market_support.rs` now hosts provider market support helpers and sell-order lifecycle action handlers (cancel/expire/retry).
+- `apps/agentd/src/market_support.rs` now hosts agent market support helpers and match lifecycle/bidding handlers (cancel/expire/retry/start).
+- `apps/dashboard/src/http_helpers.rs` now hosts shared HTTP/warning helper logic used by the bridge aggregation path.
+
+The runtime ownership and API contract behavior are unchanged; this is a structural extraction only.

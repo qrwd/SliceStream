@@ -15,6 +15,7 @@ pub const MATCH_STATUS_REJECTED: &str = "rejected";
 pub const MATCH_STATUS_SETTLING: &str = "settling";
 pub const MATCH_STATUS_SETTLED: &str = "settled";
 pub const MATCH_STATUS_FAILED: &str = "failed";
+pub const MATCH_STATUS_CANCELLED: &str = "cancelled";
 pub const MATCH_STATUS_EXPIRED: &str = "expired";
 
 pub const MARKET_ROUTE_PROVIDERS: &str = "/internal/market/providers";

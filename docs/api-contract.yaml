@@ -70,6 +70,80 @@ paths:
                 items:
                   $ref: '#/components/schemas/SellOrder'
 
+
+
+  /internal/market/orders/sell/{order_id}/cancel:
+    post:
+      tags: [internal-market]
+      summary: Cancel sell order
+      parameters:
+        - in: path
+          name: order_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Order action response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+
+  /internal/market/orders/sell/{order_id}/expire:
+    post:
+      tags: [internal-market]
+      summary: Expire sell order
+      parameters:
+        - in: path
+          name: order_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Order action response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+
+  /internal/market/orders/sell/{order_id}/retry:
+    post:
+      tags: [internal-market]
+      summary: Retry sell order from cancelled/expired to open
+      parameters:
+        - in: path
+          name: order_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Order action response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+
+  /internal/market/orders/sell/{order_id}/release:
+    post:
+      tags: [internal-market]
+      summary: Release sell order lock/state after failed settlement compensation
+      parameters:
+        - in: path
+          name: order_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Release response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+
   /internal/market/orders/buy:
     get:
       tags: [internal-market]
@@ -120,6 +194,61 @@ paths:
     post:
       tags: [internal-market]
       summary: Reject proposed match
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MatchActionRequest'
+      responses:
+        '200':
+          description: Match action response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatchActionResponse'
+
+
+  /internal/market/matches/cancel:
+    post:
+      tags: [internal-market]
+      summary: Cancel accepted/settling match and release resources
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MatchActionRequest'
+      responses:
+        '200':
+          description: Match action response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatchActionResponse'
+
+  /internal/market/matches/expire:
+    post:
+      tags: [internal-market]
+      summary: Expire match and release resources
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MatchActionRequest'
+      responses:
+        '200':
+          description: Match action response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatchActionResponse'
+
+  /internal/market/matches/retry:
+    post:
+      tags: [internal-market]
+      summary: Prepare retry by releasing existing binding and queueing re-match
       requestBody:
         required: true
         content:

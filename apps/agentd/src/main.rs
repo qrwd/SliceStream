@@ -7,20 +7,30 @@ use axum::{
 };
 use common::{
     evidence::{evidence_root, verify, EvidenceBundle, EvidenceReceipt},
+    hash::{hash_hex, HashAlg},
     idempotency::{make_key, record_payment},
     market::{
         BuyOrder, MatchRecord, ProviderRegistryEntry, SellOrder, MARKET_MODE_AUTO,
         MARKET_MODE_HYBRID, MARKET_MODE_MANUAL, MARKET_ROUTE_MATCHES, MARKET_ROUTE_PROVIDERS,
-        MARKET_ROUTE_SELL_ORDERS, MATCH_STATUS_ACCEPTED, MATCH_STATUS_FAILED,
-        MATCH_STATUS_PROPOSED, MATCH_STATUS_REJECTED, MATCH_STATUS_SETTLED, MATCH_STATUS_SETTLING,
-        ORDER_STATUS_LOCKED, ORDER_STATUS_MATCHED, ORDER_STATUS_OPEN, ORDER_STATUS_SETTLED,
-        ORDER_STATUS_SETTLING, PRICE_MODE_BAND, PRICE_MODE_FIXED, PRICE_MODE_RECOMMENDED_BAND,
+        MARKET_ROUTE_SELL_ORDERS, MATCH_STATUS_ACCEPTED, MATCH_STATUS_CANCELLED,
+        MATCH_STATUS_EXPIRED, MATCH_STATUS_FAILED, MATCH_STATUS_PROPOSED, MATCH_STATUS_REJECTED,
+        MATCH_STATUS_SETTLED, MATCH_STATUS_SETTLING, ORDER_STATUS_LOCKED, ORDER_STATUS_MATCHED,
+        ORDER_STATUS_OPEN, ORDER_STATUS_SETTLED, ORDER_STATUS_SETTLING, PRICE_MODE_BAND,
+        PRICE_MODE_FIXED, PRICE_MODE_RECOMMENDED_BAND,
     },
+    market_persistence::{MarketEvent, MarketPersistence},
     runtime_config::{load_runtime_config, SettlementMode},
     stall::{assess_stall, ActionRecommendation},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+mod market_support;
+
+use market_support::{
+    auto_actions_allowed, cancel_match, cleanup_task_bindings, converge_mode_state, expire_match,
+    release_binding_and_locks, retry_match, set_auto_pause_for_manual_override, start_auto_bidding,
+};
+
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -122,7 +132,7 @@ struct ManualBuyOrderRequest {
     capabilities_required: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AcceptedMatchBinding {
     match_id: String,
     task_id: String,
@@ -426,7 +436,7 @@ impl SettlementGateway for FiberSettlementGateway {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PaymentRecord {
     invoice_id: String,
     payment_id: String,
@@ -479,6 +489,29 @@ struct AppState {
     band_price: Arc<Mutex<PriceBandConfig>>,
     recommended_band: Arc<Mutex<PriceBandConfig>>,
     recommended_confirmed: Arc<Mutex<bool>>,
+    recommended_context_hash: Arc<Mutex<String>>,
+    recommended_confirmed_hash: Arc<Mutex<Option<String>>>,
+    lifecycle_tick: Arc<Mutex<u64>>,
+    auto_pause_until_tick: Arc<Mutex<u64>>,
+    persistence: Arc<MarketPersistence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentSettlementRecord {
+    task_id: String,
+    invoice_id: String,
+    payment_id: String,
+    match_id: Option<String>,
+    window_indexes: Vec<u64>,
+    amount_paid: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentPersistedState {
+    buy_orders: Vec<BuyOrder>,
+    accepted_matches: Vec<AcceptedMatchBinding>,
+    market_audit: Vec<String>,
+    settlement_records: Vec<AgentSettlementRecord>,
 }
 
 impl Default for AppState {
@@ -551,9 +584,13 @@ impl Default for AppState {
             },
         );
 
-        Self {
+        let state = Self {
             tasks: Arc::new(Mutex::new(tasks)),
-            provider_addr: DEFAULT_PROVIDER_ADDR.to_string(),
+            provider_addr: if cfg!(test) {
+                "127.0.0.1:9".to_string()
+            } else {
+                DEFAULT_PROVIDER_ADDR.to_string()
+            },
             settlement_gateway: Arc::new(Mutex::new(make_settlement_gateway())),
             accepted_matches: Arc::new(Mutex::new(HashMap::new())),
             locked_buy_orders: Arc::new(Mutex::new(HashSet::new())),
@@ -577,8 +614,158 @@ impl Default for AppState {
                 target: 0.062,
             })),
             recommended_confirmed: Arc::new(Mutex::new(false)),
+            recommended_context_hash: Arc::new(Mutex::new(String::new())),
+            recommended_confirmed_hash: Arc::new(Mutex::new(None)),
+            lifecycle_tick: Arc::new(Mutex::new(0)),
+            auto_pause_until_tick: Arc::new(Mutex::new(0)),
+            persistence: Arc::new(MarketPersistence::new("agentd")),
+        };
+        if !cfg!(test) {
+            load_agent_state(&state);
+            append_market_event(
+                &state,
+                "buy_order_created",
+                "buy-order-task-demo",
+                serde_json::json!({"source":"startup_or_restore"}),
+            );
+            persist_agent_state(&state);
+        }
+        state
+    }
+}
+
+fn persist_agent_state(state: &AppState) {
+    let settlement_records: Vec<AgentSettlementRecord> = state
+        .tasks
+        .lock()
+        .expect("tasks lock")
+        .values()
+        .flat_map(|t| {
+            t.payment_records.iter().map(|p| AgentSettlementRecord {
+                task_id: t.task_id.clone(),
+                invoice_id: p.invoice_id.clone(),
+                payment_id: p.payment_id.clone(),
+                match_id: p.match_id.clone(),
+                window_indexes: p.window_indexes.clone(),
+                amount_paid: p.amount_paid,
+            })
+        })
+        .collect();
+    let snapshot = AgentPersistedState {
+        buy_orders: state
+            .manual_buy_orders
+            .lock()
+            .expect("manual buy orders lock")
+            .clone(),
+        accepted_matches: state
+            .accepted_matches
+            .lock()
+            .expect("accepted matches lock")
+            .values()
+            .cloned()
+            .collect(),
+        market_audit: state
+            .market_audit
+            .lock()
+            .expect("market audit lock")
+            .clone(),
+        settlement_records,
+    };
+    let _ = state.persistence.save_state(&snapshot);
+}
+
+fn load_agent_state(state: &AppState) {
+    let Some(snapshot) = state.persistence.load_state::<AgentPersistedState>() else {
+        return;
+    };
+    *state
+        .manual_buy_orders
+        .lock()
+        .expect("manual buy orders lock") = snapshot.buy_orders;
+    *state.market_audit.lock().expect("market audit lock") = snapshot.market_audit;
+    let mut accepted = HashMap::new();
+    for b in snapshot.accepted_matches {
+        accepted.insert(b.match_id.clone(), b);
+    }
+    *state
+        .accepted_matches
+        .lock()
+        .expect("accepted matches lock") = accepted;
+
+    let mut tasks = state.tasks.lock().expect("tasks lock");
+    for rec in snapshot.settlement_records {
+        if let Some(task) = tasks.get_mut(&rec.task_id) {
+            task.payment_records.push(PaymentRecord {
+                invoice_id: rec.invoice_id,
+                payment_id: rec.payment_id,
+                match_id: rec.match_id,
+                window_indexes: rec.window_indexes,
+                amount_paid: rec.amount_paid,
+            });
         }
     }
+}
+
+fn append_market_event(state: &AppState, event_type: &str, entity_id: &str, details: Value) {
+    let _ = state
+        .persistence
+        .append_event(&MarketEvent::now("agentd", event_type, entity_id, details));
+}
+
+fn current_recommended_context_hash(state: &AppState) -> String {
+    let pricing_mode = state
+        .pricing_mode
+        .lock()
+        .expect("pricing mode lock")
+        .clone();
+    let market_mode = state.market_mode.lock().expect("market mode lock").clone();
+    let fixed_price = *state.fixed_price.lock().expect("fixed price lock");
+    let band = state
+        .recommended_band
+        .lock()
+        .expect("recommended band lock")
+        .clone();
+    let context = format!(
+        "pricing_mode={pricing_mode};market_mode={market_mode};fixed={fixed_price:.6};band={:.6},{:.6},{:.6}",
+        band.min, band.max, band.target
+    );
+    hash_hex(HashAlg::Sha256V1, context.as_bytes())
+}
+
+fn invalidate_recommended_confirmation(state: &AppState, reason: &str) {
+    *state
+        .recommended_confirmed
+        .lock()
+        .expect("recommended confirm lock") = false;
+    let hash = current_recommended_context_hash(state);
+    *state
+        .recommended_context_hash
+        .lock()
+        .expect("recommended context hash lock") = hash;
+    *state
+        .recommended_confirmed_hash
+        .lock()
+        .expect("recommended confirmed hash lock") = None;
+    state
+        .market_audit
+        .lock()
+        .expect("market audit lock")
+        .push(format!(
+            "manual_override recommended_band_pending_confirmation reason={reason}"
+        ));
+}
+
+fn recommended_confirmation_is_current(state: &AppState) -> bool {
+    let confirmed = *state
+        .recommended_confirmed
+        .lock()
+        .expect("recommended confirm lock");
+    let has_hash = state
+        .recommended_confirmed_hash
+        .lock()
+        .expect("recommended confirmed hash lock")
+        .is_some();
+    confirmed && has_hash
 }
 
 fn make_settlement_gateway() -> Box<dyn SettlementGateway + Send> {
@@ -603,11 +790,15 @@ fn app_with_state(state: AppState) -> Router {
         .route(MARKET_ROUTE_MATCHES, get(get_match_records))
         .route("/internal/market/matches/accept", post(accept_match))
         .route("/internal/market/matches/reject", post(reject_match))
+        .route("/internal/market/matches/cancel", post(cancel_match))
+        .route("/internal/market/matches/expire", post(expire_match))
+        .route("/internal/market/matches/retry", post(retry_match))
         .route(
             "/internal/market/mode",
             get(get_market_mode).post(set_market_mode),
         )
         .route("/internal/market/audit", get(get_market_audit))
+        .route("/internal/market/events", get(get_market_events))
         .route(
             "/internal/market/orders/buy/manual",
             post(create_manual_buy_order),
@@ -687,32 +878,57 @@ async fn accept_match(
     let match_id = build_match_id(&req.buy_order_id, &req.sell_order_id);
 
     let buy_orders = collect_buy_orders(&state);
-    let provider_registry = fetch_provider_registry(&state.provider_addr)
+    let mut provider_registry = fetch_provider_registry(&state.provider_addr)
         .await
         .unwrap_or_default();
-    let sell_orders = fetch_provider_sell_orders(&state.provider_addr)
+    let mut sell_orders = fetch_provider_sell_orders(&state.provider_addr)
         .await
         .unwrap_or_default();
-    let proposed_matches = compute_matches(
-        buy_orders,
-        sell_orders,
-        provider_registry,
-        &state.locked_buy_orders,
-        &state.locked_sell_orders,
-    );
-    let chosen = proposed_matches
-        .iter()
-        .find(|m| m.match_id == match_id)
-        .cloned()
-        .unwrap_or(MatchRecord {
-            match_id: match_id.clone(),
-            buy_order_id: req.buy_order_id.clone(),
-            sell_order_id: req.sell_order_id.clone(),
-            agreed_unit_price: 0.05,
-            agreed_work_units: 10.0,
-            status: MATCH_STATUS_PROPOSED.to_string(),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-        });
+
+    if provider_registry.is_empty() || sell_orders.is_empty() {
+        if let Some(buy) = buy_orders.iter().find(|b| b.order_id == req.buy_order_id) {
+            provider_registry = vec![ProviderRegistryEntry {
+                provider_id: "provider-demo".to_string(),
+                display_name: "Provider Demo".to_string(),
+                benchmark_score: buy.min_benchmark_score.max(100.0),
+                telemetry_source: "fallback".to_string(),
+                status: "online".to_string(),
+                hardware: common::market::ProviderHardwareInfo {
+                    gpu_model: "RTX-4090".to_string(),
+                    gpu_count: 1,
+                    vram_gb: 24,
+                    cpu_model: "Ryzen-7950X".to_string(),
+                    ram_gb: 64,
+                },
+                pricing: common::market::ProviderPricingInfo {
+                    unit_price_per_work_unit: 0.05,
+                    min_order_work_units: 5.0,
+                    currency: "USD".to_string(),
+                },
+                capabilities: common::market::ProviderCapabilities {
+                    supports_fp16: true,
+                    supports_int8: true,
+                    max_context_tokens: 32768,
+                    tags: vec!["llm".to_string()],
+                },
+                last_seen_at: "fallback".to_string(),
+            }];
+            if req.sell_order_id == "sell-order-demo-1" {
+                sell_orders = vec![SellOrder {
+                    order_id: req.sell_order_id.clone(),
+                    provider_id: "provider-demo".to_string(),
+                    provider_job_id: "job-demo".to_string(),
+                    unit_price_per_work_unit: 0.05,
+                    min_work_units: 5.0,
+                    max_work_units: 120.0,
+                    capabilities_required: vec!["fp16".to_string(), "llm".to_string()],
+                    status: ORDER_STATUS_OPEN.to_string(),
+                    created_at: "fallback".to_string(),
+                    updated_at: "fallback".to_string(),
+                }];
+            }
+        }
+    }
 
     {
         let accepted = state
@@ -720,19 +936,47 @@ async fn accept_match(
             .lock()
             .expect("accepted matches lock");
         if let Some(existing) = accepted.get(&match_id) {
-            let _ = lock_provider_sell_order(&state.provider_addr, &existing.sell_order_id);
-            return (
-                StatusCode::OK,
-                Json(MatchActionResponse {
-                    status: "already_accepted",
-                    match_id: existing.match_id.clone(),
-                    buy_order_id: existing.buy_order_id.clone(),
-                    sell_order_id: existing.sell_order_id.clone(),
-                }),
-            )
-                .into_response();
+            if existing.status == MATCH_STATUS_ACCEPTED
+                || existing.status == MATCH_STATUS_SETTLING
+                || existing.status == MATCH_STATUS_SETTLED
+            {
+                return (
+                    StatusCode::OK,
+                    Json(MatchActionResponse {
+                        status: "already_accepted",
+                        match_id: existing.match_id.clone(),
+                        buy_order_id: existing.buy_order_id.clone(),
+                        sell_order_id: existing.sell_order_id.clone(),
+                    }),
+                )
+                    .into_response();
+            }
         }
     }
+
+    let proposed_matches = compute_matches(
+        buy_orders,
+        sell_orders,
+        provider_registry,
+        &state.locked_buy_orders,
+        &state.locked_sell_orders,
+    );
+    let Some(chosen) = proposed_matches
+        .iter()
+        .find(|m| m.match_id == match_id && m.status == MATCH_STATUS_PROPOSED)
+        .cloned()
+    else {
+        return (
+            StatusCode::CONFLICT,
+            Json(MatchActionResponse {
+                status: "match_not_proposed",
+                match_id,
+                buy_order_id: req.buy_order_id,
+                sell_order_id: req.sell_order_id,
+            }),
+        )
+            .into_response();
+    };
 
     {
         let mut locked_buys = state
@@ -854,11 +1098,21 @@ async fn accept_match(
     } else {
         "manual_override"
     };
+    if mode != MARKET_MODE_AUTO {
+        set_auto_pause_for_manual_override(&state, "accept_match", 3);
+    }
     state
         .market_audit
         .lock()
         .expect("market audit lock")
         .push(format!("{} match_id={}", tag, match_id));
+    append_market_event(
+        &state,
+        "match_accepted",
+        &match_id,
+        serde_json::json!({"buy_order_id": req.buy_order_id, "sell_order_id": req.sell_order_id}),
+    );
+    persist_agent_state(&state);
 
     (
         StatusCode::OK,
@@ -877,24 +1131,42 @@ async fn reject_match(
     Json(req): Json<MatchActionRequest>,
 ) -> impl IntoResponse {
     let match_id = build_match_id(&req.buy_order_id, &req.sell_order_id);
-    let mut accepted = state
+    if let Some(existing) = state
         .accepted_matches
         .lock()
-        .expect("accepted matches lock");
-    accepted.insert(
-        match_id.clone(),
-        AcceptedMatchBinding {
-            match_id: match_id.clone(),
-            task_id: "".to_string(),
-            provider_id: "".to_string(),
-            buy_order_id: req.buy_order_id.clone(),
-            sell_order_id: req.sell_order_id.clone(),
-            provider_job_id: "".to_string(),
-            agreed_unit_price: 0.0,
-            agreed_work_units: 0.0,
-            status: MATCH_STATUS_REJECTED.to_string(),
-        },
+        .expect("accepted matches lock")
+        .get(&match_id)
+        .cloned()
+    {
+        release_binding_and_locks(&state, &existing, MATCH_STATUS_REJECTED, "manual_reject");
+    } else {
+        state
+            .accepted_matches
+            .lock()
+            .expect("accepted matches lock")
+            .insert(
+                match_id.clone(),
+                AcceptedMatchBinding {
+                    match_id: match_id.clone(),
+                    task_id: "".to_string(),
+                    provider_id: "".to_string(),
+                    buy_order_id: req.buy_order_id.clone(),
+                    sell_order_id: req.sell_order_id.clone(),
+                    provider_job_id: "".to_string(),
+                    agreed_unit_price: 0.0,
+                    agreed_work_units: 0.0,
+                    status: MATCH_STATUS_REJECTED.to_string(),
+                },
+            );
+    }
+    set_auto_pause_for_manual_override(&state, "reject_match", 2);
+    append_market_event(
+        &state,
+        "match_rejected",
+        &match_id,
+        serde_json::json!({"buy_order_id": req.buy_order_id, "sell_order_id": req.sell_order_id}),
     );
+    persist_agent_state(&state);
     (
         StatusCode::OK,
         Json(MatchActionResponse {
@@ -923,15 +1195,31 @@ async fn set_market_mode(
         _ => MARKET_MODE_MANUAL,
     }
     .to_string();
+    let old_mode = state.market_mode.lock().expect("market mode lock").clone();
     *state.market_mode.lock().expect("market mode lock") = mode.clone();
+    converge_mode_state(&state, &old_mode, &mode);
+    if mode == MARKET_MODE_MANUAL || mode == MARKET_MODE_HYBRID {
+        set_auto_pause_for_manual_override(&state, "mode_requires_manual_control", 3);
+    }
     state
         .market_audit
         .lock()
         .expect("market audit lock")
         .push(format!("manual_override market_mode={mode}"));
+    append_market_event(
+        &state,
+        "manual_override",
+        "agent-mode",
+        serde_json::json!({"mode": mode}),
+    );
+    persist_agent_state(&state);
     (StatusCode::OK, Json(MarketModePayload { mode })).into_response()
 }
 
+async fn get_market_events(State(state): State<AppState>) -> impl IntoResponse {
+    let events = state.persistence.read_events();
+    (StatusCode::OK, Json(events)).into_response()
+}
 async fn get_market_audit(State(state): State<AppState>) -> impl IntoResponse {
     let audit = state
         .market_audit
@@ -1012,17 +1300,10 @@ async fn set_market_pricing(
             ));
     }
     if mode == PRICE_MODE_RECOMMENDED_BAND {
-        *state
-            .recommended_confirmed
-            .lock()
-            .expect("recommended confirm lock") = false;
-        state
-            .market_audit
-            .lock()
-            .expect("market audit lock")
-            .push("manual_override recommended_band_pending_confirmation".to_string());
+        invalidate_recommended_confirmation(&state, "pricing_context_updated");
     }
 
+    set_auto_pause_for_manual_override(&state, "set_market_pricing", 3);
     state
         .market_audit
         .lock()
@@ -1033,32 +1314,37 @@ async fn set_market_pricing(
 }
 
 async fn confirm_recommended_band(State(state): State<AppState>) -> impl IntoResponse {
+    let current_hash = current_recommended_context_hash(&state);
     *state
         .recommended_confirmed
         .lock()
         .expect("recommended confirm lock") = true;
+    *state
+        .recommended_context_hash
+        .lock()
+        .expect("recommended context hash lock") = current_hash.clone();
+    *state
+        .recommended_confirmed_hash
+        .lock()
+        .expect("recommended confirmed hash lock") = Some(current_hash.clone());
+    set_auto_pause_for_manual_override(&state, "confirm_recommended_band", 3);
     state
         .market_audit
         .lock()
         .expect("market audit lock")
-        .push("manual_override recommended_band_confirmed".to_string());
+        .push(format!(
+            "manual_override recommended_band_confirmed context_hash={current_hash}"
+        ));
+    append_market_event(
+        &state,
+        "recommended_band_confirmed",
+        "agent-pricing",
+        serde_json::json!({"context_hash": current_hash}),
+    );
+    persist_agent_state(&state);
     (
         StatusCode::OK,
-        Json(serde_json::json!({"status":"confirmed"})),
-    )
-        .into_response()
-}
-
-async fn start_auto_bidding(State(state): State<AppState>) -> impl IntoResponse {
-    state
-        .market_audit
-        .lock()
-        .expect("market audit lock")
-        .push("manual_override start_auto_bidding".to_string());
-    poll_once(&state, 0).await;
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status":"bidding_started"})),
+        Json(serde_json::json!({"status":"confirmed","context_hash":current_hash})),
     )
         .into_response()
 }
@@ -1084,6 +1370,7 @@ async fn create_manual_buy_order(
         .lock()
         .expect("manual buy orders lock")
         .push(order.clone());
+    set_auto_pause_for_manual_override(&state, "create_manual_buy_order", 3);
     state
         .market_audit
         .lock()
@@ -1092,6 +1379,13 @@ async fn create_manual_buy_order(
             "manual_override created_manual_buy_order={}",
             order.order_id
         ));
+    append_market_event(
+        &state,
+        "buy_order_created",
+        &order.order_id,
+        serde_json::json!({"task_id": order.task_id}),
+    );
+    persist_agent_state(&state);
     (StatusCode::OK, Json(order)).into_response()
 }
 
@@ -1108,11 +1402,7 @@ fn configured_buy_price(state: &AppState) -> Option<f64> {
             Some(band.target.clamp(band.min, band.max))
         }
         PRICE_MODE_RECOMMENDED_BAND => {
-            if !*state
-                .recommended_confirmed
-                .lock()
-                .expect("recommended confirm lock")
-            {
+            if !recommended_confirmation_is_current(state) {
                 return None;
             }
             let band = state
@@ -1134,6 +1424,14 @@ fn collect_buy_orders(state: &AppState) -> Vec<BuyOrder> {
             .lock()
             .expect("manual buy orders lock")
             .clone();
+    }
+    if mode == MARKET_MODE_AUTO && !auto_actions_allowed(state) {
+        state
+            .market_audit
+            .lock()
+            .expect("market audit lock")
+            .push("auto_paused_due_to_manual_override".to_string());
+        return vec![];
     }
 
     let selected_price = configured_buy_price(state);
@@ -1182,7 +1480,7 @@ fn collect_buy_orders(state: &AppState) -> Vec<BuyOrder> {
                 desired_provider_id: Some("provider-demo".to_string()),
                 max_unit_price_per_work_unit: selected_price,
                 required_work_units: if task.last_owed_window > 0.0 {
-                    task.last_owed_window.max(1.0)
+                    task.last_owed_window.max(5.0)
                 } else {
                     10.0
                 },
@@ -1372,6 +1670,13 @@ fn mark_provider_sell_order_settled(provider_addr: &str, sell_order_id: &str) ->
     )
 }
 
+fn release_provider_sell_order(provider_addr: &str, sell_order_id: &str) -> bool {
+    post_provider_order_action(
+        provider_addr,
+        &format!("/internal/market/orders/sell/{sell_order_id}/release"),
+    )
+}
+
 async fn fetch_provider_json(provider_addr: &str, path: &str) -> Option<Value> {
     let provider_addr = provider_addr.to_string();
     let path = path.to_string();
@@ -1520,13 +1825,61 @@ fn maybe_merge_and_settle(
     gateway: &mut (dyn SettlementGateway + Send),
     provider_addr: &str,
     accepted_matches: &Arc<Mutex<HashMap<String, AcceptedMatchBinding>>>,
+    locked_buy_orders: &Arc<Mutex<HashSet<String>>>,
+    locked_sell_orders: &Arc<Mutex<HashSet<String>>>,
 ) {
+    let persistence = MarketPersistence::new("agentd");
+    let emit = |event_type: &str, entity_id: &str, details: Value| {
+        let _ =
+            persistence.append_event(&MarketEvent::now("agentd", event_type, entity_id, details));
+    };
     while task.pending_windows.len() >= task.merge_window_count {
         let Some(bound_match_id) = task.bound_match_id.clone() else {
             task.settlement_audit_events
                 .push("settlement_skipped:no_accepted_match_binding".to_string());
             break;
         };
+
+        let release_after_failure =
+            |failure_code: &str,
+             task: &mut TaskRuntime,
+             accepted_matches: &Arc<Mutex<HashMap<String, AcceptedMatchBinding>>>,
+             locked_buy_orders: &Arc<Mutex<HashSet<String>>>,
+             locked_sell_orders: &Arc<Mutex<HashSet<String>>>,
+             provider_addr: &str,
+             bound_match_id: &str| {
+                if let Some(binding) = accepted_matches
+                    .lock()
+                    .expect("accepted matches lock")
+                    .get_mut(bound_match_id)
+                {
+                    binding.status = MATCH_STATUS_FAILED.to_string();
+                    let _ = release_provider_sell_order(provider_addr, &binding.sell_order_id);
+                    locked_buy_orders
+                        .lock()
+                        .expect("locked buy orders lock")
+                        .remove(&binding.buy_order_id);
+                    locked_sell_orders
+                        .lock()
+                        .expect("locked sell orders lock")
+                        .remove(&binding.sell_order_id);
+                }
+                task.settlement_audit_events.push(format!(
+                    "settlement_compensation status=applied reason={} match_id={}",
+                    failure_code, bound_match_id
+                ));
+                emit(
+                    "settlement_failed",
+                    bound_match_id,
+                    serde_json::json!({"failure_code": failure_code}),
+                );
+                emit(
+                    "match_failed",
+                    bound_match_id,
+                    serde_json::json!({"failure_code": failure_code}),
+                );
+                task.bound_match_id = None;
+            };
 
         {
             let accepted = accepted_matches.lock().expect("accepted matches lock");
@@ -1561,6 +1914,12 @@ fn maybe_merge_and_settle(
                 .unwrap_or_else(|| "sell-order-demo-1".to_string())
         };
         let _ = mark_provider_sell_order_settling(provider_addr, &sell_order_for_match);
+        emit(
+            "settlement_started",
+            &bound_match_id,
+            serde_json::json!({"sell_order_id": sell_order_for_match}),
+        );
+        emit("match_settling", &bound_match_id, serde_json::json!({}));
 
         let windows: Vec<WindowCharge> = task
             .pending_windows
@@ -1582,11 +1941,15 @@ fn maybe_merge_and_settle(
                 task.last_audit_event =
                     Some(format!("settlement_error:{}:{}", err.code, err.message));
                 task.stall_status = "pause".to_string();
-                accepted_matches
-                    .lock()
-                    .expect("accepted matches lock")
-                    .entry(bound_match_id.clone())
-                    .and_modify(|m| m.status = MATCH_STATUS_FAILED.to_string());
+                release_after_failure(
+                    &err.code,
+                    task,
+                    accepted_matches,
+                    locked_buy_orders,
+                    locked_sell_orders,
+                    provider_addr,
+                    &bound_match_id,
+                );
                 break;
             }
         };
@@ -1610,11 +1973,15 @@ fn maybe_merge_and_settle(
                 task.last_audit_event =
                     Some(format!("settlement_error:{}:{}", err.code, err.message));
                 task.stall_status = "pause".to_string();
-                accepted_matches
-                    .lock()
-                    .expect("accepted matches lock")
-                    .entry(bound_match_id.clone())
-                    .and_modify(|m| m.status = MATCH_STATUS_FAILED.to_string());
+                release_after_failure(
+                    &err.code,
+                    task,
+                    accepted_matches,
+                    locked_buy_orders,
+                    locked_sell_orders,
+                    provider_addr,
+                    &bound_match_id,
+                );
                 break;
             }
         };
@@ -1635,6 +2002,15 @@ fn maybe_merge_and_settle(
             ));
             task.last_audit_event = Some(format!("settlement_error:{}:{}", err.code, err.message));
             task.stall_status = "pause".to_string();
+            release_after_failure(
+                &err.code,
+                task,
+                accepted_matches,
+                locked_buy_orders,
+                locked_sell_orders,
+                provider_addr,
+                &bound_match_id,
+            );
             break;
         }
         task.settlement_audit_events.push(format!(
@@ -1674,8 +2050,14 @@ fn maybe_merge_and_settle(
             window_indexes,
             amount_paid,
         });
-
         let latest = task.payment_records.last().expect("just pushed record");
+        emit(
+            "settlement_succeeded",
+            &bound_match_id,
+            serde_json::json!({"invoice_id": latest.invoice_id, "payment_id": latest.payment_id, "amount_paid": latest.amount_paid}),
+        );
+        emit("match_settled", &bound_match_id, serde_json::json!({}));
+
         match notify_provider_reconciliation(
             provider_addr,
             &task.provider_job_id,
@@ -1734,6 +2116,8 @@ fn apply_provider_poll(
     }
 
     let accepted_matches = Arc::new(Mutex::new(seed));
+    let locked_buy_orders = Arc::new(Mutex::new(HashSet::new()));
+    let locked_sell_orders = Arc::new(Mutex::new(HashSet::new()));
     apply_provider_poll_with_matches(
         task,
         polled,
@@ -1741,6 +2125,8 @@ fn apply_provider_poll(
         gateway,
         provider_addr,
         &accepted_matches,
+        &locked_buy_orders,
+        &locked_sell_orders,
     );
 }
 
@@ -1751,10 +2137,19 @@ fn apply_provider_poll_with_matches(
     gateway: &mut (dyn SettlementGateway + Send),
     provider_addr: &str,
     accepted_matches: &Arc<Mutex<HashMap<String, AcceptedMatchBinding>>>,
+    locked_buy_orders: &Arc<Mutex<HashSet<String>>>,
+    locked_sell_orders: &Arc<Mutex<HashSet<String>>>,
 ) {
     let previous_window = task.last_window_index;
     let polled_window = polled.window_index.unwrap_or(task.last_window_index);
     let polled_owed = polled.owed_window.unwrap_or(0.0);
+
+    if polled.status != "running" {
+        task.status = polled.status.clone();
+        task.last_audit_event = Some("task_not_running_skip_settlement".to_string());
+        update_evidence_for_runtime(task, polled, now_secs);
+        return;
+    }
 
     if polled_window > previous_window {
         task.last_window_index = polled_window;
@@ -1773,7 +2168,14 @@ fn apply_provider_poll_with_matches(
             task.spent += polled_owed;
             task.last_progress_at_secs = now_secs;
             task.last_audit_event = Some("provider_window_advanced".to_string());
-            maybe_merge_and_settle(task, gateway, provider_addr, accepted_matches);
+            maybe_merge_and_settle(
+                task,
+                gateway,
+                provider_addr,
+                accepted_matches,
+                locked_buy_orders,
+                locked_sell_orders,
+            );
         }
     }
 
@@ -1803,10 +2205,6 @@ fn apply_provider_poll_with_matches(
         task.last_audit_event = assessment.audit_event.map(|e| e.event_type);
     } else if task.status == "running" {
         task.stall_status = "ok".to_string();
-    }
-
-    if polled.status != "running" && task.status == "running" {
-        task.status = polled.status.clone();
     }
 
     update_evidence_for_runtime(task, polled, now_secs);
@@ -1934,6 +2332,11 @@ fn parse_provider_status_json(body: &str) -> Option<ProviderJobStatusPoll> {
 }
 
 async fn poll_once(state: &AppState, now_secs: u64) {
+    {
+        let mut tick = state.lifecycle_tick.lock().expect("lifecycle tick lock");
+        *tick = tick.saturating_add(1);
+    }
+
     let tasks_to_poll: Vec<(String, String)> = {
         let tasks = state.tasks.lock().expect("tasks lock poisoned");
         tasks
@@ -1958,12 +2361,33 @@ async fn poll_once(state: &AppState, now_secs: u64) {
                         &mut **gateway,
                         &state.provider_addr,
                         &state.accepted_matches,
+                        &state.locked_buy_orders,
+                        &state.locked_sell_orders,
                     );
                 }
             }
 
+            if polled.status != "running" {
+                cleanup_task_bindings(
+                    state,
+                    &task_id,
+                    "task_stopped_cleanup",
+                    MATCH_STATUS_EXPIRED,
+                );
+                state
+                    .market_audit
+                    .lock()
+                    .expect("market audit lock")
+                    .push(format!(
+                        "lifecycle_task_stopped task_id={} status={}",
+                        task_id, polled.status
+                    ));
+                persist_agent_state(state);
+                continue;
+            }
+
             let mode = state.market_mode.lock().expect("market mode lock").clone();
-            if mode == MARKET_MODE_AUTO {
+            if mode == MARKET_MODE_AUTO && auto_actions_allowed(state) {
                 let has_bound = {
                     let tasks = state.tasks.lock().expect("tasks lock");
                     tasks
@@ -1998,7 +2422,23 @@ async fn poll_once(state: &AppState, now_secs: u64) {
                     }
                 }
             }
+        } else {
+            cleanup_task_bindings(
+                state,
+                &task_id,
+                "provider_offline_cleanup",
+                MATCH_STATUS_EXPIRED,
+            );
+            state
+                .market_audit
+                .lock()
+                .expect("market audit lock")
+                .push(format!(
+                    "lifecycle_provider_offline task_id={} provider_job_id={}",
+                    task_id, provider_job_id
+                ));
         }
+        persist_agent_state(state);
     }
 }
 
@@ -2837,6 +3277,7 @@ mod tests {
         if let Some(task) = state.tasks.lock().unwrap().get_mut("task-demo") {
             task.bound_match_id = None;
         }
+        *state.market_mode.lock().unwrap() = MARKET_MODE_AUTO.to_string();
 
         let app = app_with_state(state.clone());
         let req = Request::builder()
@@ -2873,8 +3314,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accept_non_proposed_match_is_rejected() {
+        let state = AppState::default();
+        let app = app_with_state(state);
+
+        let req = Request::builder()
+            .uri("/internal/market/matches/accept")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "buy_order_id": "buy-order-task-demo",
+                    "sell_order_id": "sell-order-missing"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "match_not_proposed");
+    }
+
+    #[tokio::test]
     async fn same_buy_or_sell_cannot_be_double_accepted() {
         let state = AppState::default();
+        *state.market_mode.lock().unwrap() = MARKET_MODE_AUTO.to_string();
         let app = app_with_state(state.clone());
 
         let req = Request::builder()
@@ -2906,6 +3373,50 @@ mod tests {
             .unwrap();
         let resp2 = app.oneshot(req2).await.unwrap();
         assert_eq!(resp2.status(), StatusCode::OK);
+        let body = to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "already_accepted");
+    }
+
+    #[tokio::test]
+    async fn already_accepted_branch_has_no_lock_side_effects() {
+        let state = AppState::default();
+        let match_id = build_match_id("buy-order-task-demo", "sell-order-demo-1");
+        state.accepted_matches.lock().unwrap().insert(
+            match_id.clone(),
+            AcceptedMatchBinding {
+                match_id,
+                task_id: "task-demo".to_string(),
+                provider_id: "provider-demo".to_string(),
+                buy_order_id: "buy-order-task-demo".to_string(),
+                sell_order_id: "sell-order-demo-1".to_string(),
+                provider_job_id: "job-demo".to_string(),
+                agreed_unit_price: 0.05,
+                agreed_work_units: 10.0,
+                status: MATCH_STATUS_ACCEPTED.to_string(),
+            },
+        );
+        state.locked_buy_orders.lock().unwrap().clear();
+        state.locked_sell_orders.lock().unwrap().clear();
+
+        let app = app_with_state(state.clone());
+        let req = Request::builder()
+            .uri("/internal/market/matches/accept")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "buy_order_id": "buy-order-task-demo",
+                    "sell_order_id": "sell-order-demo-1"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(state.locked_buy_orders.lock().unwrap().is_empty());
+        assert!(state.locked_sell_orders.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2963,7 +3474,16 @@ mod tests {
         };
 
         let mut gateway = MockSettlementGateway::default();
-        maybe_merge_and_settle(&mut task, &mut gateway, "127.0.0.1:4001", &accepted_matches);
+        let locked_buy_orders = Arc::new(Mutex::new(HashSet::new()));
+        let locked_sell_orders = Arc::new(Mutex::new(HashSet::new()));
+        maybe_merge_and_settle(
+            &mut task,
+            &mut gateway,
+            "127.0.0.1:4001",
+            &accepted_matches,
+            &locked_buy_orders,
+            &locked_sell_orders,
+        );
         assert!(task.payment_records.is_empty());
 
         let match_id = "match-buy-order-task-test-sell-order-demo-1".to_string();
@@ -2983,7 +3503,16 @@ mod tests {
             },
         );
 
-        maybe_merge_and_settle(&mut task, &mut gateway, "127.0.0.1:4001", &accepted_matches);
+        let locked_buy_orders = Arc::new(Mutex::new(HashSet::new()));
+        let locked_sell_orders = Arc::new(Mutex::new(HashSet::new()));
+        maybe_merge_and_settle(
+            &mut task,
+            &mut gateway,
+            "127.0.0.1:4001",
+            &accepted_matches,
+            &locked_buy_orders,
+            &locked_sell_orders,
+        );
         assert_eq!(task.payment_records.len(), 1);
         assert_eq!(
             task.payment_records[0].match_id.as_deref(),
@@ -3085,6 +3614,150 @@ mod tests {
         assert!(state.accepted_matches.lock().unwrap().is_empty());
     }
 
+    #[test]
+    fn settlement_failure_releases_locks_and_converges_state() {
+        #[derive(Default)]
+        struct FailingGateway;
+        impl SettlementGateway for FailingGateway {
+            fn create_invoice(
+                &mut self,
+                _task: &mut TaskRuntime,
+                _windows: &[WindowCharge],
+            ) -> Result<GatewayInvoice, GatewayError> {
+                Ok(GatewayInvoice {
+                    invoice_id: "inv-fail".to_string(),
+                })
+            }
+
+            fn settle_payment(
+                &mut self,
+                _task: &mut TaskRuntime,
+                _invoice: &GatewayInvoice,
+                _windows: &[WindowCharge],
+            ) -> Result<GatewayPayment, GatewayError> {
+                Err(GatewayError {
+                    code: "rpc_error".to_string(),
+                    message: "forced failure".to_string(),
+                })
+            }
+
+            fn record_result(
+                &mut self,
+                _task: &mut TaskRuntime,
+                _invoice: &GatewayInvoice,
+                _payment: &GatewayPayment,
+            ) -> Result<(), GatewayError> {
+                Ok(())
+            }
+        }
+
+        let accepted_matches = Arc::new(Mutex::new(HashMap::new()));
+        let locked_buy_orders = Arc::new(Mutex::new(HashSet::from([
+            "buy-order-task-test".to_string()
+        ])));
+        let locked_sell_orders =
+            Arc::new(Mutex::new(HashSet::from(["sell-order-demo-1".to_string()])));
+        let match_id = build_match_id("buy-order-task-test", "sell-order-demo-1");
+        accepted_matches.lock().unwrap().insert(
+            match_id.clone(),
+            AcceptedMatchBinding {
+                match_id: match_id.clone(),
+                task_id: "task-test".to_string(),
+                provider_id: "provider-demo".to_string(),
+                buy_order_id: "buy-order-task-test".to_string(),
+                sell_order_id: "sell-order-demo-1".to_string(),
+                provider_job_id: "job-demo".to_string(),
+                agreed_unit_price: 0.05,
+                agreed_work_units: 10.0,
+                status: MATCH_STATUS_ACCEPTED.to_string(),
+            },
+        );
+
+        let mut task = TaskRuntime {
+            task_id: "task-test".to_string(),
+            status: "running".to_string(),
+            provider_job_id: "job-demo".to_string(),
+            spent: 0.0,
+            budget_max: 100.0,
+            last_window_index: 2,
+            last_owed_window: 2.0,
+            stall_status: "ok".to_string(),
+            last_audit_event: None,
+            evidence_bundle: EvidenceBundle {
+                version: "v1".to_string(),
+                job_id: "job-demo".to_string(),
+                window_range: "0-0".to_string(),
+                merge_policy: "30s".to_string(),
+                receipts: vec![],
+                root_hash: "".to_string(),
+                telemetry_samples_digest: "".to_string(),
+                telemetry_source_manifest: "".to_string(),
+                pricing_inputs: "".to_string(),
+                idempotency_records: vec![],
+                conflict_records: vec![],
+                stall_records: vec![],
+                generated_at_utc: "".to_string(),
+                generator_version: "".to_string(),
+            },
+            last_progress_at_secs: 0,
+            stall_sla_secs: 6,
+            merge_window_count: 2,
+            pending_windows: vec![
+                WindowCharge {
+                    window_index: 1,
+                    owed_window: 1.0,
+                },
+                WindowCharge {
+                    window_index: 2,
+                    owed_window: 1.0,
+                },
+            ],
+            settled_windows: HashSet::new(),
+            last_settled_window_index: 0,
+            last_invoice_id: None,
+            last_payment_id: None,
+            total_paid: 0.0,
+            payment_records: vec![],
+            bound_match_id: Some(match_id.clone()),
+            settlement_audit_events: vec![],
+            next_invoice_seq: 1,
+            next_payment_seq: 1,
+        };
+
+        let mut gateway = FailingGateway;
+        maybe_merge_and_settle(
+            &mut task,
+            &mut gateway,
+            "127.0.0.1:9",
+            &accepted_matches,
+            &locked_buy_orders,
+            &locked_sell_orders,
+        );
+
+        assert_eq!(task.bound_match_id, None);
+        assert!(task
+            .settlement_audit_events
+            .iter()
+            .any(|e| e.contains("settlement_compensation status=applied")));
+        assert!(!locked_buy_orders
+            .lock()
+            .unwrap()
+            .contains("buy-order-task-test"));
+        assert!(!locked_sell_orders
+            .lock()
+            .unwrap()
+            .contains("sell-order-demo-1"));
+        assert_eq!(
+            accepted_matches
+                .lock()
+                .unwrap()
+                .get(&match_id)
+                .unwrap()
+                .status,
+            MATCH_STATUS_FAILED
+        );
+    }
+
     #[tokio::test]
     async fn fixed_band_and_recommended_pricing_behave_as_expected() {
         let state = AppState::default();
@@ -3099,6 +3772,8 @@ mod tests {
             ))
             .unwrap();
         let _ = app.clone().oneshot(fixed_req).await.unwrap();
+        *state.lifecycle_tick.lock().unwrap() = 100;
+        *state.auto_pause_until_tick.lock().unwrap() = 0;
         assert_eq!(
             collect_buy_orders(&state)[0].max_unit_price_per_work_unit,
             0.061
@@ -3114,6 +3789,8 @@ mod tests {
             ))
             .unwrap();
         let _ = app.clone().oneshot(band_req).await.unwrap();
+        *state.lifecycle_tick.lock().unwrap() = 100;
+        *state.auto_pause_until_tick.lock().unwrap() = 0;
         assert_eq!(
             collect_buy_orders(&state)[0].max_unit_price_per_work_unit,
             0.07
@@ -3136,7 +3813,323 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let _ = app.clone().oneshot(confirm_req).await.unwrap();
+        *state.lifecycle_tick.lock().unwrap() = 100;
+        *state.auto_pause_until_tick.lock().unwrap() = 0;
         assert!(!collect_buy_orders(&state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn recommended_band_requires_reconfirm_after_context_change() {
+        let state = AppState::default();
+        let app = app_with_state(state.clone());
+
+        let rec_req = Request::builder()
+            .uri("/internal/market/pricing")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"price_mode":"recommended_band"}).to_string(),
+            ))
+            .unwrap();
+        let _ = app.clone().oneshot(rec_req).await.unwrap();
+
+        let confirm_req = Request::builder()
+            .uri("/internal/market/pricing/recommended/confirm")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.clone().oneshot(confirm_req).await.unwrap();
+        *state.lifecycle_tick.lock().unwrap() = 100;
+        *state.auto_pause_until_tick.lock().unwrap() = 0;
+        assert!(!collect_buy_orders(&state).is_empty());
+
+        let mutate_req = Request::builder()
+            .uri("/internal/market/pricing")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"price_mode":"recommended_band","band":{"min":0.051,"max":0.09,"target":0.07}})
+                    .to_string(),
+            ))
+            .unwrap();
+        let _ = app.clone().oneshot(mutate_req).await.unwrap();
+
+        assert!(collect_buy_orders(&state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn mode_switch_cleans_locks_and_bindings() {
+        let state = AppState::default();
+        let match_id = build_match_id("buy-order-task-demo", "sell-order-demo-1");
+        state
+            .locked_buy_orders
+            .lock()
+            .unwrap()
+            .insert("buy-order-task-demo".to_string());
+        state
+            .locked_sell_orders
+            .lock()
+            .unwrap()
+            .insert("sell-order-demo-1".to_string());
+        state.accepted_matches.lock().unwrap().insert(
+            match_id.clone(),
+            AcceptedMatchBinding {
+                match_id: match_id.clone(),
+                task_id: "task-demo".to_string(),
+                provider_id: "provider-demo".to_string(),
+                buy_order_id: "buy-order-task-demo".to_string(),
+                sell_order_id: "sell-order-demo-1".to_string(),
+                provider_job_id: "job-demo".to_string(),
+                agreed_unit_price: 0.05,
+                agreed_work_units: 10.0,
+                status: MATCH_STATUS_ACCEPTED.to_string(),
+            },
+        );
+        state
+            .tasks
+            .lock()
+            .unwrap()
+            .get_mut("task-demo")
+            .unwrap()
+            .bound_match_id = Some(match_id.clone());
+
+        let app = app_with_state(state.clone());
+        let req = Request::builder()
+            .uri("/internal/market/mode")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"mode":"manual"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(state.locked_buy_orders.lock().unwrap().is_empty());
+        assert!(state.locked_sell_orders.lock().unwrap().is_empty());
+        assert!(state
+            .tasks
+            .lock()
+            .unwrap()
+            .get("task-demo")
+            .unwrap()
+            .bound_match_id
+            .is_none());
+        assert_eq!(
+            state
+                .accepted_matches
+                .lock()
+                .unwrap()
+                .get(&match_id)
+                .unwrap()
+                .status,
+            MATCH_STATUS_EXPIRED
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_override_not_immediately_overridden_by_auto() {
+        let state = AppState::default();
+        *state.market_mode.lock().unwrap() = MARKET_MODE_AUTO.to_string();
+        let app = app_with_state(state.clone());
+
+        let req = Request::builder()
+            .uri("/internal/market/orders/buy/manual")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "task_id":"task-demo",
+                    "max_unit_price_per_work_unit":0.07,
+                    "required_work_units":12.0,
+                    "min_benchmark_score":80.0,
+                    "capabilities_required":["fp16"]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(collect_buy_orders(&state).is_empty());
+        *state.lifecycle_tick.lock().unwrap() = 100;
+        *state.auto_pause_until_tick.lock().unwrap() = 0;
+        assert!(!collect_buy_orders(&state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_and_retry_release_resources() {
+        let state = AppState::default();
+        *state.market_mode.lock().unwrap() = MARKET_MODE_AUTO.to_string();
+        let app = app_with_state(state.clone());
+
+        let accept_req = Request::builder()
+            .uri("/internal/market/matches/accept")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"buy_order_id":"buy-order-task-demo","sell_order_id":"sell-order-demo-1"}"#,
+            ))
+            .unwrap();
+        let _ = app.clone().oneshot(accept_req).await.unwrap();
+
+        let cancel_req = Request::builder()
+            .uri("/internal/market/matches/cancel")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"buy_order_id":"buy-order-task-demo","sell_order_id":"sell-order-demo-1"}"#,
+            ))
+            .unwrap();
+        let cancel_resp = app.clone().oneshot(cancel_req).await.unwrap();
+        assert_eq!(cancel_resp.status(), StatusCode::OK);
+        assert!(state.locked_buy_orders.lock().unwrap().is_empty());
+        assert!(state.locked_sell_orders.lock().unwrap().is_empty());
+
+        let retry_req = Request::builder()
+            .uri("/internal/market/matches/retry")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"buy_order_id":"buy-order-task-demo","sell_order_id":"sell-order-demo-1"}"#,
+            ))
+            .unwrap();
+        let retry_resp = app.oneshot(retry_req).await.unwrap();
+        assert_eq!(retry_resp.status(), StatusCode::OK);
+        assert!(state.accepted_matches.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn offline_provider_triggers_cleanup() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req_buf = [0_u8; 1024];
+                let _ = stream.read(&mut req_buf);
+                let body = r#"{"job_id":"job-demo","status":"stopped","window_index":1,"owed_window":0.0}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+
+{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let mut state = AppState::default();
+        state.provider_addr = format!("{}", addr);
+        let match_id = build_match_id("buy-order-task-demo", "sell-order-demo-1");
+        state
+            .locked_buy_orders
+            .lock()
+            .unwrap()
+            .insert("buy-order-task-demo".to_string());
+        state
+            .locked_sell_orders
+            .lock()
+            .unwrap()
+            .insert("sell-order-demo-1".to_string());
+        state.accepted_matches.lock().unwrap().insert(
+            match_id.clone(),
+            AcceptedMatchBinding {
+                match_id: match_id.clone(),
+                task_id: "task-demo".to_string(),
+                provider_id: "provider-demo".to_string(),
+                buy_order_id: "buy-order-task-demo".to_string(),
+                sell_order_id: "sell-order-demo-1".to_string(),
+                provider_job_id: "job-demo".to_string(),
+                agreed_unit_price: 0.05,
+                agreed_work_units: 10.0,
+                status: MATCH_STATUS_ACCEPTED.to_string(),
+            },
+        );
+        state
+            .tasks
+            .lock()
+            .unwrap()
+            .get_mut("task-demo")
+            .unwrap()
+            .bound_match_id = Some(match_id.clone());
+
+        poll_once(&state, 1).await;
+
+        assert!(state.locked_buy_orders.lock().unwrap().is_empty());
+        assert!(state.locked_sell_orders.lock().unwrap().is_empty());
+        assert!(state
+            .tasks
+            .lock()
+            .unwrap()
+            .get("task-demo")
+            .unwrap()
+            .bound_match_id
+            .is_none());
+        assert_eq!(
+            state
+                .accepted_matches
+                .lock()
+                .unwrap()
+                .get(&match_id)
+                .unwrap()
+                .status,
+            MATCH_STATUS_EXPIRED
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_offline_triggers_cleanup() {
+        let mut state = AppState::default();
+        state.provider_addr = "127.0.0.1:1".to_string();
+        let match_id = build_match_id("buy-order-task-demo", "sell-order-demo-1");
+        state
+            .locked_buy_orders
+            .lock()
+            .unwrap()
+            .insert("buy-order-task-demo".to_string());
+        state
+            .locked_sell_orders
+            .lock()
+            .unwrap()
+            .insert("sell-order-demo-1".to_string());
+        state.accepted_matches.lock().unwrap().insert(
+            match_id.clone(),
+            AcceptedMatchBinding {
+                match_id: match_id.clone(),
+                task_id: "task-demo".to_string(),
+                provider_id: "provider-demo".to_string(),
+                buy_order_id: "buy-order-task-demo".to_string(),
+                sell_order_id: "sell-order-demo-1".to_string(),
+                provider_job_id: "job-demo".to_string(),
+                agreed_unit_price: 0.05,
+                agreed_work_units: 10.0,
+                status: MATCH_STATUS_ACCEPTED.to_string(),
+            },
+        );
+        state
+            .tasks
+            .lock()
+            .unwrap()
+            .get_mut("task-demo")
+            .unwrap()
+            .bound_match_id = Some(match_id.clone());
+
+        poll_once(&state, 1).await;
+
+        assert!(state.locked_buy_orders.lock().unwrap().is_empty());
+        assert!(state.locked_sell_orders.lock().unwrap().is_empty());
+        assert!(state
+            .tasks
+            .lock()
+            .unwrap()
+            .get("task-demo")
+            .unwrap()
+            .bound_match_id
+            .is_none());
     }
 
     #[tokio::test]
@@ -3190,5 +4183,53 @@ mod tests {
         let match_body = to_bytes(match_resp.into_body(), usize::MAX).await.unwrap();
         let match_json: Value = serde_json::from_slice(&match_body).unwrap();
         assert_eq!(match_json[0]["status"], MATCH_STATUS_SETTLED);
+    }
+
+    #[test]
+    fn agent_state_persists_and_recovers() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("slicestream-agent-{}-{uniq}", std::process::id()));
+        let mut state = AppState::default();
+        state.persistence = Arc::new(MarketPersistence::new_in(
+            base.to_string_lossy().as_ref(),
+            "agentd",
+        ));
+        state.manual_buy_orders.lock().unwrap().push(BuyOrder {
+            order_id: "manual-buy-order-task-demo".to_string(),
+            task_id: "task-demo".to_string(),
+            desired_provider_id: Some("provider-demo".to_string()),
+            max_unit_price_per_work_unit: 0.06,
+            required_work_units: 10.0,
+            min_benchmark_score: 80.0,
+            capabilities_required: vec!["fp16".to_string()],
+            status: ORDER_STATUS_OPEN.to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        });
+        append_market_event(
+            &state,
+            "buy_order_created",
+            "manual-buy-order-task-demo",
+            serde_json::json!({"task_id":"task-demo"}),
+        );
+        persist_agent_state(&state);
+
+        let mut recovered = AppState::default();
+        recovered.persistence = Arc::new(MarketPersistence::new_in(
+            base.to_string_lossy().as_ref(),
+            "agentd",
+        ));
+        load_agent_state(&recovered);
+
+        let orders = recovered.manual_buy_orders.lock().unwrap().clone();
+        assert!(orders
+            .iter()
+            .any(|o| o.order_id == "manual-buy-order-task-demo"));
+        let events = recovered.persistence.read_events();
+        assert!(!events.is_empty());
     }
 }

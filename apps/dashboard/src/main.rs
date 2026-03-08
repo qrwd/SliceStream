@@ -1,3 +1,5 @@
+mod http_helpers;
+
 use axum::{
     extract::{Path, Query, State},
     response::Html,
@@ -15,6 +17,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
+
+use http_helpers::{collect_request_warnings, get_json, has_fatal_api_error};
 
 const PROVIDER_TELEMETRY_FALLBACK_HINT: &str = "fallback 提示：provider telemetry_source=mock";
 const API_UNREACHABLE_HINT: &str = "API 不可达：请确认 providerd/agentd 正在运行";
@@ -179,23 +183,43 @@ async fn index() -> Html<&'static str> {
   <title>SliceStream Market Terminal</title>
   <style>
     :root { color-scheme: dark; }
-    body { margin:0; font-family: Inter, system-ui, sans-serif; background:#050914; color:#eaf0ff; }
-    .terminal { display:grid; grid-template-rows:76px 1fr 170px; height:100vh; }
-    .top { display:grid; grid-template-columns: repeat(7,1fr) 220px; gap:8px; padding:10px; background:#0a1225; border-bottom:1px solid #1f325a; }
-    .pill { background:#121f3d; border:1px solid #29457e; border-radius:8px; padding:8px; }
-    .k{font-size:11px;color:#90a7df} .v{font-size:18px;font-weight:700}
-    .layout { display:grid; grid-template-columns: 34% 36% 30%; gap:10px; padding:10px; overflow:hidden; }
-    .panel { background:#0f1931; border:1px solid #223b6c; border-radius:10px; padding:10px; overflow:auto; }
+    body { margin:0; font-family: Inter, system-ui, sans-serif; background:linear-gradient(180deg,#050914,#060d1d 45%,#081127); color:#eaf0ff; }
+    .terminal { display:grid; grid-template-rows:auto 1fr 190px; min-height:100vh; }
+    .top {
+      display:grid;
+      grid-template-columns: repeat(4,minmax(170px,1fr));
+      gap:10px;
+      padding:12px;
+      background:#0a1225;
+      border-bottom:1px solid #1f325a;
+      position:sticky;
+      top:0;
+      z-index:10;
+    }
+    .pill { background:#121f3d; border:1px solid #29457e; border-radius:10px; padding:8px 10px; min-height:54px; }
+    .pill.controls { grid-column: span 2; display:grid; grid-template-columns: 80px 1fr 80px 1fr; gap:8px; align-items:center; }
+    .k{font-size:10px;color:#90a7df; text-transform:uppercase; letter-spacing:.06em;} .v{font-size:16px;font-weight:700}
+    .layout { display:grid; grid-template-columns: 31% 39% 30%; gap:10px; padding:10px; overflow:hidden; min-height:0; }
+    .panel { background:#0f1931; border:1px solid #223b6c; border-radius:12px; padding:10px; overflow:auto; }
     .panel h3{margin:0 0 8px 0}
+    .focus-grid { display:grid; grid-template-columns:1fr; gap:10px; }
+    .focus-card { background:#0d1a35; border:1px solid #355ea8; border-radius:10px; padding:10px; box-shadow:0 0 0 1px rgba(109,165,255,0.15) inset; }
+    .focus-card h3 { margin:0 0 6px 0; font-size:16px; }
     table{width:100%; border-collapse:collapse; font-size:12px}
-    th,td{padding:6px; border-bottom:1px solid #203458; text-align:left}
-    .tag{padding:2px 8px; border-radius:999px; font-size:11px; display:inline-block}
+    th,td{padding:6px; border-bottom:1px solid #203458; text-align:left; vertical-align:top;}
+    .tag{padding:2px 8px; border-radius:999px; font-size:11px; display:inline-block; font-weight:600}
     .ok{background:#123b24;color:#84f5a2} .bad{background:#4a1e2b;color:#ff9bad}
-    .btn{background:#1e325f; border:1px solid #4a6db8; color:#fff; border-radius:8px; padding:6px 8px; margin:2px; cursor:pointer}
+    .btn{background:#1e325f; border:1px solid #4a6db8; color:#fff; border-radius:8px; padding:7px 9px; margin:2px; cursor:pointer}
     .controls label{display:block;font-size:12px;margin-top:8px;color:#a3b7e5}
     .controls input,.controls select{width:100%;background:#0a1225;color:#fff;border:1px solid #35518c;border-radius:6px;padding:6px}
-    .bottom{display:grid; grid-template-columns:2fr 1fr; gap:10px; padding:0 10px 10px}
-    ul{margin:0;padding-left:18px}
+    .bottom{display:grid; grid-template-columns:1.4fr 1fr; gap:10px; padding:0 10px 10px}
+    .event-stream{list-style:none; margin:0; padding:0; display:grid; gap:8px;}
+    .event{background:#0c1730;border:1px solid #253f73;border-radius:9px;padding:8px 10px;font-size:12px}
+    .event small{display:block;color:#94abda;margin-bottom:2px}
+    .status-card{display:grid;gap:8px}
+    .evidence-row{display:flex; align-items:center; gap:6px; flex-wrap:wrap;}
+    .mono{font-family: ui-monospace, SFMono-Regular, Menlo, monospace;}
+    details{border:1px solid #2a467d; border-radius:8px; padding:6px 8px; background:#0b152c;}
   </style>
 </head>
 <body>
@@ -205,10 +229,9 @@ async fn index() -> Html<&'static str> {
     <div class='pill'><div class='k'>market mode</div><div id='marketMode' class='v'>-</div></div>
     <div class='pill'><div class='k'>settlement mode</div><div id='settleMode' class='v'>-</div></div>
     <div class='pill'><div class='k'>task/provider</div><div id='selection' class='v'>-</div></div>
-    <div class='pill'><div class='k'>benchmark</div><div id='benchmark' class='v'>-</div></div>
-    <div class='pill'><div class='k'>reconciliation</div><div id='recon' class='v'>-</div></div>
+    <div class='pill'><div class='k'>benchmark / reconciliation</div><div id='benchmark' class='v'>-</div><div id='recon' class='k'>-</div></div>
     <div class='pill'><div class='k'>last refresh</div><div id='refreshAt' class='v'>-</div></div>
-    <div class='pill'><label class='k'>task</label><select id='taskSelect'></select><label class='k'>provider</label><select id='providerSelect'></select></div>
+    <div class='pill controls'><label class='k'>task</label><select id='taskSelect'></select><label class='k'>provider</label><select id='providerSelect'></select></div>
   </div>
   <div class='layout'>
     <div class='panel'>
@@ -218,12 +241,20 @@ async fn index() -> Html<&'static str> {
       <h4>Match Queue</h4><table><thead><tr><th>Match</th><th>Buy</th><th>Sell</th><th>Price</th><th>Status</th></tr></thead><tbody id='matches'></tbody></table>
     </div>
     <div class='panel'>
-      <h3>Current Deal Ticket</h3>
-      <div id='ticket'></div>
-      <h3>Live Settlement</h3>
-      <table><tbody id='settlement'></tbody></table>
-      <h3>Reconciliation</h3>
-      <table><tbody id='reconcile'></tbody></table>
+      <div class='focus-grid'>
+        <section class='focus-card'>
+          <h3>Current Deal Ticket</h3>
+          <div id='ticket'></div>
+        </section>
+        <section class='focus-card'>
+          <h3>Live Settlement</h3>
+          <table><tbody id='settlement'></tbody></table>
+        </section>
+        <section class='focus-card'>
+          <h3>Reconciliation</h3>
+          <table><tbody id='reconcile'></tbody></table>
+        </section>
+      </div>
     </div>
     <div class='panel controls'>
       <h3>Trading Controls</h3>
@@ -242,8 +273,8 @@ async fn index() -> Html<&'static str> {
     </div>
   </div>
   <div class='bottom'>
-    <div class='panel'><h3>Audit Events</h3><ul id='audit'></ul></div>
-    <div class='panel'><h3>Warnings / Evidence</h3><ul id='warnings'></ul><div id='evidenceShort'></div></div>
+    <div class='panel'><h3>Audit Events</h3><ul id='audit' class='event-stream'></ul></div>
+    <div class='panel status-card'><h3>Warnings / Evidence</h3><ul id='warnings' class='event-stream'></ul><div id='evidenceShort'></div></div>
   </div>
 </div>
 <script>
@@ -253,21 +284,29 @@ const row=(k,v)=>`<tr><th>${k}</th><td>${v??'-'}</td></tr>`;
 async function j(url,opts){const r=await fetch(url,opts); return [r.status, await r.json()];}
 async function loadMeta(){const [,m]=await j('/api/meta'); el('taskSelect').innerHTML=(m.task_ids||[]).map(x=>`<option>${x}</option>`).join(''); el('providerSelect').innerHTML=(m.providers||[]).map(x=>`<option value="${x.id}">${x.label}</option>`).join(''); taskId=m.default_task_id||taskId; providerId=m.default_provider_id||providerId; el('taskSelect').value=taskId; el('providerSelect').value=providerId; el('taskSelect').onchange=()=>{taskId=el('taskSelect').value; refresh();}; el('providerSelect').onchange=()=>{providerId=el('providerSelect').value; refresh();}; }
 function tag(v){const ok=['matched','accepted','settled','MATCH','online'].includes(String(v)); return `<span class='tag ${ok?'ok':'bad'}'>${v}</span>`;}
+function shortHash(v){ if(!v||v==='-') return '-'; return String(v).length>18?`${String(v).slice(0,10)}...${String(v).slice(-6)}`:String(v); }
+function eventItem(type,msg){ return `<li class='event'><small>${type}</small>${msg}</li>`; }
+async function copyText(v){ try{ await navigator.clipboard.writeText(v); }catch(_e){} }
 async function refresh(){
   const [status,data]=await j(`/api/live/${taskId}?provider=${encodeURIComponent(providerId)}`); if(status>=400)return;
-  el('net').textContent=`${data.network}/${data.prefix}`; el('marketMode').textContent=`P:${data.provider_market_mode||'-'} A:${data.agent_market_mode||'-'}`; el('settleMode').textContent=data.settlement_mode; el('selection').textContent=`${data.selected_task_id}/${data.selected_provider_id}`; el('benchmark').textContent=data.benchmark_score??'-'; el('recon').innerHTML=tag(data.reconciliation.status); el('refreshAt').textContent=new Date().toLocaleTimeString();
+  el('net').textContent=`${data.network}/${data.prefix}`; el('marketMode').textContent=`P:${data.provider_market_mode||'-'} A:${data.agent_market_mode||'-'}`; el('settleMode').textContent=data.settlement_mode; el('selection').textContent=`${data.selected_task_id}/${data.selected_provider_id}`; el('benchmark').textContent=data.benchmark_score??'-'; el('recon').innerHTML=`status ${tag(data.reconciliation.status)}`; el('refreshAt').textContent=new Date().toLocaleTimeString();
   el('providers').innerHTML=(data.provider_pool||[]).map(p=>`<tr><td>${p.provider_id}</td><td>${p.benchmark_score}</td><td>${tag(p.status)}</td><td>${p.pricing?.unit_price_per_work_unit??'-'}</td></tr>`).join('');
   const sells=(data.sell_orders||[]).map(o=>`<tr><td>SELL</td><td>${o.order_id}</td><td>${o.unit_price_per_work_unit}</td><td>${o.max_work_units??o.min_work_units}</td><td>${tag(o.status)}</td></tr>`).join('');
   const buys=(data.buy_orders||[]).map(o=>`<tr><td>BUY</td><td>${o.order_id}</td><td>${o.max_unit_price_per_work_unit}</td><td>${o.required_work_units}</td><td>${tag(o.status)}</td></tr>`).join('');
   el('book').innerHTML=sells+buys;
   el('matches').innerHTML=(data.match_records||[]).map(m=>`<tr><td>${m.match_id}</td><td>${m.buy_order_id}</td><td>${m.sell_order_id}</td><td>${m.agreed_unit_price}</td><td>${tag(m.status)}</td></tr>`).join('');
-  el('ticket').innerHTML=`<div>bound_match_id: <b>${data.bound_match_id||'-'}</b></div><div>task_status: ${data.task_status||'-'}</div><div>total_paid: ${data.total_paid??'-'} / provider_confirmed: ${data.total_confirmed_paid??'-'}</div>`;
+  el('ticket').innerHTML=`<table><tbody>${row('Bound Match',`<span class='mono'>${data.bound_match_id||'-'}</span>`) + row('Task Status',tag(data.task_status||'-')) + row('Agent Paid',data.total_paid??'-') + row('Provider Confirmed',data.total_confirmed_paid??'-')}</tbody></table>`;
   el('settlement').innerHTML=[row('window',data.live_settlement.window_index),row('work_units',data.live_settlement.work_units_window),row('active_ratio',data.live_settlement.active_ratio),row('owed_window',data.live_settlement.owed_window),row('invoice',data.live_settlement.last_invoice_id),row('payment',data.live_settlement.last_payment_id)].join('');
   el('reconcile').innerHTML=[row('agent_total_paid',data.reconciliation.agent_total_paid),row('provider_total_confirmed_paid',data.reconciliation.provider_total_confirmed_paid),row('status',tag(data.reconciliation.status))].join('');
   el('pricing').innerHTML=[row('provider mode',data.provider_pricing?.price_mode),row('provider fixed',data.provider_pricing?.fixed_price),row('agent mode',data.agent_pricing?.price_mode),row('agent fixed',data.agent_pricing?.fixed_price),row('agent band',JSON.stringify(data.agent_pricing?.band||{}))].join('');
-  const audit=[...(data.provider_market_audit||[]),...(data.agent_market_audit||[])].slice(-20).reverse(); el('audit').innerHTML=audit.map(a=>`<li>${a}</li>`).join('')||'<li>none</li>';
-  el('warnings').innerHTML=(data.warnings||[]).map(w=>`<li>${w}</li>`).join('')||'<li>none</li>';
-  el('evidenceShort').textContent=`evidence_root=${data.receipt_evidence?.evidence_root||'-'} verify=${data.receipt_evidence?.evidence_verify_ok}`;
+  const audit=[...(data.provider_market_audit||[]),...(data.agent_market_audit||[])].slice(-20).reverse();
+  el('audit').innerHTML=audit.map(a=>eventItem('market_event',a)).join('')||eventItem('market_event','none');
+  el('warnings').innerHTML=(data.warnings||[]).map(w=>eventItem('warning',w)).join('')||eventItem('warning','none');
+  const root=data.receipt_evidence?.evidence_root||'-';
+  const verify=data.receipt_evidence?.evidence_verify_ok;
+  el('evidenceShort').innerHTML=`<details><summary>Evidence Status ${tag(verify===true?'MATCH':'MISMATCH')}</summary><div class='evidence-row'><span class='k'>root</span><span class='mono'>${shortHash(root)}</span><button class='btn' id='copyRoot'>Copy</button></div><div class='evidence-row'><span class='k'>verify</span>${tag(String(verify))}</div><div class='evidence-row'><span class='k'>full root</span><span class='mono'>${root}</span></div></details>`;
+  const copyBtn=el('copyRoot');
+  if(copyBtn){ copyBtn.onclick=()=>copyText(root); }
   el('modeSel').value=data.agent_market_mode||'manual';
 }
 async function postJson(url,obj){return j(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(obj)});}
@@ -704,65 +743,4 @@ fn read_string_array(obj: &Value, ptr: &str) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
-}
-
-fn collect_request_warnings(
-    provider_status: &Result<Value, String>,
-    provider_result: &Result<Value, String>,
-    agent_status: &Result<Value, String>,
-    agent_receipt: &Result<Value, String>,
-    provider_registry: &Result<Value, String>,
-    sell_orders: &Result<Value, String>,
-    buy_orders: &Result<Value, String>,
-    match_records: &Result<Value, String>,
-) -> Vec<String> {
-    let mut warnings = Vec::new();
-    if let Err(err) = provider_status {
-        warnings.push(format!("provider status error: {err}"));
-    }
-    if let Err(err) = provider_result {
-        warnings.push(format!("provider result error: {err}"));
-    }
-    if let Err(err) = agent_status {
-        warnings.push(format!("agent status error: {err}"));
-    }
-    if let Err(err) = agent_receipt {
-        warnings.push(format!("agent receipt error: {err}"));
-    }
-    if let Err(err) = provider_registry {
-        warnings.push(format!("provider registry error: {err}"));
-    }
-    if let Err(err) = sell_orders {
-        warnings.push(format!("sell orders error: {err}"));
-    }
-    if let Err(err) = buy_orders {
-        warnings.push(format!("buy orders error: {err}"));
-    }
-    if let Err(err) = match_records {
-        warnings.push(format!("match records error: {err}"));
-    }
-    warnings
-}
-
-fn has_fatal_api_error(warnings: &[String]) -> bool {
-    warnings.iter().any(|w| {
-        let low = w.to_lowercase();
-        // allow task_not_found to be a non-fatal, expected UI state for preset tasks.
-        low.contains("json_parse_error")
-            || low.contains("connection")
-            || low.contains("timed out")
-            || (low.contains("http_status=") && !low.contains("task_not_found"))
-    })
-}
-
-async fn get_json(http: &Client, url: &str) -> Result<Value, String> {
-    let response = http.get(url).send().await.map_err(|e| e.to_string())?;
-    let status = response.status();
-    let body = response.text().await.map_err(|e| e.to_string())?;
-    let json: Value =
-        serde_json::from_str(&body).map_err(|e| format!("json_parse_error={e} body={}", body))?;
-    if !status.is_success() {
-        return Err(format!("http_status={} body={}", status, json));
-    }
-    Ok(json)
 }

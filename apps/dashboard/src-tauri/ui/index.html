@@ -7,10 +7,10 @@
   <style>
     :root { color-scheme: dark; }
     html, body { margin: 0; height: 100%; font-family: Inter, system-ui, sans-serif; background: #070d1a; color: #eaf0ff; }
-    .shell { height: 100%; display: grid; grid-template-rows: 72px 1fr; }
+    .shell { height: 100%; display: grid; grid-template-rows: auto 1fr; }
     .top {
       display: grid;
-      grid-template-columns: repeat(5, minmax(160px, 1fr));
+      grid-template-columns: repeat(3, minmax(180px, 1fr));
       gap: 10px;
       padding: 10px;
       border-bottom: 1px solid #22365f;
@@ -18,7 +18,8 @@
     }
     .pill { border: 1px solid #314c82; border-radius: 10px; padding: 8px 10px; background: #131f3d; }
     .k { color: #9fb4e7; font-size: 11px; text-transform: uppercase; }
-    .v { font-size: 16px; font-weight: 700; margin-top: 4px; }
+    .v { font-size: 15px; font-weight: 700; margin-top: 4px; }
+    .sub { font-size: 11px; color: #9fb4e7; margin-top: 3px; }
     .ok { color: #7ee6a2; }
     .err { color: #ff8fa0; }
     .frame-wrap { position: relative; min-height: 0; }
@@ -53,11 +54,9 @@
   <!-- smoke markers: Bridge / Connected / Disconnected / mode / Network / Prefix / cargo run -p dashboard -->
   <div class="shell">
     <section class="top">
-      <div class="pill"><div class="k">Bridge</div><div id="bridge" class="v err">Disconnected</div></div>
-      <div class="pill"><div class="k">mode</div><div id="mode" class="v">-</div></div>
-      <div class="pill"><div class="k">Network / Prefix</div><div id="network" class="v">-</div></div>
-      <div class="pill"><div class="k">Terminal</div><div class="v">Market Terminal</div></div>
-      <div class="pill"><div class="k">Desktop Entry</div><div id="last" class="v">-</div></div>
+      <div class="pill"><div class="k">Bridge</div><div id="bridge" class="v err">Disconnected</div><div class="sub">desktop terminal host</div></div>
+      <div class="pill"><div class="k">Runtime</div><div id="mode" class="v">-</div><div id="network" class="sub">-</div></div>
+      <div class="pill"><div class="k">Terminal</div><div class="v">SliceStream Trading Terminal</div><div id="last" class="sub">-</div></div>
     </section>
     <section class="frame-wrap">
       <iframe id="terminalFrame" title="SliceStream Terminal"></iframe>
@@ -85,7 +84,7 @@
     function setConnected(data) {
       bridge.textContent = 'Connected';
       bridge.className = 'v ok';
-      mode.textContent = data?.settlement_mode || '-';
+      mode.textContent = `settlement=${data?.settlement_mode || '-'}`;
       network.textContent = `${data?.network || '-'} / ${data?.prefix || '-'}`;
       last.textContent = new Date().toLocaleTimeString();
       overlay.style.display = 'none';
