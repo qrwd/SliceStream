@@ -1,0 +1,426 @@
+openapi: 3.0.3
+info:
+  title: SliceStream API Contract
+  version: 1.0.0
+paths:
+  /provider/jobs/{job_id}/status:
+    get:
+      summary: Provider job status
+      parameters:
+        - in: path
+          name: job_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Job status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderJobStatus'
+
+  /receipts/{receipt_id}:
+    get:
+      summary: Settlement receipt
+      parameters:
+        - in: path
+          name: receipt_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Receipt payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Receipt'
+
+  # -----------------------------
+  # Internal market/runtime extension section (documentation-only extension)
+  # Existing external contract above is unchanged.
+  # -----------------------------
+
+  /internal/market/providers:
+    get:
+      tags: [internal-market]
+      summary: Provider registry snapshot
+      responses:
+        '200':
+          description: List of provider registry entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProviderRegistryEntry'
+
+  /internal/market/orders/sell:
+    get:
+      tags: [internal-market]
+      summary: Sell orders snapshot
+      responses:
+        '200':
+          description: List of sell orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SellOrder'
+
+  /internal/market/orders/buy:
+    get:
+      tags: [internal-market]
+      summary: Buy orders snapshot
+      responses:
+        '200':
+          description: List of buy orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BuyOrder'
+
+  /internal/market/matches:
+    get:
+      tags: [internal-market]
+      summary: Match records snapshot
+      responses:
+        '200':
+          description: List of match records
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MatchRecord'
+
+  /internal/market/matches/accept:
+    post:
+      tags: [internal-market]
+      summary: Accept proposed match
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MatchActionRequest'
+      responses:
+        '200':
+          description: Match action response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatchActionResponse'
+
+  /internal/market/matches/reject:
+    post:
+      tags: [internal-market]
+      summary: Reject proposed match
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MatchActionRequest'
+      responses:
+        '200':
+          description: Match action response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatchActionResponse'
+
+  /internal/market/mode:
+    get:
+      tags: [internal-market]
+      summary: Current market control mode
+      responses:
+        '200':
+          description: Current mode payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketModePayload'
+    post:
+      tags: [internal-market]
+      summary: Set market control mode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MarketModePayload'
+      responses:
+        '200':
+          description: Updated mode payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketModePayload'
+
+  /internal/market/pricing:
+    get:
+      tags: [internal-market]
+      summary: Current pricing mode/configuration
+      responses:
+        '200':
+          description: Pricing payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketPricingPayload'
+    post:
+      tags: [internal-market]
+      summary: Set pricing mode/configuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MarketPricingPayload'
+      responses:
+        '200':
+          description: Updated pricing payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketPricingPayload'
+
+  /internal/market/pricing/recommended/confirm:
+    post:
+      tags: [internal-market]
+      summary: Confirm recommended_band pricing before order generation/bidding
+      responses:
+        '200':
+          description: Confirmation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+
+  /internal/market/bidding/start:
+    post:
+      tags: [internal-market]
+      summary: Trigger auto bidding pass in current mode/runtime
+      responses:
+        '200':
+          description: Bidding trigger response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+
+components:
+  schemas:
+    ProviderJobStatus:
+      type: object
+      required:
+        - job_id
+        - status
+      properties:
+        job_id:
+          type: string
+        status:
+          type: string
+        telemetry_summary:
+          type: object
+          description: Window-level telemetry summary for settlement.
+          properties:
+            sampled_at:
+              type: string
+              format: date-time
+            window_seconds:
+              type: integer
+              example: 15
+            active_ratio:
+              type: number
+              format: float
+            active_samples:
+              type: integer
+            total_samples:
+              type: integer
+        telemetry_sig:
+          type: string
+          description: Signature for telemetry_summary.
+        window_index:
+          type: integer
+          minimum: 0
+        work_units_window:
+          type: number
+          format: float
+        unit_price_per_work_unit:
+          type: number
+          format: float
+        owed_window:
+          type: number
+          format: float
+
+    Receipt:
+      type: object
+      required:
+        - receipt_id
+        - amount_paid
+      properties:
+        receipt_id:
+          type: string
+        amount_paid:
+          type: number
+          format: float
+        telemetry_summary:
+          type: object
+          properties:
+            window_seconds:
+              type: integer
+            active_ratio:
+              type: number
+              format: float
+            active_samples:
+              type: integer
+            total_samples:
+              type: integer
+        telemetry_sig:
+          type: string
+        window_index:
+          type: integer
+        work_units_window:
+          type: number
+          format: float
+        unit_price_per_work_unit:
+          type: number
+          format: float
+        owed_window:
+          type: number
+          format: float
+
+    ProviderRegistryEntry:
+      type: object
+      required: [provider_id, display_name, benchmark_score, telemetry_source, status, hardware, pricing, capabilities, last_seen_at]
+      properties:
+        provider_id: { type: string }
+        display_name: { type: string }
+        benchmark_score: { type: number, format: float }
+        telemetry_source: { type: string }
+        status: { type: string }
+        hardware:
+          type: object
+          properties:
+            gpu_model: { type: string }
+            gpu_count: { type: integer }
+            vram_gb: { type: integer }
+            cpu_model: { type: string }
+            ram_gb: { type: integer }
+        pricing:
+          type: object
+          properties:
+            unit_price_per_work_unit: { type: number, format: float }
+            min_order_work_units: { type: number, format: float }
+            currency: { type: string }
+        capabilities:
+          type: object
+          properties:
+            supports_fp16: { type: boolean }
+            supports_int8: { type: boolean }
+            max_context_tokens: { type: integer }
+            tags:
+              type: array
+              items: { type: string }
+        last_seen_at: { type: string }
+
+    SellOrder:
+      type: object
+      required: [order_id, provider_id, provider_job_id, unit_price_per_work_unit, min_work_units, max_work_units, capabilities_required, status, created_at, updated_at]
+      properties:
+        order_id: { type: string }
+        provider_id: { type: string }
+        provider_job_id: { type: string }
+        unit_price_per_work_unit: { type: number, format: float }
+        min_work_units: { type: number, format: float }
+        max_work_units: { type: number, format: float }
+        capabilities_required:
+          type: array
+          items: { type: string }
+        status: { type: string }
+        created_at: { type: string }
+        updated_at: { type: string }
+
+    BuyOrder:
+      type: object
+      required: [order_id, task_id, max_unit_price_per_work_unit, required_work_units, min_benchmark_score, capabilities_required, status, created_at, updated_at]
+      properties:
+        order_id: { type: string }
+        task_id: { type: string }
+        desired_provider_id: { type: string, nullable: true }
+        max_unit_price_per_work_unit: { type: number, format: float }
+        required_work_units: { type: number, format: float }
+        min_benchmark_score: { type: number, format: float }
+        capabilities_required:
+          type: array
+          items: { type: string }
+        status: { type: string }
+        created_at: { type: string }
+        updated_at: { type: string }
+
+    MatchRecord:
+      type: object
+      required: [match_id, buy_order_id, sell_order_id, agreed_unit_price, agreed_work_units, status, created_at]
+      properties:
+        match_id: { type: string }
+        buy_order_id: { type: string }
+        sell_order_id: { type: string }
+        agreed_unit_price: { type: number, format: float }
+        agreed_work_units: { type: number, format: float }
+        status: { type: string }
+        created_at: { type: string }
+
+    MatchActionRequest:
+      type: object
+      required: [buy_order_id, sell_order_id]
+      properties:
+        buy_order_id: { type: string }
+        sell_order_id: { type: string }
+
+    MatchActionResponse:
+      type: object
+      required: [status, match_id, buy_order_id, sell_order_id]
+      properties:
+        status: { type: string }
+        match_id: { type: string }
+        buy_order_id: { type: string }
+        sell_order_id: { type: string }
+
+    MarketModePayload:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [manual, auto, hybrid]
+
+    MarketPricingPayload:
+      type: object
+      required: [price_mode]
+      properties:
+        price_mode:
+          type: string
+          enum: [fixed, band, recommended_band]
+        fixed_price:
+          type: number
+          format: float
+          nullable: true
+        band:
+          type: object
+          nullable: true
+          properties:
+            min: { type: number, format: float }
+            max: { type: number, format: float }
+            target: { type: number, format: float }
+
+    SimpleStatus:
+      type: object
+      properties:
+        status: { type: string }
+        error: { type: string }
