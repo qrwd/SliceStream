@@ -1,0 +1,855 @@
+openapi: 3.0.3
+info:
+  title: SliceStream API Contract
+  version: 1.0.0
+paths:
+  /provider/jobs/{job_id}/status:
+    get:
+      summary: Provider job status
+      parameters:
+        - in: path
+          name: job_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Job status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderJobStatus'
+
+  /receipts/{receipt_id}:
+    get:
+      summary: Settlement receipt
+      parameters:
+        - in: path
+          name: receipt_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Receipt payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Receipt'
+
+  # -----------------------------
+  # Internal market/runtime extension section (documentation-only extension)
+  # Existing external contract above is unchanged.
+  # -----------------------------
+
+  /internal/market/providers:
+    get:
+      tags: [internal-market]
+      summary: Provider registry snapshot
+      responses:
+        '200':
+          description: List of provider registry entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProviderRegistryEntry'
+
+  /internal/market/orders/sell:
+    get:
+      tags: [internal-market]
+      summary: Sell orders snapshot
+      responses:
+        '200':
+          description: List of sell orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SellOrder'
+
+  /internal/market/orders/sell/{order_id}/lock:
+    post:
+      tags: [internal-market]
+      summary: Lock sell order (idempotent)
+      description: |
+        State machine rule: open -> locked. Repeated calls in locked stay locked (no-op).
+        Any other source state returns conflict and does not mutate state.
+      parameters:
+        - in: path
+          name: order_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Lock acquired or already locked (idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+        '409':
+          description: Invalid state transition for lock
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+
+  /internal/market/orders/sell/{order_id}/mark_settling:
+    post:
+      tags: [internal-market]
+      summary: Mark sell order settling with strict transition checks
+      description: 'Allowed transition: locked -> settling. settling -> settling is idempotent no-op.'
+      parameters:
+        - in: path
+          name: order_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: State set to settling or already settling
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+        '409':
+          description: Invalid state transition
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+
+  /internal/market/orders/sell/{order_id}/mark_settled:
+    post:
+      tags: [internal-market]
+      summary: Mark sell order settled with strict transition checks
+      description: 'Allowed transition: settling -> settled. settled -> settled is idempotent no-op.'
+      parameters:
+        - in: path
+          name: order_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: State set to settled or already settled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+        '409':
+          description: Invalid state transition
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+
+  /internal/market/orders/sell/{order_id}/cancel:
+    post:
+      tags: [internal-market]
+      summary: Cancel sell order
+      parameters:
+        - in: path
+          name: order_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Order action response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+
+  /internal/market/orders/sell/{order_id}/expire:
+    post:
+      tags: [internal-market]
+      summary: Expire sell order
+      parameters:
+        - in: path
+          name: order_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Order action response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+
+  /internal/market/orders/sell/{order_id}/retry:
+    post:
+      tags: [internal-market]
+      summary: Retry sell order from cancelled/expired to open
+      parameters:
+        - in: path
+          name: order_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Order action response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+
+  /internal/market/orders/sell/{order_id}/release:
+    post:
+      tags: [internal-market]
+      summary: Release sell order lock/state after failed settlement compensation
+      parameters:
+        - in: path
+          name: order_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Release response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+
+  /internal/market/orders/buy:
+    get:
+      tags: [internal-market]
+      summary: Buy orders snapshot
+      responses:
+        '200':
+          description: List of buy orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BuyOrder'
+
+  /internal/market/matches:
+    get:
+      tags: [internal-market]
+      summary: Match records snapshot
+      responses:
+        '200':
+          description: List of match records
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MatchRecord'
+
+  /internal/market/matches/accept:
+    post:
+      tags: [internal-market]
+      summary: Accept proposed match only
+      description: |
+        Accept succeeds only when the target match currently exists in computed proposed matches.
+        Repeated accept of an already accepted/settling/settled match is idempotent and returns status=already_accepted without side effects.
+        If provider lock fails, agent rolls back local tentative changes and returns provider_lock_failed.
+        Optional header `x-client-idempotency-key` enables request-level replay semantics:
+        same key + same payload => replay/no-op success; same key + different payload => accept_idempotency_conflict.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MatchActionRequest'
+      responses:
+        '200':
+          description: Match accepted or already_accepted (idempotent replay)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatchActionResponse'
+        '409':
+          description: Match is not currently proposed (match_not_proposed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatchActionResponse'
+        '503':
+          description: Provider lock failed and local accept was compensated (provider_lock_failed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatchActionResponse'
+
+  /internal/market/matches/reject:
+    post:
+      tags: [internal-market]
+      summary: Reject proposed match
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MatchActionRequest'
+      responses:
+        '200':
+          description: Match action response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatchActionResponse'
+
+
+  /internal/market/matches/cancel:
+    post:
+      tags: [internal-market]
+      summary: Cancel accepted/settling match and release resources
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MatchActionRequest'
+      responses:
+        '200':
+          description: Match action response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatchActionResponse'
+
+  /internal/market/matches/expire:
+    post:
+      tags: [internal-market]
+      summary: Expire match and release resources
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MatchActionRequest'
+      responses:
+        '200':
+          description: Match action response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatchActionResponse'
+
+  /internal/market/matches/retry:
+    post:
+      tags: [internal-market]
+      summary: Prepare retry by releasing existing binding and queueing re-match
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MatchActionRequest'
+      responses:
+        '200':
+          description: Match action response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatchActionResponse'
+
+  /internal/market/mode:
+    get:
+      tags: [internal-market]
+      summary: Current market control mode
+      responses:
+        '200':
+          description: Current mode payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketModePayload'
+    post:
+      tags: [internal-market]
+      summary: Set market control mode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MarketModePayload'
+      responses:
+        '200':
+          description: Updated mode payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketModePayload'
+
+  /internal/market/pricing:
+    get:
+      tags: [internal-market]
+      summary: Current pricing mode/configuration
+      responses:
+        '200':
+          description: Pricing payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketPricingPayload'
+    post:
+      tags: [internal-market]
+      summary: Set pricing mode/configuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MarketPricingPayload'
+      responses:
+        '200':
+          description: Updated pricing payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketPricingPayload'
+
+  /internal/market/pricing/recommended/confirm:
+    post:
+      tags: [internal-market]
+      summary: Confirm recommended_band pricing before order generation/bidding
+      responses:
+        '200':
+          description: Confirmation response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+
+  /internal/market/bidding/start:
+    post:
+      tags: [internal-market]
+      summary: Trigger auto bidding pass in current mode/runtime
+      responses:
+        '200':
+          description: Bidding trigger response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+
+
+  /internal/market/accept-attempts/{attempt_id}:
+    get:
+      tags: [internal-market]
+      summary: Query accept attempt by attempt_id
+      parameters:
+        - in: path
+          name: attempt_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Accept attempt snapshot
+        '404':
+          description: Attempt not found
+
+  /internal/market/settlement-attempts/{attempt_id}:
+    get:
+      tags: [internal-market]
+      summary: Query settlement attempt by attempt_id
+      parameters:
+        - in: path
+          name: attempt_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Settlement attempt snapshot
+        '404':
+          description: Attempt not found
+
+  /internal/market/settlement-attempts/{attempt_id}/retry:
+    post:
+      tags: [internal-market]
+      summary: Retry settlement attempt in retryable_failed/payment_unknown
+      description: Recovery orchestrator automatically scans started/in_progress/retryable_failed attempts with bounded backoff; payment_unknown remains conservative/manual by default.
+      parameters:
+        - in: path
+          name: attempt_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Retry queued
+        '409':
+          description: Invalid attempt state for retry
+
+  /internal/market/settlement-attempts/{attempt_id}/mark-final:
+    post:
+      tags: [internal-market]
+      summary: Mark settlement attempt as failed_final after manual confirmation
+      parameters:
+        - in: path
+          name: attempt_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Marked failed_final
+        '409':
+          description: Invalid attempt state for mark-final
+
+  /confirm:
+    post:
+      tags: [internal-settlement]
+      summary: Confirm payment with idempotency key
+      description: |
+        Idempotency key must equal make_key(job_id, window_end).
+        Same key + same payment_id is idempotent success; same key + different payment_id is conflict.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmRequest'
+      responses:
+        '200':
+          description: Payment confirmation accepted
+        '400':
+          description: Invalid idempotency key
+        '409':
+          description: Idempotency conflict for the key
+
+  /internal/provider/reconcile:
+    post:
+      tags: [internal-settlement]
+      summary: Reconcile provider payment with idempotent replay protection
+      description: |
+        Idempotency key is (invoice_id, payment_id).
+        - Same payload replay is no-op success.
+        - Different payload under same key is conflict and does not mutate totals.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReconcilePaymentRequest'
+      responses:
+        '200':
+          description: Reconciled or duplicate replay ignored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReconcilePaymentResponse'
+        '409':
+          description: Idempotency conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorMessage'
+
+
+
+  /internal/market/disputes:
+    get:
+      tags: [internal-market]
+      summary: List dispute records
+      responses:
+        '200':
+          description: Dispute list
+
+  /internal/market/disputes/{dispute_id}/resolve:
+    post:
+      tags: [internal-market]
+      summary: Mark dispute as manually resolved
+      parameters:
+        - in: path
+          name: dispute_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Dispute resolved
+        '404':
+          description: Dispute not found
+
+  /internal/ops/recovery/run:
+    post:
+      tags: [internal-market]
+      summary: Force one recovery orchestrator tick
+      responses:
+        '200':
+          description: Recovery run completed
+
+  /internal/ops/reaper/run:
+    post:
+      tags: [internal-market]
+      summary: Force one reaper cleanup tick
+      responses:
+        '200':
+          description: Reaper run completed
+
+components:
+  schemas:
+    ConfirmRequest:
+      type: object
+      required: [job_id, window_end, payment_id]
+      properties:
+        job_id:
+          type: string
+        window_end:
+          type: integer
+          format: uint64
+        payment_id:
+          type: string
+
+    ReconcilePaymentRequest:
+      type: object
+      required: [job_id, invoice_id, payment_id, window_indexes, amount_paid]
+      properties:
+        job_id:
+          type: string
+        invoice_id:
+          type: string
+        payment_id:
+          type: string
+        window_indexes:
+          type: array
+          items:
+            type: integer
+            format: uint64
+        amount_paid:
+          type: number
+
+    ReconcilePaymentResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        last_confirmed_invoice_id:
+          type: string
+        last_confirmed_payment_id:
+          type: string
+        total_confirmed_paid:
+          type: number
+
+    ErrorMessage:
+      type: object
+      properties:
+        error:
+          type: string
+        detail:
+          type: string
+
+    ProviderJobStatus:
+      type: object
+      required:
+        - job_id
+        - status
+      properties:
+        job_id:
+          type: string
+        status:
+          type: string
+        telemetry_summary:
+          type: object
+          description: Window-level telemetry summary for settlement.
+          properties:
+            sampled_at:
+              type: string
+              format: date-time
+            window_seconds:
+              type: integer
+              example: 15
+            active_ratio:
+              type: number
+              format: float
+            active_samples:
+              type: integer
+            total_samples:
+              type: integer
+        telemetry_sig:
+          type: string
+          description: Signature for telemetry_summary.
+        window_index:
+          type: integer
+          minimum: 0
+        work_units_window:
+          type: number
+          format: float
+        unit_price_per_work_unit:
+          type: number
+          format: float
+        owed_window:
+          type: number
+          format: float
+
+    Receipt:
+      type: object
+      required:
+        - receipt_id
+        - amount_paid
+      properties:
+        receipt_id:
+          type: string
+        amount_paid:
+          type: number
+          format: float
+        telemetry_summary:
+          type: object
+          properties:
+            window_seconds:
+              type: integer
+            active_ratio:
+              type: number
+              format: float
+            active_samples:
+              type: integer
+            total_samples:
+              type: integer
+        telemetry_sig:
+          type: string
+        window_index:
+          type: integer
+        work_units_window:
+          type: number
+          format: float
+        unit_price_per_work_unit:
+          type: number
+          format: float
+        owed_window:
+          type: number
+          format: float
+
+    ProviderRegistryEntry:
+      type: object
+      required: [provider_id, display_name, benchmark_score, telemetry_source, status, hardware, pricing, capabilities, last_seen_at]
+      properties:
+        provider_id: { type: string }
+        display_name: { type: string }
+        benchmark_score: { type: number, format: float }
+        telemetry_source: { type: string }
+        status: { type: string }
+        hardware:
+          type: object
+          properties:
+            gpu_model: { type: string }
+            gpu_count: { type: integer }
+            vram_gb: { type: integer }
+            cpu_model: { type: string }
+            ram_gb: { type: integer }
+        pricing:
+          type: object
+          properties:
+            unit_price_per_work_unit: { type: number, format: float }
+            min_order_work_units: { type: number, format: float }
+            currency: { type: string }
+        capabilities:
+          type: object
+          properties:
+            supports_fp16: { type: boolean }
+            supports_int8: { type: boolean }
+            max_context_tokens: { type: integer }
+            tags:
+              type: array
+              items: { type: string }
+        last_seen_at: { type: string }
+
+    SellOrder:
+      type: object
+      required: [order_id, provider_id, provider_job_id, unit_price_per_work_unit, min_work_units, max_work_units, capabilities_required, status, created_at, updated_at]
+      properties:
+        order_id: { type: string }
+        provider_id: { type: string }
+        provider_job_id: { type: string }
+        unit_price_per_work_unit: { type: number, format: float }
+        min_work_units: { type: number, format: float }
+        max_work_units: { type: number, format: float }
+        capabilities_required:
+          type: array
+          items: { type: string }
+        status: { type: string }
+        created_at: { type: string }
+        updated_at: { type: string }
+
+    BuyOrder:
+      type: object
+      required: [order_id, task_id, max_unit_price_per_work_unit, required_work_units, min_benchmark_score, capabilities_required, status, created_at, updated_at]
+      properties:
+        order_id: { type: string }
+        task_id: { type: string }
+        desired_provider_id: { type: string, nullable: true }
+        max_unit_price_per_work_unit: { type: number, format: float }
+        required_work_units: { type: number, format: float }
+        min_benchmark_score: { type: number, format: float }
+        capabilities_required:
+          type: array
+          items: { type: string }
+        status: { type: string }
+        created_at: { type: string }
+        updated_at: { type: string }
+
+    MatchRecord:
+      type: object
+      required: [match_id, buy_order_id, sell_order_id, agreed_unit_price, agreed_work_units, status, created_at]
+      properties:
+        match_id: { type: string }
+        buy_order_id: { type: string }
+        sell_order_id: { type: string }
+        agreed_unit_price: { type: number, format: float }
+        agreed_work_units: { type: number, format: float }
+        status: { type: string }
+        created_at: { type: string }
+
+    MatchActionRequest:
+      type: object
+      required: [buy_order_id, sell_order_id]
+      properties:
+        buy_order_id: { type: string }
+        sell_order_id: { type: string }
+
+    MatchActionResponse:
+      type: object
+      required: [status, match_id, buy_order_id, sell_order_id]
+      properties:
+        status: { type: string }
+        match_id: { type: string }
+        buy_order_id: { type: string }
+        sell_order_id: { type: string }
+
+    MarketModePayload:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [manual, auto, hybrid]
+
+    MarketPricingPayload:
+      type: object
+      required: [price_mode]
+      properties:
+        price_mode:
+          type: string
+          enum: [fixed, band, recommended_band]
+        fixed_price:
+          type: number
+          format: float
+          nullable: true
+        band:
+          type: object
+          nullable: true
+          properties:
+            min: { type: number, format: float }
+            max: { type: number, format: float }
+            target: { type: number, format: float }
+
+    SimpleStatus:
+      type: object
+      properties:
+        status: { type: string }
+        error: { type: string }
