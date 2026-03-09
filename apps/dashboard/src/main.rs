@@ -80,6 +80,22 @@ struct DashboardPayload {
     agent_market_audit: Vec<String>,
     provider_pricing: Value,
     agent_pricing: Value,
+    current_market_mode: Option<String>,
+    auto_pause_reason: Option<String>,
+    auto_pause_until: Option<u64>,
+    recommended_context_hash: Option<String>,
+    recommended_confirmation_valid: Option<bool>,
+    recommended_invalidation_reason: Option<String>,
+    active_accept_attempts_count: Option<u64>,
+    active_settlement_attempts_count: Option<u64>,
+    retryable_failed_attempts_count: Option<u64>,
+    payment_unknown_attempts_count: Option<u64>,
+    stuck_attempts_count: Option<u64>,
+    locked_buy_orders_count: Option<u64>,
+    locked_sell_orders_count: Option<u64>,
+    recovery_queue_size: Option<u64>,
+    provider_offline_impact_count: Option<u64>,
+    disputes: Vec<Value>,
     warnings: Vec<String>,
     api_error: Option<String>,
 }
@@ -150,6 +166,11 @@ async fn main() {
         )
         .route("/api/action/manual_buy/:task_id", post(action_manual_buy))
         .route("/api/action/start_bidding", post(action_start_bidding))
+        .route("/api/action/recovery_run", post(action_recovery_run))
+        .route("/api/action/reaper_run", post(action_reaper_run))
+        .route("/api/action/retry_attempt/:attempt_id", post(action_retry_attempt))
+        .route("/api/action/mark_final/:attempt_id", post(action_mark_final_attempt))
+        .route("/api/action/dispute_resolve/:dispute_id", post(action_dispute_resolve))
         .with_state(Arc::new(AppState {
             http: Client::builder()
                 .no_proxy()
@@ -270,11 +291,18 @@ async fn index() -> Html<&'static str> {
       <button class='btn' id='refreshBtn'>Refresh</button>
       <h4>Pricing Context</h4>
       <table><tbody id='pricing'></tbody></table>
+      <h4>Recovery / Ops</h4>
+      <table><tbody id='ops'></tbody></table>
+      <label>Attempt ID</label><input id='attemptId' placeholder='settlement-attempt-*'/>
+      <button class='btn' id='retryAttempt'>Retry Attempt</button>
+      <button class='btn' id='markFinalAttempt'>Mark Final</button>
+      <button class='btn' id='runRecovery'>Resume Recovery</button>
+      <button class='btn' id='runReaper'>Reap / Cleanup</button>
     </div>
   </div>
   <div class='bottom'>
-    <div class='panel'><h3>Audit Events</h3><ul id='audit' class='event-stream'></ul></div>
-    <div class='panel status-card'><h3>Warnings / Evidence</h3><ul id='warnings' class='event-stream'></ul><div id='evidenceShort'></div></div>
+    <div class='panel'><h3>Audit Events</h3><ul id='audit' class='event-stream'></ul></div><div class='panel'><h3>Disputes</h3><ul id='disputes' class='event-stream'></ul><input id='disputeId' placeholder='dispute-*'/><button class='btn' id='resolveDispute'>Resolve Dispute</button></div>
+    <div class='panel status-card'><h3>Mode / Recommended / Warnings</h3><ul id='warnings' class='event-stream'></ul><div id='modeInfo'></div><div id='evidenceShort'></div></div>
   </div>
 </div>
 <script>
@@ -299,9 +327,12 @@ async function refresh(){
   el('settlement').innerHTML=[row('window',data.live_settlement.window_index),row('work_units',data.live_settlement.work_units_window),row('active_ratio',data.live_settlement.active_ratio),row('owed_window',data.live_settlement.owed_window),row('invoice',data.live_settlement.last_invoice_id),row('payment',data.live_settlement.last_payment_id)].join('');
   el('reconcile').innerHTML=[row('agent_total_paid',data.reconciliation.agent_total_paid),row('provider_total_confirmed_paid',data.reconciliation.provider_total_confirmed_paid),row('status',tag(data.reconciliation.status))].join('');
   el('pricing').innerHTML=[row('provider mode',data.provider_pricing?.price_mode),row('provider fixed',data.provider_pricing?.fixed_price),row('agent mode',data.agent_pricing?.price_mode),row('agent fixed',data.agent_pricing?.fixed_price),row('agent band',JSON.stringify(data.agent_pricing?.band||{}))].join('');
+  el('ops').innerHTML=[row('current mode',data.current_market_mode),row('auto pause',`${data.auto_pause_reason||'-'} until ${data.auto_pause_until||'-'}`),row('recommended valid',tag(String(data.recommended_confirmation_valid))),row('recommended hash',`<span class="mono">${shortHash(data.recommended_context_hash||'-')}</span>`),row('recommended reason',data.recommended_invalidation_reason||'-'),row('active settlement attempts',data.active_settlement_attempts_count),row('retryable_failed attempts',data.retryable_failed_attempts_count),row('payment_unknown attempts',data.payment_unknown_attempts_count),row('stuck attempts',data.stuck_attempts_count),row('recovery queue',data.recovery_queue_size),row('locked buys/sells',`${data.locked_buy_orders_count||0}/${data.locked_sell_orders_count||0}`),row('provider offline impact',data.provider_offline_impact_count)].join('');
   const audit=[...(data.provider_market_audit||[]),...(data.agent_market_audit||[])].slice(-20).reverse();
+  el('disputes').innerHTML=(data.disputes||[]).slice(-20).reverse().map(d=>eventItem(`dispute:${d.dispute_type||'-'}`,`${d.dispute_id||'-'} [${d.status||'-'}] ${d.summary||''}`)).join('')||eventItem('dispute','none');
   el('audit').innerHTML=audit.map(a=>eventItem('market_event',a)).join('')||eventItem('market_event','none');
   el('warnings').innerHTML=(data.warnings||[]).map(w=>eventItem('warning',w)).join('')||eventItem('warning','none');
+  el('modeInfo').innerHTML=`<div class='event'><small>mode matrix</small>manual: manual accept/recovery · auto: auto proposal+accept+recover · hybrid: auto proposal, manual acceptance/recovery</div>`;
   const root=data.receipt_evidence?.evidence_root||'-';
   const verify=data.receipt_evidence?.evidence_verify_ok;
   el('evidenceShort').innerHTML=`<details><summary>Evidence Status ${tag(verify===true?'MATCH':'MISMATCH')}</summary><div class='evidence-row'><span class='k'>root</span><span class='mono'>${shortHash(root)}</span><button class='btn' id='copyRoot'>Copy</button></div><div class='evidence-row'><span class='k'>verify</span>${tag(String(verify))}</div><div class='evidence-row'><span class='k'>full root</span><span class='mono'>${root}</span></div></details>`;
@@ -315,6 +346,11 @@ el('applyPricing').onclick=async()=>{const payload={price_mode:el('priceModeSel'
 el('confirmRecommended').onclick=async()=>{await j('/api/action/confirm_recommended',{method:'POST'}); refresh();};
 el('manualBuy').onclick=async()=>{await j(`/api/action/manual_buy/${taskId}`,{method:'POST'}); refresh();};
 el('startBidding').onclick=async()=>{await j('/api/action/start_bidding',{method:'POST'}); refresh();};
+el('runRecovery').onclick=async()=>{await j('/api/action/recovery_run',{method:'POST'}); refresh();};
+el('runReaper').onclick=async()=>{await j('/api/action/reaper_run',{method:'POST'}); refresh();};
+el('retryAttempt').onclick=async()=>{const id=el('attemptId').value.trim(); if(id) await j(`/api/action/retry_attempt/${encodeURIComponent(id)}`,{method:'POST'}); refresh();};
+el('markFinalAttempt').onclick=async()=>{const id=el('attemptId').value.trim(); if(id) await j(`/api/action/mark_final/${encodeURIComponent(id)}`,{method:'POST'}); refresh();};
+el('resolveDispute').onclick=async()=>{const id=el('disputeId').value.trim(); if(id) await j(`/api/action/dispute_resolve/${encodeURIComponent(id)}`,{method:'POST'}); refresh();};
 el('refreshBtn').onclick=refresh;
 (async()=>{await loadMeta(); await refresh(); setInterval(refresh,3000);})();
 </script>
@@ -480,6 +516,84 @@ async fn action_start_bidding(State(state): State<Arc<AppState>>) -> Json<Value>
     })
 }
 
+async fn action_recovery_run(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let resp = state
+        .http
+        .post(format!("{}/internal/ops/recovery/run", state.agent_base))
+        .send()
+        .await;
+    Json(match resp {
+        Ok(_) => serde_json::json!({"status":"ok"}),
+        Err(e) => serde_json::json!({"error": format!("{e}")}),
+    })
+}
+
+async fn action_reaper_run(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let resp = state
+        .http
+        .post(format!("{}/internal/ops/reaper/run", state.agent_base))
+        .send()
+        .await;
+    Json(match resp {
+        Ok(_) => serde_json::json!({"status":"ok"}),
+        Err(e) => serde_json::json!({"error": format!("{e}")}),
+    })
+}
+
+async fn action_retry_attempt(
+    State(state): State<Arc<AppState>>,
+    Path(attempt_id): Path<String>,
+) -> Json<Value> {
+    let resp = state
+        .http
+        .post(format!(
+            "{}/internal/market/settlement-attempts/{}/retry",
+            state.agent_base, attempt_id
+        ))
+        .send()
+        .await;
+    Json(match resp {
+        Ok(v) => v.json::<Value>().await.unwrap_or_else(|_| serde_json::json!({"status":"ok"})),
+        Err(e) => serde_json::json!({"error": format!("{e}")}),
+    })
+}
+
+async fn action_mark_final_attempt(
+    State(state): State<Arc<AppState>>,
+    Path(attempt_id): Path<String>,
+) -> Json<Value> {
+    let resp = state
+        .http
+        .post(format!(
+            "{}/internal/market/settlement-attempts/{}/mark-final",
+            state.agent_base, attempt_id
+        ))
+        .send()
+        .await;
+    Json(match resp {
+        Ok(v) => v.json::<Value>().await.unwrap_or_else(|_| serde_json::json!({"status":"ok"})),
+        Err(e) => serde_json::json!({"error": format!("{e}")}),
+    })
+}
+
+async fn action_dispute_resolve(
+    State(state): State<Arc<AppState>>,
+    Path(dispute_id): Path<String>,
+) -> Json<Value> {
+    let resp = state
+        .http
+        .post(format!(
+            "{}/internal/market/disputes/{}/resolve",
+            state.agent_base, dispute_id
+        ))
+        .send()
+        .await;
+    Json(match resp {
+        Ok(v) => v.json::<Value>().await.unwrap_or_else(|_| serde_json::json!({"status":"ok"})),
+        Err(e) => serde_json::json!({"error": format!("{e}")}),
+    })
+}
+
 async fn live_dashboard(
     State(state): State<Arc<AppState>>,
     Path(task_id): Path<String>,
@@ -529,6 +643,7 @@ async fn live_dashboard(
     let agent_audit_url = format!("{}/internal/market/audit", state.agent_base);
     let provider_pricing_url = format!("{}/internal/market/pricing", provider.base_url);
     let agent_pricing_url = format!("{}/internal/market/pricing", state.agent_base);
+    let disputes_url = format!("{}/internal/market/disputes", state.agent_base);
 
     let provider_status = get_json(&state.http, &provider_status_url).await;
     let provider_result = get_json(&state.http, &provider_result_url).await;
@@ -544,6 +659,7 @@ async fn live_dashboard(
     let agent_audit = get_json(&state.http, &agent_audit_url).await;
     let provider_pricing = get_json(&state.http, &provider_pricing_url).await;
     let agent_pricing = get_json(&state.http, &agent_pricing_url).await;
+    let disputes = get_json(&state.http, &disputes_url).await;
 
     let mut warnings = collect_request_warnings(
         &provider_status,
@@ -574,6 +690,9 @@ async fn live_dashboard(
     }
     if let Err(err) = &agent_pricing {
         warnings.push(format!("agent pricing error: {err}"));
+    }
+    if let Err(err) = &disputes {
+        warnings.push(format!("disputes error: {err}"));
     }
 
     let fatal_api_error = has_fatal_api_error(&warnings);
@@ -700,6 +819,22 @@ async fn live_dashboard(
             .collect(),
         provider_pricing: provider_pricing.unwrap_or(Value::Null),
         agent_pricing: agent_pricing.unwrap_or(Value::Null),
+        current_market_mode: read_str(&agent_status_v, "current_market_mode").map(str::to_string),
+        auto_pause_reason: read_str(&agent_status_v, "auto_pause_reason").map(str::to_string),
+        auto_pause_until: read_u64(&agent_status_v, "auto_pause_until"),
+        recommended_context_hash: read_str(&agent_status_v, "recommended_context_hash").map(str::to_string),
+        recommended_confirmation_valid: agent_status_v.get("recommended_confirmation_valid").and_then(|v| v.as_bool()),
+        recommended_invalidation_reason: read_str(&agent_status_v, "recommended_invalidation_reason").map(str::to_string),
+        active_accept_attempts_count: read_u64(&agent_status_v, "active_accept_attempts_count"),
+        active_settlement_attempts_count: read_u64(&agent_status_v, "active_settlement_attempts_count"),
+        retryable_failed_attempts_count: read_u64(&agent_status_v, "retryable_failed_attempts_count"),
+        payment_unknown_attempts_count: read_u64(&agent_status_v, "payment_unknown_attempts_count"),
+        stuck_attempts_count: read_u64(&agent_status_v, "stuck_attempts_count"),
+        locked_buy_orders_count: read_u64(&agent_status_v, "locked_buy_orders_count"),
+        locked_sell_orders_count: read_u64(&agent_status_v, "locked_sell_orders_count"),
+        recovery_queue_size: read_u64(&agent_status_v, "recovery_queue_size"),
+        provider_offline_impact_count: read_u64(&agent_status_v, "provider_offline_impact_count"),
+        disputes: disputes.ok().and_then(|v| v.as_array().cloned()).unwrap_or_default(),
         warnings,
         api_error,
     };

@@ -15,8 +15,46 @@ pub const MATCH_STATUS_REJECTED: &str = "rejected";
 pub const MATCH_STATUS_SETTLING: &str = "settling";
 pub const MATCH_STATUS_SETTLED: &str = "settled";
 pub const MATCH_STATUS_FAILED: &str = "failed";
+pub const MATCH_STATUS_RETRYABLE_FAILED: &str = "retryable_failed";
+pub const MATCH_STATUS_FAILED_FINAL: &str = "failed_final";
+pub const MATCH_STATUS_PAYMENT_UNKNOWN: &str = "payment_unknown";
 pub const MATCH_STATUS_CANCELLED: &str = "cancelled";
 pub const MATCH_STATUS_EXPIRED: &str = "expired";
+
+pub const SETTLEMENT_ATTEMPT_STATUS_STARTED: &str = "started";
+pub const SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS: &str = "in_progress";
+pub const SETTLEMENT_ATTEMPT_STATUS_COMMITTED: &str = "committed";
+pub const SETTLEMENT_ATTEMPT_STATUS_RETRYABLE_FAILED: &str = "retryable_failed";
+pub const SETTLEMENT_ATTEMPT_STATUS_PAYMENT_UNKNOWN: &str = "payment_unknown";
+pub const SETTLEMENT_ATTEMPT_STATUS_FAILED_FINAL: &str = "failed_final";
+
+pub const SETTLEMENT_ATTEMPT_STAGE_PROVIDER_MARK_SETTLING: &str = "provider_mark_settling";
+pub const SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE: &str = "create_invoice";
+pub const SETTLEMENT_ATTEMPT_STAGE_SETTLE_PAYMENT: &str = "settle_payment";
+pub const SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT: &str = "record_result";
+pub const SETTLEMENT_ATTEMPT_STAGE_PROVIDER_MARK_SETTLED: &str = "provider_mark_settled";
+
+pub const ACCEPT_ATTEMPT_STATUS_RECEIVED: &str = "received";
+pub const ACCEPT_ATTEMPT_STATUS_VALIDATING: &str = "validating";
+pub const ACCEPT_ATTEMPT_STATUS_LOCKING: &str = "locking";
+pub const ACCEPT_ATTEMPT_STATUS_COMMITTED: &str = "committed";
+pub const ACCEPT_ATTEMPT_STATUS_CONFLICT: &str = "conflict";
+pub const ACCEPT_ATTEMPT_STATUS_FAILED: &str = "failed";
+
+pub const DISPUTE_STATUS_OPEN: &str = "open";
+pub const DISPUTE_STATUS_INVESTIGATING: &str = "investigating";
+pub const DISPUTE_STATUS_AWAITING_MANUAL: &str = "awaiting_manual_resolution";
+pub const DISPUTE_STATUS_AUTO_RESOLVED: &str = "auto_resolved";
+pub const DISPUTE_STATUS_MANUALLY_RESOLVED: &str = "manually_resolved";
+pub const DISPUTE_STATUS_ESCALATED_FINAL: &str = "escalated_final";
+
+pub const DISPUTE_TYPE_PAYMENT_UNKNOWN: &str = "payment_unknown";
+pub const DISPUTE_TYPE_RECONCILE_CONFLICT: &str = "reconcile_conflict";
+pub const DISPUTE_TYPE_AMOUNT_MISMATCH: &str = "provider_agent_amount_mismatch";
+pub const DISPUTE_TYPE_RESULT_RECORD_CONFLICT: &str = "result_record_conflict";
+pub const DISPUTE_TYPE_RECOMMENDED_INVALIDATED: &str = "recommended_context_invalidated";
+pub const DISPUTE_TYPE_STATE_DIVERGENCE: &str = "state_divergence";
+
 
 pub const MARKET_ROUTE_PROVIDERS: &str = "/internal/market/providers";
 pub const MARKET_ROUTE_SELL_ORDERS: &str = "/internal/market/orders/sell";
@@ -107,9 +145,179 @@ pub struct MatchRecord {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AcceptAttempt {
+    pub attempt_id: String,
+    pub client_idempotency_key: Option<String>,
+    pub match_id: String,
+    pub buy_order_id: String,
+    pub sell_order_id: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub payload_hash: String,
+    pub provider_lock_done: bool,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DisputeRecord {
+    pub dispute_id: String,
+    pub dispute_type: String,
+    pub severity: String,
+    pub related_attempt_id: Option<String>,
+    pub related_match_id: Option<String>,
+    pub related_buy_order_id: Option<String>,
+    pub related_sell_order_id: Option<String>,
+    pub related_payment_id: Option<String>,
+    pub status: String,
+    pub opened_at: String,
+    pub updated_at: String,
+    pub origin: String,
+    pub summary: String,
+    pub local_snapshot_hash: Option<String>,
+    pub remote_snapshot_hash: Option<String>,
+    pub evidence_refs: Vec<String>,
+    pub resolution_action: Option<String>,
+    pub resolved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SettlementAttempt {
+    pub attempt_id: String,
+    pub match_id: String,
+    pub buy_order_id: String,
+    pub sell_order_id: String,
+    pub task_id: String,
+    pub job_id: String,
+    pub window_indexes: Vec<u64>,
+    pub invoice_id: Option<String>,
+    pub payment_id: Option<String>,
+    pub status: String,
+    pub stage: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub retry_count: u32,
+    pub idempotency_key: Option<String>,
+    pub payload_hash: Option<String>,
+    pub last_error_stage: Option<String>,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+    pub provider_mark_settling_done: bool,
+    pub provider_mark_settled_done: bool,
+    pub result_recorded: bool,
+}
+
+pub fn can_transition_match(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        (MATCH_STATUS_PROPOSED, MATCH_STATUS_ACCEPTED)
+            | (MATCH_STATUS_ACCEPTED, MATCH_STATUS_SETTLING)
+            | (MATCH_STATUS_SETTLING, MATCH_STATUS_SETTLED)
+            | (MATCH_STATUS_ACCEPTED, MATCH_STATUS_RETRYABLE_FAILED)
+            | (MATCH_STATUS_SETTLING, MATCH_STATUS_RETRYABLE_FAILED)
+            | (MATCH_STATUS_ACCEPTED, MATCH_STATUS_PAYMENT_UNKNOWN)
+            | (MATCH_STATUS_SETTLING, MATCH_STATUS_PAYMENT_UNKNOWN)
+            | (MATCH_STATUS_ACCEPTED, MATCH_STATUS_FAILED_FINAL)
+            | (MATCH_STATUS_SETTLING, MATCH_STATUS_FAILED_FINAL)
+            | (MATCH_STATUS_ACCEPTED, MATCH_STATUS_CANCELLED)
+            | (MATCH_STATUS_ACCEPTED, MATCH_STATUS_EXPIRED)
+            | (MATCH_STATUS_RETRYABLE_FAILED, MATCH_STATUS_PROPOSED)
+    )
+}
+
+pub fn can_transition_sell_order(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        (ORDER_STATUS_OPEN, ORDER_STATUS_LOCKED)
+            | (ORDER_STATUS_LOCKED, ORDER_STATUS_SETTLING)
+            | (ORDER_STATUS_SETTLING, ORDER_STATUS_SETTLED)
+            | (ORDER_STATUS_LOCKED, ORDER_STATUS_OPEN)
+            | (ORDER_STATUS_CANCELLED, ORDER_STATUS_OPEN)
+            | (ORDER_STATUS_EXPIRED, ORDER_STATUS_OPEN)
+    )
+}
+
+pub fn can_transition_settlement_attempt_status(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        (
+            SETTLEMENT_ATTEMPT_STATUS_STARTED,
+            SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS
+        ) | (
+            SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS,
+            SETTLEMENT_ATTEMPT_STATUS_COMMITTED
+        ) | (
+            SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS,
+            SETTLEMENT_ATTEMPT_STATUS_RETRYABLE_FAILED
+        ) | (
+            SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS,
+            SETTLEMENT_ATTEMPT_STATUS_PAYMENT_UNKNOWN
+        ) | (
+            SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS,
+            SETTLEMENT_ATTEMPT_STATUS_FAILED_FINAL
+        ) | (
+            SETTLEMENT_ATTEMPT_STATUS_RETRYABLE_FAILED,
+            SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS
+        ) | (
+            SETTLEMENT_ATTEMPT_STATUS_PAYMENT_UNKNOWN,
+            SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS
+        )
+    )
+}
+
+pub fn can_transition_settlement_attempt_stage(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        (
+            SETTLEMENT_ATTEMPT_STAGE_PROVIDER_MARK_SETTLING,
+            SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE
+        ) | (
+            SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE,
+            SETTLEMENT_ATTEMPT_STAGE_SETTLE_PAYMENT
+        ) | (
+            SETTLEMENT_ATTEMPT_STAGE_SETTLE_PAYMENT,
+            SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT
+        ) | (
+            SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT,
+            SETTLEMENT_ATTEMPT_STAGE_PROVIDER_MARK_SETTLED
+        )
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_guard_rejects_invalid_transitions() {
+        assert!(can_transition_match(
+            MATCH_STATUS_PROPOSED,
+            MATCH_STATUS_ACCEPTED
+        ));
+        assert!(!can_transition_match(
+            MATCH_STATUS_SETTLED,
+            MATCH_STATUS_ACCEPTED
+        ));
+        assert!(can_transition_settlement_attempt_status(
+            SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS,
+            SETTLEMENT_ATTEMPT_STATUS_RETRYABLE_FAILED
+        ));
+        assert!(!can_transition_settlement_attempt_status(
+            SETTLEMENT_ATTEMPT_STATUS_COMMITTED,
+            SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS
+        ));
+        assert!(can_transition_settlement_attempt_stage(
+            SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE,
+            SETTLEMENT_ATTEMPT_STAGE_SETTLE_PAYMENT
+        ));
+        assert!(!can_transition_settlement_attempt_stage(
+            SETTLEMENT_ATTEMPT_STAGE_PROVIDER_MARK_SETTLED,
+            SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE
+        ));
+    }
 
     #[test]
     fn order_schema_is_serializable() {

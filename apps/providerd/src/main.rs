@@ -6,7 +6,8 @@ use axum::{
     Json, Router,
 };
 use common::{
-    idempotency::{make_key, record_payment},
+    hash::{hash_hex, HashAlg},
+    idempotency::make_key,
     market::{
         MatchRecord, ProviderCapabilities, ProviderHardwareInfo, ProviderPricingInfo,
         ProviderRegistryEntry, SellOrder, MARKET_MODE_AUTO, MARKET_MODE_HYBRID, MARKET_MODE_MANUAL,
@@ -23,7 +24,7 @@ use serde_json::Value;
 mod market_support;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io::{BufRead, BufReader},
     process::{Command, Stdio},
     sync::{mpsc, Arc, Mutex},
@@ -199,7 +200,7 @@ struct JobRuntime {
     total_confirmed_paid: f64,
     reconciliation_audit: Vec<String>,
     reconciliation_last_error: Option<String>,
-    reconciled_pairs: HashSet<String>,
+    reconciled_pairs: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -242,7 +243,15 @@ struct AppState {
     recommended_confirmed_hash: Arc<Mutex<Option<String>>>,
     lifecycle_tick: Arc<Mutex<u64>>,
     auto_pause_until_tick: Arc<Mutex<u64>>,
+    auto_pause_reason: Arc<Mutex<Option<String>>>,
+    confirm_ledger: Arc<Mutex<HashMap<String, String>>>,
     persistence: Arc<MarketPersistence>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ReconciledPairRecord {
+    key: String,
+    payload_hash: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -252,6 +261,7 @@ struct ProviderSettlementRecord {
     payment_id: Option<String>,
     total_confirmed_paid: f64,
     paid_window_indexes: Vec<u64>,
+    reconciled_pairs: Vec<ReconciledPairRecord>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -261,6 +271,7 @@ struct ProviderPersistedState {
     match_records: Vec<MatchRecord>,
     settlement_records: Vec<ProviderSettlementRecord>,
     market_audit: Vec<String>,
+    confirm_ledger: Vec<ReconciledPairRecord>,
 }
 
 impl AppState {
@@ -302,7 +313,7 @@ impl AppState {
                 total_confirmed_paid: 0.0,
                 reconciliation_audit: vec![],
                 reconciliation_last_error: None,
-                reconciled_pairs: HashSet::new(),
+                reconciled_pairs: HashMap::new(),
             },
         );
         let provider_registry = vec![ProviderRegistryEntry {
@@ -382,6 +393,8 @@ impl AppState {
             recommended_confirmed_hash: Arc::new(Mutex::new(None)),
             lifecycle_tick: Arc::new(Mutex::new(0)),
             auto_pause_until_tick: Arc::new(Mutex::new(0)),
+            auto_pause_reason: Arc::new(Mutex::new(None)),
+            confirm_ledger: Arc::new(Mutex::new(HashMap::new())),
             persistence: Arc::new(MarketPersistence::new("providerd")),
         };
 
@@ -417,6 +430,14 @@ fn persist_provider_state(state: &AppState) {
             payment_id: j.last_confirmed_payment_id.clone(),
             total_confirmed_paid: j.total_confirmed_paid,
             paid_window_indexes: j.paid_window_indexes.clone(),
+            reconciled_pairs: j
+                .reconciled_pairs
+                .iter()
+                .map(|(key, payload_hash)| ReconciledPairRecord {
+                    key: key.clone(),
+                    payload_hash: payload_hash.clone(),
+                })
+                .collect(),
         })
         .collect();
     let snapshot = ProviderPersistedState {
@@ -437,6 +458,16 @@ fn persist_provider_state(state: &AppState) {
             .lock()
             .expect("market audit lock")
             .clone(),
+        confirm_ledger: state
+            .confirm_ledger
+            .lock()
+            .expect("confirm ledger lock")
+            .iter()
+            .map(|(key, payload_hash)| ReconciledPairRecord {
+                key: key.clone(),
+                payload_hash: payload_hash.clone(),
+            })
+            .collect(),
     };
     let _ = state.persistence.save_state(&snapshot);
 }
@@ -452,12 +483,22 @@ fn load_provider_state(state: &AppState) {
     *state.sell_orders.lock().expect("sell orders lock") = snapshot.sell_orders;
     *state.match_records.lock().expect("match records lock") = snapshot.match_records;
     *state.market_audit.lock().expect("market audit lock") = snapshot.market_audit;
+    *state.confirm_ledger.lock().expect("confirm ledger lock") = snapshot
+        .confirm_ledger
+        .into_iter()
+        .map(|v| (v.key, v.payload_hash))
+        .collect();
     for rec in snapshot.settlement_records {
         if let Some(job) = state.jobs.lock().expect("jobs lock").get_mut(&rec.job_id) {
             job.last_confirmed_invoice_id = rec.invoice_id;
             job.last_confirmed_payment_id = rec.payment_id;
             job.total_confirmed_paid = rec.total_confirmed_paid;
             job.paid_window_indexes = rec.paid_window_indexes;
+            job.reconciled_pairs = rec
+                .reconciled_pairs
+                .into_iter()
+                .map(|v| (v.key, v.payload_hash))
+                .collect();
         }
     }
 }
@@ -832,7 +873,7 @@ async fn root() -> impl IntoResponse {
 }
 
 async fn confirm_payment(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<ConfirmRequest>,
 ) -> impl IntoResponse {
@@ -854,18 +895,38 @@ async fn confirm_payment(
             .into_response();
     }
 
-    match record_payment(provided_key, &req.payment_id) {
-        Ok(()) => (StatusCode::OK, Json(ConfirmOk { status: "ok" })).into_response(),
-        Err(conflict) => (
+    let mut ledger = state.confirm_ledger.lock().expect("confirm ledger lock");
+    match ledger.get(provided_key) {
+        Some(existing) if existing == &req.payment_id => {
+            (StatusCode::OK, Json(ConfirmOk { status: "ok" })).into_response()
+        }
+        Some(existing) => (
             StatusCode::CONFLICT,
             Json(ConfirmError {
                 error: "idempotency_conflict",
-                key: Some(conflict.key),
-                existing_payment_id: Some(conflict.existing_payment_id),
+                key: Some(provided_key.to_string()),
+                existing_payment_id: Some(existing.clone()),
             }),
         )
             .into_response(),
+        None => {
+            ledger.insert(provided_key.to_string(), req.payment_id.clone());
+            drop(ledger);
+            persist_provider_state(&state);
+            (StatusCode::OK, Json(ConfirmOk { status: "ok" })).into_response()
+        }
     }
+}
+
+fn reconcile_payload_hash(req: &ReconcilePaymentRequest) -> String {
+    let canonical = serde_json::json!({
+        "job_id": req.job_id,
+        "invoice_id": req.invoice_id,
+        "payment_id": req.payment_id,
+        "window_indexes": req.window_indexes,
+        "amount_paid": req.amount_paid,
+    });
+    hash_hex(HashAlg::Sha256V1, canonical.to_string().as_bytes())
 }
 
 async fn reconcile_payment(
@@ -907,30 +968,50 @@ async fn reconcile_payment(
     }
 
     let reconcile_key = format!("{}::{}", req.invoice_id, req.payment_id);
-    if runtime.reconciled_pairs.contains(&reconcile_key) {
-        runtime.reconciliation_audit.push(format!(
-            "status=duplicate_ignored invoice_id={} payment_id={}",
-            req.invoice_id, req.payment_id
-        ));
+    let payload_hash = reconcile_payload_hash(&req);
+    if let Some(existing_hash) = runtime.reconciled_pairs.get(&reconcile_key) {
+        if existing_hash == &payload_hash {
+            runtime.reconciliation_audit.push(format!(
+                "status=duplicate_ignored invoice_id={} payment_id={}",
+                req.invoice_id, req.payment_id
+            ));
+            return (
+                StatusCode::OK,
+                Json(ReconcilePaymentResponse {
+                    status: "ok",
+                    last_confirmed_invoice_id: runtime
+                        .last_confirmed_invoice_id
+                        .clone()
+                        .unwrap_or_else(|| req.invoice_id.clone()),
+                    last_confirmed_payment_id: runtime
+                        .last_confirmed_payment_id
+                        .clone()
+                        .unwrap_or_else(|| req.payment_id.clone()),
+                    total_confirmed_paid: runtime.total_confirmed_paid,
+                }),
+            )
+                .into_response();
+        }
+
+        let detail = format!(
+            "reconcile idempotency conflict invoice_id={} payment_id={} existing_payload_hash={} incoming_payload_hash={}",
+            req.invoice_id, req.payment_id, existing_hash, payload_hash
+        );
+        runtime.reconciliation_last_error = Some(detail.clone());
+        runtime
+            .reconciliation_audit
+            .push(format!("status=idempotency_conflict {detail}"));
         return (
-            StatusCode::OK,
-            Json(ReconcilePaymentResponse {
-                status: "ok",
-                last_confirmed_invoice_id: runtime
-                    .last_confirmed_invoice_id
-                    .clone()
-                    .unwrap_or_else(|| req.invoice_id.clone()),
-                last_confirmed_payment_id: runtime
-                    .last_confirmed_payment_id
-                    .clone()
-                    .unwrap_or_else(|| req.payment_id.clone()),
-                total_confirmed_paid: runtime.total_confirmed_paid,
+            StatusCode::CONFLICT,
+            Json(ReconcileError {
+                error: "reconcile_idempotency_conflict",
+                detail,
             }),
         )
             .into_response();
     }
 
-    runtime.reconciled_pairs.insert(reconcile_key);
+    runtime.reconciled_pairs.insert(reconcile_key, payload_hash);
     runtime.last_confirmed_invoice_id = Some(req.invoice_id.clone());
     runtime.last_confirmed_payment_id = Some(req.payment_id.clone());
     runtime.total_confirmed_paid += req.amount_paid;
@@ -1159,6 +1240,8 @@ async fn get_sell_orders(State(state): State<AppState>) -> impl IntoResponse {
         .map(|mut o| {
             if let Some(price) = maybe_price {
                 o.unit_price_per_work_unit = price;
+            } else if state.pricing_mode.lock().expect("pricing mode lock").as_str() == PRICE_MODE_RECOMMENDED_BAND {
+                o.status = "blocked_pending_confirmation".to_string();
             }
             o
         })
@@ -1452,6 +1535,15 @@ async fn get_match_records(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, Json(records)).into_response()
 }
 
+fn can_transition_sell_order(current: &str, next: &str) -> bool {
+    matches!(
+        (current, next),
+        (ORDER_STATUS_OPEN, ORDER_STATUS_LOCKED)
+            | (ORDER_STATUS_LOCKED, ORDER_STATUS_SETTLING)
+            | (ORDER_STATUS_SETTLING, ORDER_STATUS_SETTLED)
+    )
+}
+
 async fn lock_sell_order(
     State(state): State<AppState>,
     Path(order_id): Path<String>,
@@ -1468,10 +1560,29 @@ async fn lock_sell_order(
             .into_response();
     };
 
-    if order.status == ORDER_STATUS_OPEN {
-        order.status = ORDER_STATUS_LOCKED.to_string();
+    if order.status == ORDER_STATUS_LOCKED {
+        return (
+            StatusCode::OK,
+            Json(OrderActionResponse {
+                status: "locked",
+                order_id: order.order_id.clone(),
+            }),
+        )
+            .into_response();
     }
 
+    if !can_transition_sell_order(&order.status, ORDER_STATUS_LOCKED) {
+        return (
+            StatusCode::CONFLICT,
+            Json(OrderActionResponse {
+                status: "invalid_lock_transition",
+                order_id: order.order_id.clone(),
+            }),
+        )
+            .into_response();
+    }
+
+    order.status = ORDER_STATUS_LOCKED.to_string();
     (
         StatusCode::OK,
         Json(OrderActionResponse {
@@ -1497,6 +1608,28 @@ async fn mark_sell_order_settling(
         )
             .into_response();
     };
+
+    if order.status == ORDER_STATUS_SETTLING {
+        return (
+            StatusCode::OK,
+            Json(OrderActionResponse {
+                status: "settling",
+                order_id: order.order_id.clone(),
+            }),
+        )
+            .into_response();
+    }
+
+    if !can_transition_sell_order(&order.status, ORDER_STATUS_SETTLING) {
+        return (
+            StatusCode::CONFLICT,
+            Json(OrderActionResponse {
+                status: "invalid_mark_settling_transition",
+                order_id: order.order_id.clone(),
+            }),
+        )
+            .into_response();
+    }
 
     order.status = ORDER_STATUS_SETTLING.to_string();
     (
@@ -1524,6 +1657,28 @@ async fn mark_sell_order_settled(
         )
             .into_response();
     };
+
+    if order.status == ORDER_STATUS_SETTLED {
+        return (
+            StatusCode::OK,
+            Json(OrderActionResponse {
+                status: "settled",
+                order_id: order.order_id.clone(),
+            }),
+        )
+            .into_response();
+    }
+
+    if !can_transition_sell_order(&order.status, ORDER_STATUS_SETTLED) {
+        return (
+            StatusCode::CONFLICT,
+            Json(OrderActionResponse {
+                status: "invalid_mark_settled_transition",
+                order_id: order.order_id.clone(),
+            }),
+        )
+            .into_response();
+    }
 
     order.status = ORDER_STATUS_SETTLED.to_string();
     (
@@ -1717,6 +1872,49 @@ mod tests {
             let reconcile_resp = app.clone().oneshot(reconcile_req).await.unwrap();
             assert_eq!(reconcile_resp.status(), StatusCode::OK);
         }
+
+        let status_req = Request::builder()
+            .uri("/v1/provider/jobs/job-demo")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let status_resp = app.oneshot(status_req).await.unwrap();
+        let status_body = to_bytes(status_resp.into_body(), usize::MAX).await.unwrap();
+        let status_json: Value = serde_json::from_slice(&status_body).unwrap();
+        assert_eq!(status_json["total_confirmed_paid"], 5.0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_payment_conflict_when_same_invoice_payment_has_different_payload() {
+        let app = app();
+
+        let first_req = Request::builder()
+            .uri("/internal/provider/reconcile")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"job_id":"job-demo","invoice_id":"inv-repeat","payment_id":"pay-repeat","window_indexes":[1,2],"amount_paid":5.0}"#,
+            ))
+            .unwrap();
+        let first_resp = app.clone().oneshot(first_req).await.unwrap();
+        assert_eq!(first_resp.status(), StatusCode::OK);
+
+        let conflict_req = Request::builder()
+            .uri("/internal/provider/reconcile")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"job_id":"job-demo","invoice_id":"inv-repeat","payment_id":"pay-repeat","window_indexes":[1,3],"amount_paid":7.0}"#,
+            ))
+            .unwrap();
+        let conflict_resp = app.clone().oneshot(conflict_req).await.unwrap();
+        assert_eq!(conflict_resp.status(), StatusCode::CONFLICT);
+
+        let body = to_bytes(conflict_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "reconcile_idempotency_conflict");
 
         let status_req = Request::builder()
             .uri("/v1/provider/jobs/job-demo")
@@ -2015,6 +2213,14 @@ mod tests {
     #[tokio::test]
     async fn sell_order_progresses_settling_then_settled() {
         let app = app();
+        let lock_req = Request::builder()
+            .uri("/internal/market/orders/sell/sell-order-demo-1/lock")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let lock_resp = app.clone().oneshot(lock_req).await.unwrap();
+        assert_eq!(lock_resp.status(), StatusCode::OK);
+
         let settling_req = Request::builder()
             .uri("/internal/market/orders/sell/sell-order-demo-1/mark_settling")
             .method("POST")
@@ -2041,6 +2247,51 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json[0]["status"], ORDER_STATUS_SETTLED);
     }
+    #[tokio::test]
+    async fn invalid_mark_transitions_are_rejected() {
+        let app = app();
+
+        let settled_without_settling = Request::builder()
+            .uri("/internal/market/orders/sell/sell-order-demo-1/mark_settled")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let settled_resp = app.clone().oneshot(settled_without_settling).await.unwrap();
+        assert_eq!(settled_resp.status(), StatusCode::CONFLICT);
+
+        let settling_req = Request::builder()
+            .uri("/internal/market/orders/sell/sell-order-demo-1/mark_settling")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let settling_resp = app.clone().oneshot(settling_req).await.unwrap();
+        assert_eq!(settling_resp.status(), StatusCode::CONFLICT);
+
+        let lock_req = Request::builder()
+            .uri("/internal/market/orders/sell/sell-order-demo-1/lock")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let lock_resp = app.clone().oneshot(lock_req).await.unwrap();
+        assert_eq!(lock_resp.status(), StatusCode::OK);
+
+        let settling_req = Request::builder()
+            .uri("/internal/market/orders/sell/sell-order-demo-1/mark_settling")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let settling_resp = app.clone().oneshot(settling_req).await.unwrap();
+        assert_eq!(settling_resp.status(), StatusCode::OK);
+
+        let lock_after_settling = Request::builder()
+            .uri("/internal/market/orders/sell/sell-order-demo-1/lock")
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let lock_after_settling_resp = app.oneshot(lock_after_settling).await.unwrap();
+        assert_eq!(lock_after_settling_resp.status(), StatusCode::CONFLICT);
+    }
+
     #[tokio::test]
     async fn lock_sell_order_is_idempotent_without_state_advance() {
         let app = app();

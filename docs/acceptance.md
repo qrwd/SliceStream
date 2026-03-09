@@ -319,3 +319,61 @@ Example summary (expected):
 - mode switch leaves no dirty lock residue (`locked_buy_orders`/`locked_sell_orders` cleared, bound match released with lifecycle audit).
 - manual override adds `hold_auto_until_tick=*` audit so auto path does not instantly overwrite human actions.
 - cancel/expire/retry transitions are visible through status + audit events and return resources for next matching cycle.
+
+
+## Phase-1 baseline hardening checks (idempotency + failure compensation)
+
+- `POST /internal/market/matches/accept` must accept **only** currently proposed matches.
+  - Non-proposed input returns `409` with `status=match_not_proposed`.
+- Repeating `accept` on the same accepted match is idempotent (`status=already_accepted`) and does not create additional side effects.
+- Provider `POST /internal/market/orders/sell/{order_id}/lock` is strict/idempotent:
+  - `open -> locked`
+  - `locked -> locked` (no-op)
+  - invalid source state -> `409`.
+- Settlement stage failures (`create_invoice`, `settle_payment`, `record_result`) must converge with compensation:
+  - locks released
+  - bound match cleared
+  - match status converges to `retryable_failed` or `payment_unknown` (no hanging settling residue)
+- `POST /internal/provider/reconcile` is idempotent by `(invoice_id,payment_id)`:
+  - same payload replay => no-op success
+  - conflicting payload replay => `409 reconcile_idempotency_conflict`
+
+
+
+- Accept now supports optional `x-client-idempotency-key` request-level replay semantics:
+  - same key + same payload => no-op replay success
+  - same key + different payload => conflict (`accept_idempotency_conflict`)
+- Settlement now has explicit attempt model (`SettlementAttempt`) with stage + status progression:
+  - stages: provider_mark_settling -> create_invoice -> settle_payment -> record_result -> provider_mark_settled
+  - statuses: started/in_progress/committed/retryable_failed/payment_unknown/failed_final
+- Internal recovery/query endpoints:
+  - `GET /internal/market/accept-attempts/{attempt_id}`
+  - `GET /internal/market/settlement-attempts/{attempt_id}`
+  - `POST /internal/market/settlement-attempts/{attempt_id}/retry`
+  - `POST /internal/market/settlement-attempts/{attempt_id}/mark-final`
+- Restart recovery keeps attempt snapshots (including `payment_unknown`) for post-restart inspection/retry.
+
+
+## Recovery orchestrator + mode/recommended lifecycle (P1/P2)
+
+- Agent runs `run_recovery_tick` on polling cycle and startup ticks, scanning settlement attempts with status: `started`, `in_progress`, `retryable_failed`.
+- `payment_unknown` is intentionally conservative: no automatic commit/finalize; requires explicit retry/mark-final decision.
+- Recovery applies bounded retries with backoff and transitions to `failed_final` when retry budget is exhausted.
+- Live task status exposes mode/recommended/recovery counters (auto pause reason/until, confirmation validity, active/retryable/payment_unknown attempt counts, lock counts, queue size).
+- Recommended-band remains a hard gate: when confirmation is invalid, executable pricing is blocked until reconfirm.
+
+
+## Final closure checks (recovery/reaper/mode/UI ops)
+
+- Recovery orchestrator is stage-runner based and resumes attempts without restarting full flow.
+- Reaper is callable independently (`/internal/ops/reaper/run`) and performs lock/task/orphan cleanup.
+- Recovery can be forced via `/internal/ops/recovery/run` and respects conservative `payment_unknown` policy.
+- Mode matrix must match docs/mode-matrix.md and dashboard mode panel wording.
+- Dashboard ops actions must expose: retry attempt, mark-final, run recovery, run reaper, reconfirm recommended.
+
+
+- Dispute protocol checks:
+  - payment_unknown and recommended invalidation must open dispute records.
+  - disputes are queryable from `/internal/market/disputes` and resolvable from `/internal/market/disputes/{dispute_id}/resolve`.
+- Dashboard and Tauri parity checks:
+  - both surfaces show mode/recommended/recovery/dispute summaries and expose recovery/reaper/reconfirm actions.

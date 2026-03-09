@@ -10,7 +10,7 @@
     .shell { height: 100%; display: grid; grid-template-rows: auto 1fr; }
     .top {
       display: grid;
-      grid-template-columns: repeat(3, minmax(180px, 1fr));
+      grid-template-columns: repeat(6, minmax(160px, 1fr));
       gap: 10px;
       padding: 10px;
       border-bottom: 1px solid #22365f;
@@ -57,6 +57,9 @@
       <div class="pill"><div class="k">Bridge</div><div id="bridge" class="v err">Disconnected</div><div class="sub">desktop terminal host</div></div>
       <div class="pill"><div class="k">Runtime</div><div id="mode" class="v">-</div><div id="network" class="sub">-</div></div>
       <div class="pill"><div class="k">Terminal</div><div class="v">SliceStream Trading Terminal</div><div id="last" class="sub">-</div></div>
+      <div class="pill"><div class="k">Recommended</div><div id="rec" class="v">-</div><div id="rech" class="sub mono">-</div></div>
+      <div class="pill"><div class="k">Recovery</div><div id="recovery" class="v">-</div><div id="locks" class="sub">-</div></div>
+      <div class="pill"><div class="k">Disputes</div><div id="disputes" class="v">-</div><div id="disputeHint" class="sub">-</div></div>
     </section>
     <section class="frame-wrap">
       <iframe id="terminalFrame" title="SliceStream Terminal"></iframe>
@@ -66,7 +69,7 @@
           <p class="line">Desktop terminal is waiting for dashboard bridge.</p>
           <p class="line mono">Please start: <b>cargo run -p dashboard</b></p>
           <p class="line mono">Then keep providerd and agentd running.</p>
-          <button id="retryBtn">Retry Connection</button>
+          <button id="retryBtn">Retry Connection</button><button id="runRecoveryBtn">Resume Recovery</button><button id="runReaperBtn">Run Reaper</button><button id="confirmRecBtn">Reconfirm Recommended</button>
         </div>
       </div>
     </section>
@@ -80,12 +83,25 @@
     const mode = document.getElementById('mode');
     const network = document.getElementById('network');
     const last = document.getElementById('last');
+    const rec = document.getElementById('rec');
+    const rech = document.getElementById('rech');
+    const recovery = document.getElementById('recovery');
+    const locks = document.getElementById('locks');
+    const disputes = document.getElementById('disputes');
+    const disputeHint = document.getElementById('disputeHint');
 
     function setConnected(data) {
       bridge.textContent = 'Connected';
       bridge.className = 'v ok';
-      mode.textContent = `settlement=${data?.settlement_mode || '-'}`;
+      mode.textContent = `mode=${data?.current_market_mode || data?.agent_market_mode || '-'} settlement=${data?.settlement_mode || '-'}`;
       network.textContent = `${data?.network || '-'} / ${data?.prefix || '-'}`;
+      rec.textContent = String(data?.recommended_confirmation_valid);
+      rech.textContent = String(data?.recommended_context_hash || '-').slice(0,24);
+      recovery.textContent = `q=${data?.recovery_queue_size ?? '-'} stuck=${data?.stuck_attempts_count ?? '-'}`;
+      locks.textContent = `locks ${data?.locked_buy_orders_count ?? 0}/${data?.locked_sell_orders_count ?? 0}`;
+      const ds=(data?.disputes||[]);
+      disputes.textContent = `${ds.length}`;
+      disputeHint.textContent = ds.length ? `${ds[0].dispute_type||'-'}:${ds[0].status||'-'}` : 'none';
       last.textContent = new Date().toLocaleTimeString();
       overlay.style.display = 'none';
       if (frame.src !== `${BRIDGE}/`) {
@@ -111,7 +127,11 @@
       }
     }
 
+    async function act(path) { try { await fetch(`${BRIDGE}${path}`, { method: 'POST' }); } catch (_e) {} await probe(); }
     document.getElementById('retryBtn').addEventListener('click', probe);
+    document.getElementById('runRecoveryBtn').addEventListener('click', () => act('/api/action/recovery_run'));
+    document.getElementById('runReaperBtn').addEventListener('click', () => act('/api/action/reaper_run'));
+    document.getElementById('confirmRecBtn').addEventListener('click', () => act('/api/action/confirm_recommended'));
     probe();
     setInterval(probe, 2500);
   </script>

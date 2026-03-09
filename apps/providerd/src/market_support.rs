@@ -23,6 +23,7 @@ pub(crate) fn set_auto_pause_for_manual_override(state: &AppState, reason: &str,
     let now = *state.lifecycle_tick.lock().expect("lifecycle tick lock");
     let mut until = state.auto_pause_until_tick.lock().expect("auto pause lock");
     *until = (*until).max(now.saturating_add(hold_ticks));
+    *state.auto_pause_reason.lock().expect("auto pause reason lock") = Some(reason.to_string());
     state
         .market_audit
         .lock()

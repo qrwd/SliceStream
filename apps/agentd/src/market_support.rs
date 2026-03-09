@@ -1,3 +1,4 @@
+use axum::http::HeaderMap;
 use super::*;
 
 pub(crate) fn set_auto_pause_for_manual_override(state: &AppState, reason: &str, hold_ticks: u64) {
@@ -8,6 +9,7 @@ pub(crate) fn set_auto_pause_for_manual_override(state: &AppState, reason: &str,
     let now = *state.lifecycle_tick.lock().expect("lifecycle tick lock");
     let mut until = state.auto_pause_until_tick.lock().expect("auto pause lock");
     *until = (*until).max(now.saturating_add(hold_ticks));
+    *state.auto_pause_reason.lock().expect("auto pause reason lock") = Some(reason.to_string());
     state
         .market_audit
         .lock()
@@ -95,11 +97,34 @@ pub(crate) fn converge_mode_state(state: &AppState, old_mode: &str, new_mode: &s
         release_binding_and_locks(state, &binding, MATCH_STATUS_EXPIRED, "mode_switch_cleanup");
     }
 
-    state
-        .manual_buy_orders
-        .lock()
-        .expect("manual buy orders lock")
-        .clear();
+    {
+        let mut accept_attempts = state.accept_attempts.lock().expect("accept attempts lock");
+        for attempt in accept_attempts.values_mut() {
+            if attempt.status != ACCEPT_ATTEMPT_STATUS_COMMITTED
+                && attempt.status != ACCEPT_ATTEMPT_STATUS_CONFLICT
+                && attempt.status != ACCEPT_ATTEMPT_STATUS_FAILED
+            {
+                attempt.status = ACCEPT_ATTEMPT_STATUS_FAILED.to_string();
+                attempt.last_error_code = Some("mode_switch_cancelled".to_string());
+                attempt.last_error_message = Some("mode switch requires re-accept".to_string());
+                attempt.updated_at = now_rfc3339_like();
+            }
+        }
+    }
+    {
+        let mut settlement_attempts = state.settlement_attempts.lock().expect("settlement attempts lock");
+        for attempt in settlement_attempts.values_mut() {
+            if attempt.status == SETTLEMENT_ATTEMPT_STATUS_STARTED
+                || attempt.status == SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS
+            {
+                attempt.status = SETTLEMENT_ATTEMPT_STATUS_RETRYABLE_FAILED.to_string();
+                attempt.last_error_code = Some("mode_switch_requires_recovery".to_string());
+                attempt.last_error_stage = Some(attempt.stage.clone());
+                attempt.last_error_message = Some("mode switched while attempt in-flight".to_string());
+                attempt.updated_at = now_rfc3339_like();
+            }
+        }
+    }
     invalidate_recommended_confirmation(state, "mode_switch_cleanup");
     set_auto_pause_for_manual_override(state, "mode_switch", 2);
     state
@@ -313,6 +338,7 @@ pub(crate) async fn start_auto_bidding(State(state): State<AppState>) -> impl In
         );
         let _ = accept_match(
             State(state.clone()),
+            HeaderMap::new(),
             Json(MatchActionRequest {
                 buy_order_id: first.buy_order_id.clone(),
                 sell_order_id: first.sell_order_id.clone(),

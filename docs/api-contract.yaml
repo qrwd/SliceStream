@@ -70,7 +70,82 @@ paths:
                 items:
                   $ref: '#/components/schemas/SellOrder'
 
+  /internal/market/orders/sell/{order_id}/lock:
+    post:
+      tags: [internal-market]
+      summary: Lock sell order (idempotent)
+      description: |
+        State machine rule: open -> locked. Repeated calls in locked stay locked (no-op).
+        Any other source state returns conflict and does not mutate state.
+      parameters:
+        - in: path
+          name: order_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Lock acquired or already locked (idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+        '409':
+          description: Invalid state transition for lock
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
 
+  /internal/market/orders/sell/{order_id}/mark_settling:
+    post:
+      tags: [internal-market]
+      summary: Mark sell order settling with strict transition checks
+      description: 'Allowed transition: locked -> settling. settling -> settling is idempotent no-op.'
+      parameters:
+        - in: path
+          name: order_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: State set to settling or already settling
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+        '409':
+          description: Invalid state transition
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+
+  /internal/market/orders/sell/{order_id}/mark_settled:
+    post:
+      tags: [internal-market]
+      summary: Mark sell order settled with strict transition checks
+      description: 'Allowed transition: settling -> settled. settled -> settled is idempotent no-op.'
+      parameters:
+        - in: path
+          name: order_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: State set to settled or already settled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
+        '409':
+          description: Invalid state transition
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleStatus'
 
   /internal/market/orders/sell/{order_id}/cancel:
     post:
@@ -175,7 +250,13 @@ paths:
   /internal/market/matches/accept:
     post:
       tags: [internal-market]
-      summary: Accept proposed match
+      summary: Accept proposed match only
+      description: |
+        Accept succeeds only when the target match currently exists in computed proposed matches.
+        Repeated accept of an already accepted/settling/settled match is idempotent and returns status=already_accepted without side effects.
+        If provider lock fails, agent rolls back local tentative changes and returns provider_lock_failed.
+        Optional header `x-client-idempotency-key` enables request-level replay semantics:
+        same key + same payload => replay/no-op success; same key + different payload => accept_idempotency_conflict.
       requestBody:
         required: true
         content:
@@ -184,7 +265,19 @@ paths:
               $ref: '#/components/schemas/MatchActionRequest'
       responses:
         '200':
-          description: Match action response
+          description: Match accepted or already_accepted (idempotent replay)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatchActionResponse'
+        '409':
+          description: Match is not currently proposed (match_not_proposed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatchActionResponse'
+        '503':
+          description: Provider lock failed and local accept was compensated (provider_lock_failed)
           content:
             application/json:
               schema:
@@ -343,8 +436,215 @@ paths:
               schema:
                 $ref: '#/components/schemas/SimpleStatus'
 
+
+  /internal/market/accept-attempts/{attempt_id}:
+    get:
+      tags: [internal-market]
+      summary: Query accept attempt by attempt_id
+      parameters:
+        - in: path
+          name: attempt_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Accept attempt snapshot
+        '404':
+          description: Attempt not found
+
+  /internal/market/settlement-attempts/{attempt_id}:
+    get:
+      tags: [internal-market]
+      summary: Query settlement attempt by attempt_id
+      parameters:
+        - in: path
+          name: attempt_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Settlement attempt snapshot
+        '404':
+          description: Attempt not found
+
+  /internal/market/settlement-attempts/{attempt_id}/retry:
+    post:
+      tags: [internal-market]
+      summary: Retry settlement attempt in retryable_failed/payment_unknown
+      description: Recovery orchestrator automatically scans started/in_progress/retryable_failed attempts with bounded backoff; payment_unknown remains conservative/manual by default.
+      parameters:
+        - in: path
+          name: attempt_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Retry queued
+        '409':
+          description: Invalid attempt state for retry
+
+  /internal/market/settlement-attempts/{attempt_id}/mark-final:
+    post:
+      tags: [internal-market]
+      summary: Mark settlement attempt as failed_final after manual confirmation
+      parameters:
+        - in: path
+          name: attempt_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Marked failed_final
+        '409':
+          description: Invalid attempt state for mark-final
+
+  /confirm:
+    post:
+      tags: [internal-settlement]
+      summary: Confirm payment with idempotency key
+      description: |
+        Idempotency key must equal make_key(job_id, window_end).
+        Same key + same payment_id is idempotent success; same key + different payment_id is conflict.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmRequest'
+      responses:
+        '200':
+          description: Payment confirmation accepted
+        '400':
+          description: Invalid idempotency key
+        '409':
+          description: Idempotency conflict for the key
+
+  /internal/provider/reconcile:
+    post:
+      tags: [internal-settlement]
+      summary: Reconcile provider payment with idempotent replay protection
+      description: |
+        Idempotency key is (invoice_id, payment_id).
+        - Same payload replay is no-op success.
+        - Different payload under same key is conflict and does not mutate totals.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReconcilePaymentRequest'
+      responses:
+        '200':
+          description: Reconciled or duplicate replay ignored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReconcilePaymentResponse'
+        '409':
+          description: Idempotency conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorMessage'
+
+
+
+  /internal/market/disputes:
+    get:
+      tags: [internal-market]
+      summary: List dispute records
+      responses:
+        '200':
+          description: Dispute list
+
+  /internal/market/disputes/{dispute_id}/resolve:
+    post:
+      tags: [internal-market]
+      summary: Mark dispute as manually resolved
+      parameters:
+        - in: path
+          name: dispute_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Dispute resolved
+        '404':
+          description: Dispute not found
+
+  /internal/ops/recovery/run:
+    post:
+      tags: [internal-market]
+      summary: Force one recovery orchestrator tick
+      responses:
+        '200':
+          description: Recovery run completed
+
+  /internal/ops/reaper/run:
+    post:
+      tags: [internal-market]
+      summary: Force one reaper cleanup tick
+      responses:
+        '200':
+          description: Reaper run completed
+
 components:
   schemas:
+    ConfirmRequest:
+      type: object
+      required: [job_id, window_end, payment_id]
+      properties:
+        job_id:
+          type: string
+        window_end:
+          type: integer
+          format: uint64
+        payment_id:
+          type: string
+
+    ReconcilePaymentRequest:
+      type: object
+      required: [job_id, invoice_id, payment_id, window_indexes, amount_paid]
+      properties:
+        job_id:
+          type: string
+        invoice_id:
+          type: string
+        payment_id:
+          type: string
+        window_indexes:
+          type: array
+          items:
+            type: integer
+            format: uint64
+        amount_paid:
+          type: number
+
+    ReconcilePaymentResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        last_confirmed_invoice_id:
+          type: string
+        last_confirmed_payment_id:
+          type: string
+        total_confirmed_paid:
+          type: number
+
+    ErrorMessage:
+      type: object
+      properties:
+        error:
+          type: string
+        detail:
+          type: string
+
     ProviderJobStatus:
       type: object
       required:
