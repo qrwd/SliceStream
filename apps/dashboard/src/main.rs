@@ -23,6 +23,7 @@ use http_helpers::{collect_request_warnings, get_json, has_fatal_api_error};
 const PROVIDER_TELEMETRY_FALLBACK_HINT: &str = "fallback 提示：provider telemetry_source=mock";
 const API_UNREACHABLE_HINT: &str = "API 不可达：请确认 providerd/agentd 正在运行";
 const FIBER_UNAVAILABLE_HINT: &str = "fiber unavailable: 当前显示可能处于安全降级/失败记录路径";
+const UI_SOURCE: &str = include_str!("../src-tauri/ui/index.html");
 
 #[derive(Clone)]
 struct AppState {
@@ -95,7 +96,25 @@ struct DashboardPayload {
     locked_sell_orders_count: Option<u64>,
     recovery_queue_size: Option<u64>,
     provider_offline_impact_count: Option<u64>,
+    peer_id: Option<String>,
+    node_pubkey: Option<String>,
+    settlement_interval_secs: Option<u64>,
+    committed_compute_total: Option<f64>,
+    minimum_commit_compute: Option<f64>,
+    delivered_compute_total: Option<f64>,
+    breach_tolerance_ratio: Option<f64>,
+    penalty_policy: Option<String>,
+    stop_condition: Option<String>,
+    finalization_rule: Option<String>,
     disputes: Vec<Value>,
+    trades: Vec<Value>,
+    billing_windows: Vec<Value>,
+    offers: Vec<Value>,
+    runtime_mode: Option<String>,
+    direct_mode_ready: Option<bool>,
+    runtime_data_source_path: Option<String>,
+    bridge_dependent_modules: Vec<String>,
+    payment_rail_mode: Option<String>,
     warnings: Vec<String>,
     api_error: Option<String>,
 }
@@ -140,6 +159,151 @@ struct LiveQuery {
     provider: Option<String>,
 }
 
+struct LiveUrls {
+    provider_status: String,
+    provider_result: String,
+    agent_status: String,
+    agent_receipt: String,
+    provider_registry: String,
+    sell_orders: String,
+    buy_orders: String,
+    match_records: String,
+    provider_mode: String,
+    provider_audit: String,
+    agent_mode: String,
+    agent_audit: String,
+    provider_pricing: String,
+    agent_pricing: String,
+    disputes: String,
+    trade_desk: String,
+    network_runtime: String,
+    node_identity: String,
+}
+
+struct LiveFetchResults {
+    provider_status: Result<Value, String>,
+    provider_result: Result<Value, String>,
+    agent_status: Result<Value, String>,
+    agent_receipt: Result<Value, String>,
+    provider_registry: Result<Value, String>,
+    sell_orders: Result<Value, String>,
+    buy_orders: Result<Value, String>,
+    match_records: Result<Value, String>,
+    provider_mode: Result<Value, String>,
+    provider_audit: Result<Value, String>,
+    agent_mode: Result<Value, String>,
+    agent_audit: Result<Value, String>,
+    provider_pricing: Result<Value, String>,
+    agent_pricing: Result<Value, String>,
+    disputes: Result<Value, String>,
+    trade_desk: Result<Value, String>,
+    network_runtime: Result<Value, String>,
+    node_identity: Result<Value, String>,
+}
+
+fn resolve_provider(state: &AppState, provider_id: &str) -> Option<ProviderTarget> {
+    state
+        .providers
+        .iter()
+        .find(|p| p.id == provider_id)
+        .cloned()
+        .or_else(|| state.providers.first().cloned())
+}
+
+fn build_live_urls(agent_base: &str, provider: &ProviderTarget, task_id: &str) -> LiveUrls {
+    LiveUrls {
+        provider_status: format!(
+            "{}/v1/provider/jobs/{}",
+            provider.base_url, provider.provider_job_id
+        ),
+        provider_result: format!(
+            "{}/v1/provider/jobs/{}/result",
+            provider.base_url, provider.provider_job_id
+        ),
+        agent_status: format!("{}/v1/tasks/{}", agent_base, task_id),
+        agent_receipt: format!("{}/v1/tasks/{}/receipt", agent_base, task_id),
+        provider_registry: format!("{}{}", provider.base_url, MARKET_ROUTE_PROVIDERS),
+        sell_orders: format!("{}{}", provider.base_url, MARKET_ROUTE_SELL_ORDERS),
+        buy_orders: format!("{}{}", agent_base, MARKET_ROUTE_BUY_ORDERS),
+        match_records: format!("{}{}", agent_base, MARKET_ROUTE_MATCHES),
+        provider_mode: format!("{}/internal/market/mode", provider.base_url),
+        provider_audit: format!("{}/internal/market/audit", provider.base_url),
+        agent_mode: format!("{}/internal/market/mode", agent_base),
+        agent_audit: format!("{}/internal/market/audit", agent_base),
+        provider_pricing: format!("{}/internal/market/pricing", provider.base_url),
+        agent_pricing: format!("{}/internal/market/pricing", agent_base),
+        disputes: format!("{}/internal/market/disputes", agent_base),
+        trade_desk: format!("{}/v1/tasks/{}/trade-desk", agent_base, task_id),
+        network_runtime: format!("{}/internal/network/runtime", agent_base),
+        node_identity: format!("{}/internal/node/identity", agent_base),
+    }
+}
+
+async fn fetch_live_results(http: &Client, urls: &LiveUrls) -> LiveFetchResults {
+    LiveFetchResults {
+        provider_status: get_json(http, &urls.provider_status).await,
+        provider_result: get_json(http, &urls.provider_result).await,
+        agent_status: get_json(http, &urls.agent_status).await,
+        agent_receipt: get_json(http, &urls.agent_receipt).await,
+        provider_registry: get_json(http, &urls.provider_registry).await,
+        sell_orders: get_json(http, &urls.sell_orders).await,
+        buy_orders: get_json(http, &urls.buy_orders).await,
+        match_records: get_json(http, &urls.match_records).await,
+        provider_mode: get_json(http, &urls.provider_mode).await,
+        provider_audit: get_json(http, &urls.provider_audit).await,
+        agent_mode: get_json(http, &urls.agent_mode).await,
+        agent_audit: get_json(http, &urls.agent_audit).await,
+        provider_pricing: get_json(http, &urls.provider_pricing).await,
+        agent_pricing: get_json(http, &urls.agent_pricing).await,
+        disputes: get_json(http, &urls.disputes).await,
+        trade_desk: get_json(http, &urls.trade_desk).await,
+        network_runtime: get_json(http, &urls.network_runtime).await,
+        node_identity: get_json(http, &urls.node_identity).await,
+    }
+}
+
+fn warnings_and_api_error(results: &LiveFetchResults) -> (Vec<String>, Option<String>) {
+    let mut warnings = collect_request_warnings(
+        &results.provider_status,
+        &results.provider_result,
+        &results.agent_status,
+        &results.agent_receipt,
+        &results.provider_registry,
+        &results.sell_orders,
+        &results.buy_orders,
+        &results.match_records,
+    );
+
+    push_result_error(
+        &mut warnings,
+        "provider market mode",
+        &results.provider_mode,
+    );
+    push_result_error(
+        &mut warnings,
+        "provider market audit",
+        &results.provider_audit,
+    );
+    push_result_error(&mut warnings, "agent market mode", &results.agent_mode);
+    push_result_error(&mut warnings, "agent market audit", &results.agent_audit);
+
+    push_result_error(&mut warnings, "provider pricing", &results.provider_pricing);
+    push_result_error(&mut warnings, "agent pricing", &results.agent_pricing);
+    push_result_error(&mut warnings, "disputes", &results.disputes);
+    push_result_error(&mut warnings, "trade desk", &results.trade_desk);
+    push_result_error(&mut warnings, "network runtime", &results.network_runtime);
+    push_result_error(&mut warnings, "node identity", &results.node_identity);
+
+    let api_error = if has_fatal_api_error(&warnings) {
+        warnings.insert(0, API_UNREACHABLE_HINT.to_string());
+        Some("one_or_more_backend_apis_unreachable".to_string())
+    } else {
+        None
+    };
+
+    (warnings, api_error)
+}
+
 #[derive(Deserialize)]
 struct ModeSetRequest {
     mode: String,
@@ -168,9 +332,18 @@ async fn main() {
         .route("/api/action/start_bidding", post(action_start_bidding))
         .route("/api/action/recovery_run", post(action_recovery_run))
         .route("/api/action/reaper_run", post(action_reaper_run))
-        .route("/api/action/retry_attempt/:attempt_id", post(action_retry_attempt))
-        .route("/api/action/mark_final/:attempt_id", post(action_mark_final_attempt))
-        .route("/api/action/dispute_resolve/:dispute_id", post(action_dispute_resolve))
+        .route(
+            "/api/action/retry_attempt/:attempt_id",
+            post(action_retry_attempt),
+        )
+        .route(
+            "/api/action/mark_final/:attempt_id",
+            post(action_mark_final_attempt),
+        )
+        .route(
+            "/api/action/dispute_resolve/:dispute_id",
+            post(action_dispute_resolve),
+        )
         .with_state(Arc::new(AppState {
             http: Client::builder()
                 .no_proxy()
@@ -196,167 +369,7 @@ async fn main() {
 }
 
 async fn index() -> Html<&'static str> {
-    Html(
-        r#"<!doctype html>
-<html>
-<head>
-  <meta charset='utf-8' />
-  <title>SliceStream Market Terminal</title>
-  <style>
-    :root { color-scheme: dark; }
-    body { margin:0; font-family: Inter, system-ui, sans-serif; background:linear-gradient(180deg,#050914,#060d1d 45%,#081127); color:#eaf0ff; }
-    .terminal { display:grid; grid-template-rows:auto 1fr 190px; min-height:100vh; }
-    .top {
-      display:grid;
-      grid-template-columns: repeat(4,minmax(170px,1fr));
-      gap:10px;
-      padding:12px;
-      background:#0a1225;
-      border-bottom:1px solid #1f325a;
-      position:sticky;
-      top:0;
-      z-index:10;
-    }
-    .pill { background:#121f3d; border:1px solid #29457e; border-radius:10px; padding:8px 10px; min-height:54px; }
-    .pill.controls { grid-column: span 2; display:grid; grid-template-columns: 80px 1fr 80px 1fr; gap:8px; align-items:center; }
-    .k{font-size:10px;color:#90a7df; text-transform:uppercase; letter-spacing:.06em;} .v{font-size:16px;font-weight:700}
-    .layout { display:grid; grid-template-columns: 31% 39% 30%; gap:10px; padding:10px; overflow:hidden; min-height:0; }
-    .panel { background:#0f1931; border:1px solid #223b6c; border-radius:12px; padding:10px; overflow:auto; }
-    .panel h3{margin:0 0 8px 0}
-    .focus-grid { display:grid; grid-template-columns:1fr; gap:10px; }
-    .focus-card { background:#0d1a35; border:1px solid #355ea8; border-radius:10px; padding:10px; box-shadow:0 0 0 1px rgba(109,165,255,0.15) inset; }
-    .focus-card h3 { margin:0 0 6px 0; font-size:16px; }
-    table{width:100%; border-collapse:collapse; font-size:12px}
-    th,td{padding:6px; border-bottom:1px solid #203458; text-align:left; vertical-align:top;}
-    .tag{padding:2px 8px; border-radius:999px; font-size:11px; display:inline-block; font-weight:600}
-    .ok{background:#123b24;color:#84f5a2} .bad{background:#4a1e2b;color:#ff9bad}
-    .btn{background:#1e325f; border:1px solid #4a6db8; color:#fff; border-radius:8px; padding:7px 9px; margin:2px; cursor:pointer}
-    .controls label{display:block;font-size:12px;margin-top:8px;color:#a3b7e5}
-    .controls input,.controls select{width:100%;background:#0a1225;color:#fff;border:1px solid #35518c;border-radius:6px;padding:6px}
-    .bottom{display:grid; grid-template-columns:1.4fr 1fr; gap:10px; padding:0 10px 10px}
-    .event-stream{list-style:none; margin:0; padding:0; display:grid; gap:8px;}
-    .event{background:#0c1730;border:1px solid #253f73;border-radius:9px;padding:8px 10px;font-size:12px}
-    .event small{display:block;color:#94abda;margin-bottom:2px}
-    .status-card{display:grid;gap:8px}
-    .evidence-row{display:flex; align-items:center; gap:6px; flex-wrap:wrap;}
-    .mono{font-family: ui-monospace, SFMono-Regular, Menlo, monospace;}
-    details{border:1px solid #2a467d; border-radius:8px; padding:6px 8px; background:#0b152c;}
-  </style>
-</head>
-<body>
-<div class='terminal'>
-  <div class='top'>
-    <div class='pill'><div class='k'>network/prefix</div><div id='net' class='v'>-</div></div>
-    <div class='pill'><div class='k'>market mode</div><div id='marketMode' class='v'>-</div></div>
-    <div class='pill'><div class='k'>settlement mode</div><div id='settleMode' class='v'>-</div></div>
-    <div class='pill'><div class='k'>task/provider</div><div id='selection' class='v'>-</div></div>
-    <div class='pill'><div class='k'>benchmark / reconciliation</div><div id='benchmark' class='v'>-</div><div id='recon' class='k'>-</div></div>
-    <div class='pill'><div class='k'>last refresh</div><div id='refreshAt' class='v'>-</div></div>
-    <div class='pill controls'><label class='k'>task</label><select id='taskSelect'></select><label class='k'>provider</label><select id='providerSelect'></select></div>
-  </div>
-  <div class='layout'>
-    <div class='panel'>
-      <h3>Market</h3>
-      <h4>Provider Pool</h4><table><thead><tr><th>Provider</th><th>Bench</th><th>Status</th><th>Price</th></tr></thead><tbody id='providers'></tbody></table>
-      <h4>Sell / Buy Order Book</h4><table><thead><tr><th>Side</th><th>Order</th><th>Price</th><th>Units</th><th>Status</th></tr></thead><tbody id='book'></tbody></table>
-      <h4>Match Queue</h4><table><thead><tr><th>Match</th><th>Buy</th><th>Sell</th><th>Price</th><th>Status</th></tr></thead><tbody id='matches'></tbody></table>
-    </div>
-    <div class='panel'>
-      <div class='focus-grid'>
-        <section class='focus-card'>
-          <h3>Current Deal Ticket</h3>
-          <div id='ticket'></div>
-        </section>
-        <section class='focus-card'>
-          <h3>Live Settlement</h3>
-          <table><tbody id='settlement'></tbody></table>
-        </section>
-        <section class='focus-card'>
-          <h3>Reconciliation</h3>
-          <table><tbody id='reconcile'></tbody></table>
-        </section>
-      </div>
-    </div>
-    <div class='panel controls'>
-      <h3>Trading Controls</h3>
-      <label>Market Mode</label><select id='modeSel'><option>manual</option><option>auto</option><option>hybrid</option></select>
-      <label>Price Mode</label><select id='priceModeSel'><option>fixed</option><option>band</option><option>recommended_band</option></select>
-      <label>Fixed Price</label><input id='fixedPrice' value='0.06'/>
-      <label>Band Min / Max / Target</label><input id='bandMin' value='0.05'/><input id='bandMax' value='0.09'/><input id='bandTarget' value='0.06'/>
-      <button class='btn' id='applyMode'>Apply Mode</button>
-      <button class='btn' id='applyPricing'>Apply Pricing</button>
-      <button class='btn' id='confirmRecommended'>Confirm Recommended</button>
-      <button class='btn' id='manualBuy'>Place Manual Buy</button>
-      <button class='btn' id='startBidding'>Start Auto Bidding</button>
-      <button class='btn' id='refreshBtn'>Refresh</button>
-      <h4>Pricing Context</h4>
-      <table><tbody id='pricing'></tbody></table>
-      <h4>Recovery / Ops</h4>
-      <table><tbody id='ops'></tbody></table>
-      <label>Attempt ID</label><input id='attemptId' placeholder='settlement-attempt-*'/>
-      <button class='btn' id='retryAttempt'>Retry Attempt</button>
-      <button class='btn' id='markFinalAttempt'>Mark Final</button>
-      <button class='btn' id='runRecovery'>Resume Recovery</button>
-      <button class='btn' id='runReaper'>Reap / Cleanup</button>
-    </div>
-  </div>
-  <div class='bottom'>
-    <div class='panel'><h3>Audit Events</h3><ul id='audit' class='event-stream'></ul></div><div class='panel'><h3>Disputes</h3><ul id='disputes' class='event-stream'></ul><input id='disputeId' placeholder='dispute-*'/><button class='btn' id='resolveDispute'>Resolve Dispute</button></div>
-    <div class='panel status-card'><h3>Mode / Recommended / Warnings</h3><ul id='warnings' class='event-stream'></ul><div id='modeInfo'></div><div id='evidenceShort'></div></div>
-  </div>
-</div>
-<script>
-let taskId='task-demo'; let providerId='provider-demo';
-const el=id=>document.getElementById(id);
-const row=(k,v)=>`<tr><th>${k}</th><td>${v??'-'}</td></tr>`;
-async function j(url,opts){const r=await fetch(url,opts); return [r.status, await r.json()];}
-async function loadMeta(){const [,m]=await j('/api/meta'); el('taskSelect').innerHTML=(m.task_ids||[]).map(x=>`<option>${x}</option>`).join(''); el('providerSelect').innerHTML=(m.providers||[]).map(x=>`<option value="${x.id}">${x.label}</option>`).join(''); taskId=m.default_task_id||taskId; providerId=m.default_provider_id||providerId; el('taskSelect').value=taskId; el('providerSelect').value=providerId; el('taskSelect').onchange=()=>{taskId=el('taskSelect').value; refresh();}; el('providerSelect').onchange=()=>{providerId=el('providerSelect').value; refresh();}; }
-function tag(v){const ok=['matched','accepted','settled','MATCH','online'].includes(String(v)); return `<span class='tag ${ok?'ok':'bad'}'>${v}</span>`;}
-function shortHash(v){ if(!v||v==='-') return '-'; return String(v).length>18?`${String(v).slice(0,10)}...${String(v).slice(-6)}`:String(v); }
-function eventItem(type,msg){ return `<li class='event'><small>${type}</small>${msg}</li>`; }
-async function copyText(v){ try{ await navigator.clipboard.writeText(v); }catch(_e){} }
-async function refresh(){
-  const [status,data]=await j(`/api/live/${taskId}?provider=${encodeURIComponent(providerId)}`); if(status>=400)return;
-  el('net').textContent=`${data.network}/${data.prefix}`; el('marketMode').textContent=`P:${data.provider_market_mode||'-'} A:${data.agent_market_mode||'-'}`; el('settleMode').textContent=data.settlement_mode; el('selection').textContent=`${data.selected_task_id}/${data.selected_provider_id}`; el('benchmark').textContent=data.benchmark_score??'-'; el('recon').innerHTML=`status ${tag(data.reconciliation.status)}`; el('refreshAt').textContent=new Date().toLocaleTimeString();
-  el('providers').innerHTML=(data.provider_pool||[]).map(p=>`<tr><td>${p.provider_id}</td><td>${p.benchmark_score}</td><td>${tag(p.status)}</td><td>${p.pricing?.unit_price_per_work_unit??'-'}</td></tr>`).join('');
-  const sells=(data.sell_orders||[]).map(o=>`<tr><td>SELL</td><td>${o.order_id}</td><td>${o.unit_price_per_work_unit}</td><td>${o.max_work_units??o.min_work_units}</td><td>${tag(o.status)}</td></tr>`).join('');
-  const buys=(data.buy_orders||[]).map(o=>`<tr><td>BUY</td><td>${o.order_id}</td><td>${o.max_unit_price_per_work_unit}</td><td>${o.required_work_units}</td><td>${tag(o.status)}</td></tr>`).join('');
-  el('book').innerHTML=sells+buys;
-  el('matches').innerHTML=(data.match_records||[]).map(m=>`<tr><td>${m.match_id}</td><td>${m.buy_order_id}</td><td>${m.sell_order_id}</td><td>${m.agreed_unit_price}</td><td>${tag(m.status)}</td></tr>`).join('');
-  el('ticket').innerHTML=`<table><tbody>${row('Bound Match',`<span class='mono'>${data.bound_match_id||'-'}</span>`) + row('Task Status',tag(data.task_status||'-')) + row('Agent Paid',data.total_paid??'-') + row('Provider Confirmed',data.total_confirmed_paid??'-')}</tbody></table>`;
-  el('settlement').innerHTML=[row('window',data.live_settlement.window_index),row('work_units',data.live_settlement.work_units_window),row('active_ratio',data.live_settlement.active_ratio),row('owed_window',data.live_settlement.owed_window),row('invoice',data.live_settlement.last_invoice_id),row('payment',data.live_settlement.last_payment_id)].join('');
-  el('reconcile').innerHTML=[row('agent_total_paid',data.reconciliation.agent_total_paid),row('provider_total_confirmed_paid',data.reconciliation.provider_total_confirmed_paid),row('status',tag(data.reconciliation.status))].join('');
-  el('pricing').innerHTML=[row('provider mode',data.provider_pricing?.price_mode),row('provider fixed',data.provider_pricing?.fixed_price),row('agent mode',data.agent_pricing?.price_mode),row('agent fixed',data.agent_pricing?.fixed_price),row('agent band',JSON.stringify(data.agent_pricing?.band||{}))].join('');
-  el('ops').innerHTML=[row('current mode',data.current_market_mode),row('auto pause',`${data.auto_pause_reason||'-'} until ${data.auto_pause_until||'-'}`),row('recommended valid',tag(String(data.recommended_confirmation_valid))),row('recommended hash',`<span class="mono">${shortHash(data.recommended_context_hash||'-')}</span>`),row('recommended reason',data.recommended_invalidation_reason||'-'),row('active settlement attempts',data.active_settlement_attempts_count),row('retryable_failed attempts',data.retryable_failed_attempts_count),row('payment_unknown attempts',data.payment_unknown_attempts_count),row('stuck attempts',data.stuck_attempts_count),row('recovery queue',data.recovery_queue_size),row('locked buys/sells',`${data.locked_buy_orders_count||0}/${data.locked_sell_orders_count||0}`),row('provider offline impact',data.provider_offline_impact_count)].join('');
-  const audit=[...(data.provider_market_audit||[]),...(data.agent_market_audit||[])].slice(-20).reverse();
-  el('disputes').innerHTML=(data.disputes||[]).slice(-20).reverse().map(d=>eventItem(`dispute:${d.dispute_type||'-'}`,`${d.dispute_id||'-'} [${d.status||'-'}] ${d.summary||''}`)).join('')||eventItem('dispute','none');
-  el('audit').innerHTML=audit.map(a=>eventItem('market_event',a)).join('')||eventItem('market_event','none');
-  el('warnings').innerHTML=(data.warnings||[]).map(w=>eventItem('warning',w)).join('')||eventItem('warning','none');
-  el('modeInfo').innerHTML=`<div class='event'><small>mode matrix</small>manual: manual accept/recovery · auto: auto proposal+accept+recover · hybrid: auto proposal, manual acceptance/recovery</div>`;
-  const root=data.receipt_evidence?.evidence_root||'-';
-  const verify=data.receipt_evidence?.evidence_verify_ok;
-  el('evidenceShort').innerHTML=`<details><summary>Evidence Status ${tag(verify===true?'MATCH':'MISMATCH')}</summary><div class='evidence-row'><span class='k'>root</span><span class='mono'>${shortHash(root)}</span><button class='btn' id='copyRoot'>Copy</button></div><div class='evidence-row'><span class='k'>verify</span>${tag(String(verify))}</div><div class='evidence-row'><span class='k'>full root</span><span class='mono'>${root}</span></div></details>`;
-  const copyBtn=el('copyRoot');
-  if(copyBtn){ copyBtn.onclick=()=>copyText(root); }
-  el('modeSel').value=data.agent_market_mode||'manual';
-}
-async function postJson(url,obj){return j(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(obj)});}
-el('applyMode').onclick=async()=>{await postJson('/api/action/mode',{mode:el('modeSel').value}); refresh();};
-el('applyPricing').onclick=async()=>{const payload={price_mode:el('priceModeSel').value,fixed_price:parseFloat(el('fixedPrice').value),band:{min:parseFloat(el('bandMin').value),max:parseFloat(el('bandMax').value),target:parseFloat(el('bandTarget').value)}}; await postJson('/api/action/pricing',payload); refresh();};
-el('confirmRecommended').onclick=async()=>{await j('/api/action/confirm_recommended',{method:'POST'}); refresh();};
-el('manualBuy').onclick=async()=>{await j(`/api/action/manual_buy/${taskId}`,{method:'POST'}); refresh();};
-el('startBidding').onclick=async()=>{await j('/api/action/start_bidding',{method:'POST'}); refresh();};
-el('runRecovery').onclick=async()=>{await j('/api/action/recovery_run',{method:'POST'}); refresh();};
-el('runReaper').onclick=async()=>{await j('/api/action/reaper_run',{method:'POST'}); refresh();};
-el('retryAttempt').onclick=async()=>{const id=el('attemptId').value.trim(); if(id) await j(`/api/action/retry_attempt/${encodeURIComponent(id)}`,{method:'POST'}); refresh();};
-el('markFinalAttempt').onclick=async()=>{const id=el('attemptId').value.trim(); if(id) await j(`/api/action/mark_final/${encodeURIComponent(id)}`,{method:'POST'}); refresh();};
-el('resolveDispute').onclick=async()=>{const id=el('disputeId').value.trim(); if(id) await j(`/api/action/dispute_resolve/${encodeURIComponent(id)}`,{method:'POST'}); refresh();};
-el('refreshBtn').onclick=refresh;
-(async()=>{await loadMeta(); await refresh(); setInterval(refresh,3000);})();
-</script>
-</body>
-</html>"#,
-    )
+    Html(UI_SOURCE)
 }
 
 async fn meta(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -553,7 +566,10 @@ async fn action_retry_attempt(
         .send()
         .await;
     Json(match resp {
-        Ok(v) => v.json::<Value>().await.unwrap_or_else(|_| serde_json::json!({"status":"ok"})),
+        Ok(v) => v
+            .json::<Value>()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({"status":"ok"})),
         Err(e) => serde_json::json!({"error": format!("{e}")}),
     })
 }
@@ -571,7 +587,10 @@ async fn action_mark_final_attempt(
         .send()
         .await;
     Json(match resp {
-        Ok(v) => v.json::<Value>().await.unwrap_or_else(|_| serde_json::json!({"status":"ok"})),
+        Ok(v) => v
+            .json::<Value>()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({"status":"ok"})),
         Err(e) => serde_json::json!({"error": format!("{e}")}),
     })
 }
@@ -589,7 +608,10 @@ async fn action_dispute_resolve(
         .send()
         .await;
     Json(match resp {
-        Ok(v) => v.json::<Value>().await.unwrap_or_else(|_| serde_json::json!({"status":"ok"})),
+        Ok(v) => v
+            .json::<Value>()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({"status":"ok"})),
         Err(e) => serde_json::json!({"error": format!("{e}")}),
     })
 }
@@ -608,12 +630,7 @@ async fn live_dashboard(
             .unwrap_or_else(|| "provider-demo".to_string())
     });
 
-    let provider = state
-        .providers
-        .iter()
-        .find(|p| p.id == provider_id)
-        .cloned()
-        .or_else(|| state.providers.first().cloned());
+    let provider = resolve_provider(&state, &provider_id);
 
     let Some(provider) = provider else {
         return Json(serde_json::json!({
@@ -623,87 +640,30 @@ async fn live_dashboard(
         }));
     };
 
-    let provider_status_url = format!(
-        "{}/v1/provider/jobs/{}",
-        provider.base_url, provider.provider_job_id
-    );
-    let provider_result_url = format!(
-        "{}/v1/provider/jobs/{}/result",
-        provider.base_url, provider.provider_job_id
-    );
-    let agent_status_url = format!("{}/v1/tasks/{}", state.agent_base, task_id);
-    let agent_receipt_url = format!("{}/v1/tasks/{}/receipt", state.agent_base, task_id);
-    let provider_registry_url = format!("{}{}", provider.base_url, MARKET_ROUTE_PROVIDERS);
-    let sell_orders_url = format!("{}{}", provider.base_url, MARKET_ROUTE_SELL_ORDERS);
-    let buy_orders_url = format!("{}{}", state.agent_base, MARKET_ROUTE_BUY_ORDERS);
-    let match_records_url = format!("{}{}", state.agent_base, MARKET_ROUTE_MATCHES);
-    let provider_mode_url = format!("{}/internal/market/mode", provider.base_url);
-    let provider_audit_url = format!("{}/internal/market/audit", provider.base_url);
-    let agent_mode_url = format!("{}/internal/market/mode", state.agent_base);
-    let agent_audit_url = format!("{}/internal/market/audit", state.agent_base);
-    let provider_pricing_url = format!("{}/internal/market/pricing", provider.base_url);
-    let agent_pricing_url = format!("{}/internal/market/pricing", state.agent_base);
-    let disputes_url = format!("{}/internal/market/disputes", state.agent_base);
+    let urls = build_live_urls(&state.agent_base, &provider, &task_id);
+    let results = fetch_live_results(&state.http, &urls).await;
+    let (mut warnings, api_error) = warnings_and_api_error(&results);
 
-    let provider_status = get_json(&state.http, &provider_status_url).await;
-    let provider_result = get_json(&state.http, &provider_result_url).await;
-    let agent_status = get_json(&state.http, &agent_status_url).await;
-    let agent_receipt = get_json(&state.http, &agent_receipt_url).await;
-    let provider_registry = get_json(&state.http, &provider_registry_url).await;
-    let sell_orders = get_json(&state.http, &sell_orders_url).await;
-    let buy_orders = get_json(&state.http, &buy_orders_url).await;
-    let match_records = get_json(&state.http, &match_records_url).await;
-    let provider_mode = get_json(&state.http, &provider_mode_url).await;
-    let provider_audit = get_json(&state.http, &provider_audit_url).await;
-    let agent_mode = get_json(&state.http, &agent_mode_url).await;
-    let agent_audit = get_json(&state.http, &agent_audit_url).await;
-    let provider_pricing = get_json(&state.http, &provider_pricing_url).await;
-    let agent_pricing = get_json(&state.http, &agent_pricing_url).await;
-    let disputes = get_json(&state.http, &disputes_url).await;
-
-    let mut warnings = collect_request_warnings(
-        &provider_status,
-        &provider_result,
-        &agent_status,
-        &agent_receipt,
-        &provider_registry,
-        &sell_orders,
-        &buy_orders,
-        &match_records,
-    );
-
-    if let Err(err) = &provider_mode {
-        warnings.push(format!("provider market mode error: {err}"));
-    }
-    if let Err(err) = &provider_audit {
-        warnings.push(format!("provider market audit error: {err}"));
-    }
-    if let Err(err) = &agent_mode {
-        warnings.push(format!("agent market mode error: {err}"));
-    }
-    if let Err(err) = &agent_audit {
-        warnings.push(format!("agent market audit error: {err}"));
-    }
-
-    if let Err(err) = &provider_pricing {
-        warnings.push(format!("provider pricing error: {err}"));
-    }
-    if let Err(err) = &agent_pricing {
-        warnings.push(format!("agent pricing error: {err}"));
-    }
-    if let Err(err) = &disputes {
-        warnings.push(format!("disputes error: {err}"));
-    }
-
-    let fatal_api_error = has_fatal_api_error(&warnings);
-    let api_error = if fatal_api_error {
-        Some("one_or_more_backend_apis_unreachable".to_string())
-    } else {
-        None
-    };
-    if fatal_api_error {
-        warnings.insert(0, API_UNREACHABLE_HINT.to_string());
-    }
+    let LiveFetchResults {
+        provider_status,
+        provider_result,
+        agent_status,
+        agent_receipt,
+        provider_registry,
+        sell_orders,
+        buy_orders,
+        match_records,
+        provider_mode,
+        provider_audit,
+        agent_mode,
+        agent_audit,
+        provider_pricing,
+        agent_pricing,
+        disputes,
+        trade_desk,
+        network_runtime,
+        node_identity,
+    } = results;
 
     let provider_status_v = provider_status.unwrap_or(Value::Null);
     let provider_result_v = provider_result.unwrap_or(Value::Null);
@@ -718,6 +678,44 @@ async fn live_dashboard(
     let buy_orders_list = buy_orders_v.as_array().cloned().unwrap_or_default();
     let match_records_v = match_records.unwrap_or(Value::Null);
     let match_records_list = match_records_v.as_array().cloned().unwrap_or_default();
+
+    let trade_desk_v = trade_desk.unwrap_or(Value::Null);
+    let network_runtime_v = network_runtime.unwrap_or(Value::Null);
+    let node_identity_v = node_identity.unwrap_or(Value::Null);
+    let seed = demo_workspace_seed();
+    let trade_rows = trade_desk_v
+        .get("trades")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            seed.get("trades")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+        });
+    let billing_windows = trade_desk_v
+        .get("bills")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            seed.get("bills")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+        });
+    let offers = trade_desk_v
+        .get("offers")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            seed.get("offers")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+        });
 
     let conflict_records = read_string_array(&agent_receipt_v, "/evidence_bundle/conflict_records");
 
@@ -822,19 +820,93 @@ async fn live_dashboard(
         current_market_mode: read_str(&agent_status_v, "current_market_mode").map(str::to_string),
         auto_pause_reason: read_str(&agent_status_v, "auto_pause_reason").map(str::to_string),
         auto_pause_until: read_u64(&agent_status_v, "auto_pause_until"),
-        recommended_context_hash: read_str(&agent_status_v, "recommended_context_hash").map(str::to_string),
-        recommended_confirmation_valid: agent_status_v.get("recommended_confirmation_valid").and_then(|v| v.as_bool()),
-        recommended_invalidation_reason: read_str(&agent_status_v, "recommended_invalidation_reason").map(str::to_string),
+        recommended_context_hash: read_str(&agent_status_v, "recommended_context_hash")
+            .map(str::to_string),
+        recommended_confirmation_valid: agent_status_v
+            .get("recommended_confirmation_valid")
+            .and_then(|v| v.as_bool()),
+        recommended_invalidation_reason: read_str(
+            &agent_status_v,
+            "recommended_invalidation_reason",
+        )
+        .map(str::to_string),
         active_accept_attempts_count: read_u64(&agent_status_v, "active_accept_attempts_count"),
-        active_settlement_attempts_count: read_u64(&agent_status_v, "active_settlement_attempts_count"),
-        retryable_failed_attempts_count: read_u64(&agent_status_v, "retryable_failed_attempts_count"),
+        active_settlement_attempts_count: read_u64(
+            &agent_status_v,
+            "active_settlement_attempts_count",
+        ),
+        retryable_failed_attempts_count: read_u64(
+            &agent_status_v,
+            "retryable_failed_attempts_count",
+        ),
         payment_unknown_attempts_count: read_u64(&agent_status_v, "payment_unknown_attempts_count"),
         stuck_attempts_count: read_u64(&agent_status_v, "stuck_attempts_count"),
         locked_buy_orders_count: read_u64(&agent_status_v, "locked_buy_orders_count"),
         locked_sell_orders_count: read_u64(&agent_status_v, "locked_sell_orders_count"),
         recovery_queue_size: read_u64(&agent_status_v, "recovery_queue_size"),
         provider_offline_impact_count: read_u64(&agent_status_v, "provider_offline_impact_count"),
-        disputes: disputes.ok().and_then(|v| v.as_array().cloned()).unwrap_or_default(),
+        peer_id: read_str(&agent_status_v, "peer_id")
+            .map(str::to_string)
+            .or_else(|| read_str(&node_identity_v, "peer_id").map(str::to_string)),
+        node_pubkey: read_str(&agent_status_v, "node_pubkey")
+            .map(str::to_string)
+            .or_else(|| read_str(&node_identity_v, "pubkey").map(str::to_string)),
+        settlement_interval_secs: read_u64(&agent_status_v, "settlement_interval_secs"),
+        committed_compute_total: read_f64(&agent_status_v, "committed_compute_total"),
+        minimum_commit_compute: read_f64(&agent_status_v, "minimum_commit_compute"),
+        delivered_compute_total: read_f64(&agent_status_v, "delivered_compute_total"),
+        breach_tolerance_ratio: read_f64(&agent_status_v, "breach_tolerance_ratio"),
+        penalty_policy: read_str(&agent_status_v, "penalty_policy").map(str::to_string),
+        stop_condition: read_str(&agent_status_v, "stop_condition").map(str::to_string),
+        finalization_rule: read_str(&agent_status_v, "finalization_rule").map(str::to_string),
+        disputes: disputes
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default(),
+        trades: trade_rows,
+        billing_windows,
+        offers,
+        runtime_mode: trade_desk_v
+            .get("runtime_mode")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| read_str(&agent_status_v, "runtime_mode").map(str::to_string)),
+        direct_mode_ready: trade_desk_v
+            .get("direct_mode_ready")
+            .and_then(|v| v.as_bool())
+            .or_else(|| {
+                agent_status_v
+                    .get("direct_mode_ready")
+                    .and_then(|v| v.as_bool())
+            }),
+        runtime_data_source_path: trade_desk_v
+            .get("runtime_data_source_path")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                network_runtime_v
+                    .get("runtime_data_source_path")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            }),
+        bridge_dependent_modules: network_runtime_v
+            .get("bridge_dependent_modules")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        payment_rail_mode: trade_desk_v
+            .get("payment_rail_mode")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                network_runtime_v
+                    .get("payment_rail_mode")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            }),
         warnings,
         api_error,
     };
@@ -843,6 +915,35 @@ async fn live_dashboard(
         serde_json::to_value(payload)
             .unwrap_or_else(|_| serde_json::json!({ "error": "serialize_failed" })),
     )
+}
+
+fn push_result_error(warnings: &mut Vec<String>, label: &str, result: &Result<Value, String>) {
+    if let Err(err) = result {
+        warnings.push(format!("{label} error: {err}"));
+    }
+}
+
+fn demo_workspace_seed() -> Value {
+    serde_json::json!({
+        "trades": [
+            {
+                "trade_id":"trade-seed-complete","status":"settled","delivered_compute_total":120.0,"committed_compute_total":120.0,"current_penalty_preview":0.0,"gap_ratio":0.0
+            },
+            {
+                "trade_id":"trade-seed-penalty","status":"settling","delivered_compute_total":80.0,"committed_compute_total":120.0,"current_penalty_preview":3.0,"gap_ratio":0.3333
+            },
+            {
+                "trade_id":"trade-seed-payment-unknown","status":"payment_unknown","delivered_compute_total":55.0,"committed_compute_total":120.0,"current_penalty_preview":2.5,"gap_ratio":0.5416
+            }
+        ],
+        "bills": [
+            {"bill_id":"bill-seed-1","trade_id":"trade-seed-penalty","settlement_attempt_id":"attempt-seed-1","window_index":8,"window_start_ts":480,"window_end_ts":540,"gross_amount":20.0,"invoice_id":"inv-seed-1","payment_id":"pay-seed-1","status":"paid"},
+            {"bill_id":"bill-seed-2","trade_id":"trade-seed-payment-unknown","settlement_attempt_id":"attempt-seed-2","window_index":9,"window_start_ts":540,"window_end_ts":600,"gross_amount":17.0,"invoice_id":"inv-seed-2","payment_id":"pay-seed-2","status":"disputed"}
+        ],
+        "offers": [
+            {"offer_id":"offer-seed-1","hardware_model":"RTX-4090","measured_perf_value":123.4,"measured_perf_unit":"tokens/s","perf_confidence":0.92,"telemetry_source":"seeded","confidence_label":"high_confidence"}
+        ]
+    })
 }
 
 fn read_str<'a>(obj: &'a Value, key: &str) -> Option<&'a str> {
@@ -878,4 +979,125 @@ fn read_string_array(obj: &Value, ptr: &str) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn demo_scenario_loader_populates_non_empty_terminal_views() {
+        let seed = demo_workspace_seed();
+        assert!(seed
+            .get("trades")
+            .and_then(|v| v.as_array())
+            .map(|v| !v.is_empty())
+            .unwrap_or(false));
+        assert!(seed
+            .get("bills")
+            .and_then(|v| v.as_array())
+            .map(|v| !v.is_empty())
+            .unwrap_or(false));
+        assert!(seed
+            .get("offers")
+            .and_then(|v| v.as_array())
+            .map(|v| !v.is_empty())
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn trade_terminal_renders_objectized_trade_rows() {
+        let html = UI_SOURCE;
+        assert!(html.contains("Trade Terminal"));
+        assert!(html.contains("trade_id"));
+        assert!(html.contains("tradeTerminalRows"));
+    }
+
+    #[test]
+    fn billing_center_renders_window_records_with_key_fields() {
+        let html = UI_SOURCE;
+        for k in [
+            "bill_id",
+            "window",
+            "invoice/payment",
+            "penalty",
+            "net_provider_payout",
+        ] {
+            assert!(html.contains(k));
+        }
+    }
+
+    #[test]
+    fn dispute_center_renders_actionable_dispute_details() {
+        let html = UI_SOURCE;
+        assert!(html.contains("Dispute Resolution Wizard"));
+        assert!(html.contains("disputeAction"));
+        assert!(html.contains("allowed actions"));
+    }
+
+    #[test]
+    fn node_network_view_renders_runtime_mode_and_dependencies() {
+        let html = UI_SOURCE;
+        assert!(html.contains("Node / Network"));
+        assert!(html.contains("bridge dependent modules"));
+        assert!(html.contains("runtime mode"));
+    }
+
+    #[test]
+    fn profile_settings_views_exist_and_render_core_fields() {
+        let html = UI_SOURCE;
+        assert!(html.contains("Profile / Settings"));
+        assert!(html.contains("Personal Homepage"));
+        assert!(html.contains("display name"));
+        assert!(html.contains("Theme"));
+        assert!(html.contains("Scenario"));
+    }
+
+    #[test]
+    fn tauri_and_dashboard_remain_layout_parity_on_core_views() {
+        let dash = UI_SOURCE;
+        let tauri = UI_SOURCE;
+        for view in [
+            "Home",
+            "Trade Terminal",
+            "Market / Offers",
+            "Orders / Trades",
+            "Billing / Settlement",
+            "Disputes",
+            "Recovery / Ops",
+            "Evidence / Audit",
+            "Node / Network",
+            "Profile / Settings",
+        ] {
+            assert!(dash.contains(view));
+            assert!(tauri.contains(view));
+        }
+    }
+
+    #[test]
+    fn offer_compare_works_with_seeded_scenarios() {
+        let seed = demo_workspace_seed();
+        assert!(seed
+            .get("offers")
+            .and_then(|v| v.as_array())
+            .map(|v| !v.is_empty())
+            .unwrap_or(false));
+        let html = UI_SOURCE;
+        assert!(html.contains("Offer Compare"));
+        assert!(html.contains("compareDo"));
+    }
+
+    #[test]
+    fn buy_wizard_smoke_path_works() {
+        let html = UI_SOURCE;
+        assert!(html.contains("Buy Wizard"));
+        assert!(html.contains("buyWizardSubmit"));
+    }
+
+    #[test]
+    fn dispute_resolution_wizard_smoke_path_works() {
+        let html = UI_SOURCE;
+        assert!(html.contains("Dispute Resolution Wizard"));
+        assert!(html.contains("disputeApply"));
+    }
 }

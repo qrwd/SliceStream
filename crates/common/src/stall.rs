@@ -80,7 +80,10 @@ mod tests {
         let result = guard_renewal(100, 145, 45);
         assert!(!result.allow_renewal);
         assert!(result.assessment.is_stalled);
-        assert_eq!(result.assessment.recommendation, Some(ActionRecommendation::Pause));
+        assert_eq!(
+            result.assessment.recommendation,
+            Some(ActionRecommendation::Pause)
+        );
 
         let event = result
             .assessment
@@ -98,7 +101,10 @@ mod tests {
         let result = guard_renewal(100, 220, 45);
         assert!(!result.allow_renewal);
         assert!(result.assessment.is_stalled);
-        assert_eq!(result.assessment.recommendation, Some(ActionRecommendation::Stop));
+        assert_eq!(
+            result.assessment.recommendation,
+            Some(ActionRecommendation::Stop)
+        );
 
         let event = result
             .assessment

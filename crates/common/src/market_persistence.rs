@@ -91,7 +91,7 @@ impl MarketPersistence {
         let reader = BufReader::new(file);
         reader
             .lines()
-            .filter_map(|l| l.ok())
+            .map_while(Result::ok)
             .filter_map(|l| serde_json::from_str::<MarketEvent>(&l).ok())
             .collect()
     }

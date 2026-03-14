@@ -1,5 +1,5 @@
-use axum::http::HeaderMap;
 use super::*;
+use axum::http::HeaderMap;
 
 pub(crate) fn set_auto_pause_for_manual_override(state: &AppState, reason: &str, hold_ticks: u64) {
     let mode = state.market_mode.lock().expect("market mode lock").clone();
@@ -9,7 +9,10 @@ pub(crate) fn set_auto_pause_for_manual_override(state: &AppState, reason: &str,
     let now = *state.lifecycle_tick.lock().expect("lifecycle tick lock");
     let mut until = state.auto_pause_until_tick.lock().expect("auto pause lock");
     *until = (*until).max(now.saturating_add(hold_ticks));
-    *state.auto_pause_reason.lock().expect("auto pause reason lock") = Some(reason.to_string());
+    *state
+        .auto_pause_reason
+        .lock()
+        .expect("auto pause reason lock") = Some(reason.to_string());
     state
         .market_audit
         .lock()
@@ -112,7 +115,10 @@ pub(crate) fn converge_mode_state(state: &AppState, old_mode: &str, new_mode: &s
         }
     }
     {
-        let mut settlement_attempts = state.settlement_attempts.lock().expect("settlement attempts lock");
+        let mut settlement_attempts = state
+            .settlement_attempts
+            .lock()
+            .expect("settlement attempts lock");
         for attempt in settlement_attempts.values_mut() {
             if attempt.status == SETTLEMENT_ATTEMPT_STATUS_STARTED
                 || attempt.status == SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS
@@ -120,7 +126,8 @@ pub(crate) fn converge_mode_state(state: &AppState, old_mode: &str, new_mode: &s
                 attempt.status = SETTLEMENT_ATTEMPT_STATUS_RETRYABLE_FAILED.to_string();
                 attempt.last_error_code = Some("mode_switch_requires_recovery".to_string());
                 attempt.last_error_stage = Some(attempt.stage.clone());
-                attempt.last_error_message = Some("mode switched while attempt in-flight".to_string());
+                attempt.last_error_message =
+                    Some("mode switched while attempt in-flight".to_string());
                 attempt.updated_at = now_rfc3339_like();
             }
         }

@@ -37,6 +37,24 @@ paths:
               schema:
                 $ref: '#/components/schemas/Receipt'
 
+  /v1/tasks/{task_id}/status:
+    get:
+      tags: [agent]
+      summary: Agent task status with recovery/dispute/billing policy metadata
+      parameters:
+        - in: path
+          name: task_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Task status snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentTaskStatus'
+
   # -----------------------------
   # Internal market/runtime extension section (documentation-only extension)
   # Existing external contract above is unchanged.
@@ -725,6 +743,36 @@ components:
           type: number
           format: float
 
+    AgentTaskStatus:
+      type: object
+      properties:
+        task_id: { type: string }
+        status: { type: string }
+        bound_match_id: { type: string, nullable: true }
+        current_market_mode: { type: string }
+        auto_pause_reason: { type: string, nullable: true }
+        auto_pause_until: { type: integer, format: uint64 }
+        recommended_context_hash: { type: string }
+        recommended_confirmation_valid: { type: boolean }
+        recommended_invalidation_reason: { type: string, nullable: true }
+        recovery_queue_size: { type: integer }
+        active_settlement_attempts_count: { type: integer }
+        retryable_failed_attempts_count: { type: integer }
+        payment_unknown_attempts_count: { type: integer }
+        stuck_attempts_count: { type: integer }
+        disputes_open_count: { type: integer }
+        disputes_high_severity_count: { type: integer }
+        peer_id: { type: string, description: protocol identity field (domain-independent) }
+        node_pubkey: { type: string, description: protocol identity field (domain-independent) }
+        settlement_interval_secs: { type: integer, example: 60 }
+        committed_compute_total: { type: number, format: float }
+        minimum_commit_compute: { type: number, format: float }
+        delivered_compute_total: { type: number, format: float }
+        breach_tolerance_ratio: { type: number, format: float, example: 0.03 }
+        penalty_policy: { type: string, example: 'gap>3% => 15% refund to buyer' }
+        stop_condition: { type: string }
+        finalization_rule: { type: string }
+
     ProviderRegistryEntry:
       type: object
       required: [provider_id, display_name, benchmark_score, telemetry_source, status, hardware, pricing, capabilities, last_seen_at]
@@ -853,3 +901,30 @@ components:
       properties:
         status: { type: string }
         error: { type: string }
+
+
+# Stage 2 notes:
+# - /v1/tasks/{task_id}/trade-desk now returns runtime-backed `bills` sourced from BillingWindowRecord lifecycle.
+# - bill.status uses: pending|invoiced|payment_submitted|paid|disputed|refunded|finalized|failed
+# - runtime_mode + direct_mode_ready are surfaced for node/network operation mode awareness.
+
+# Stage 3 notes:
+# - dispute records now include allowed_actions and resolution effect flags (`penalty_applied`, `refund_released`).
+# - new endpoint: POST /internal/market/disputes/{dispute_id}/action with body { action }.
+# - runtime_mode direct readiness is computed from runtime mode + direct/fiber endpoint availability.
+
+# Stage 4 notes:
+# - agent status and trade-desk now include `runtime_mode_dependencies` for explicit bridge/direct readiness diagnostics.
+# - new dispute action endpoint is part of runtime closure: POST /internal/market/disputes/{dispute_id}/action { action }.
+
+
+# Stage 5 notes:
+# - direct mode exposes explicit source routing: `runtime_data_source_path` + `bridge_dependent_modules`.
+# - agent direct endpoints: GET /internal/node/identity and GET /internal/network/runtime.
+# - trade-desk/status responses include `payment_rail_mode` (`fiber_real|fiber_simulated|local_placeholder`).
+# - telemetry/billing/dispute snapshots support canonical signing and verification via common::signing.
+
+# Stage 6 notes:
+# - dashboard/tauri now expose 10 enterprise workspaces: home, terminal, market, orders, billing, disputes, ops, evidence, node, profile.
+# - /api/live/{task_id} is treated as primary high-density terminal payload for KPI/risk/timeline/order/billing/dispute/evidence views.
+# - payload fields consumed by new terminal views include runtime_data_source_path, bridge_dependent_modules, payment_rail_mode, trades[], billing_windows[], disputes[], offers[].

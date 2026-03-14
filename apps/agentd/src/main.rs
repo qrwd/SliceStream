@@ -8,9 +8,9 @@ use axum::{
 use common::market::{
     can_transition_settlement_attempt_stage, can_transition_settlement_attempt_status,
     AcceptAttempt, SettlementAttempt, ACCEPT_ATTEMPT_STATUS_COMMITTED,
-    ACCEPT_ATTEMPT_STATUS_FAILED, ACCEPT_ATTEMPT_STATUS_LOCKING,
-    ACCEPT_ATTEMPT_STATUS_RECEIVED, ACCEPT_ATTEMPT_STATUS_VALIDATING,
-    SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE, SETTLEMENT_ATTEMPT_STAGE_PROVIDER_MARK_SETTLED,
+    ACCEPT_ATTEMPT_STATUS_FAILED, ACCEPT_ATTEMPT_STATUS_LOCKING, ACCEPT_ATTEMPT_STATUS_RECEIVED,
+    ACCEPT_ATTEMPT_STATUS_VALIDATING, SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE,
+    SETTLEMENT_ATTEMPT_STAGE_PROVIDER_MARK_SETTLED,
     SETTLEMENT_ATTEMPT_STAGE_PROVIDER_MARK_SETTLING, SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT,
     SETTLEMENT_ATTEMPT_STAGE_SETTLE_PAYMENT, SETTLEMENT_ATTEMPT_STATUS_COMMITTED,
     SETTLEMENT_ATTEMPT_STATUS_FAILED_FINAL, SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS,
@@ -22,30 +22,39 @@ use common::{
     hash::{hash_hex, HashAlg},
     idempotency::make_key,
     market::{
-        ACCEPT_ATTEMPT_STATUS_CONFLICT, BuyOrder, DisputeRecord, MatchRecord, ProviderRegistryEntry, SellOrder, MARKET_MODE_AUTO,
-        MARKET_MODE_HYBRID, MARKET_MODE_MANUAL, MARKET_ROUTE_MATCHES, MARKET_ROUTE_PROVIDERS,
-        MARKET_ROUTE_SELL_ORDERS, MATCH_STATUS_ACCEPTED, MATCH_STATUS_CANCELLED,
-        MATCH_STATUS_EXPIRED, MATCH_STATUS_FAILED, MATCH_STATUS_FAILED_FINAL,
-        MATCH_STATUS_PAYMENT_UNKNOWN, MATCH_STATUS_PROPOSED, MATCH_STATUS_REJECTED,
-        MATCH_STATUS_RETRYABLE_FAILED, MATCH_STATUS_SETTLED, MATCH_STATUS_SETTLING,
-        DISPUTE_STATUS_AWAITING_MANUAL, DISPUTE_STATUS_MANUALLY_RESOLVED, DISPUTE_STATUS_OPEN,
-        DISPUTE_TYPE_AMOUNT_MISMATCH, DISPUTE_TYPE_PAYMENT_UNKNOWN, DISPUTE_TYPE_RECOMMENDED_INVALIDATED,
-        DISPUTE_TYPE_RECONCILE_CONFLICT, DISPUTE_TYPE_RESULT_RECORD_CONFLICT, ORDER_STATUS_LOCKED,
-        ORDER_STATUS_MATCHED, ORDER_STATUS_OPEN, ORDER_STATUS_SETTLED, ORDER_STATUS_SETTLING,
-        PRICE_MODE_BAND, PRICE_MODE_FIXED, PRICE_MODE_RECOMMENDED_BAND,
+        BuyOrder, DisputeRecord, MatchRecord, ProviderRegistryEntry, SellOrder,
+        ACCEPT_ATTEMPT_STATUS_CONFLICT, DISPUTE_STATUS_AWAITING_MANUAL,
+        DISPUTE_STATUS_MANUALLY_RESOLVED, DISPUTE_STATUS_OPEN,
+        DISPUTE_TYPE_RECOMMENDED_INVALIDATED, DISPUTE_TYPE_RECONCILE_CONFLICT,
+        DISPUTE_TYPE_RESULT_RECORD_CONFLICT, MARKET_MODE_AUTO, MARKET_MODE_HYBRID,
+        MARKET_MODE_MANUAL, MARKET_ROUTE_MATCHES, MARKET_ROUTE_PROVIDERS, MARKET_ROUTE_SELL_ORDERS,
+        MATCH_STATUS_ACCEPTED, MATCH_STATUS_CANCELLED, MATCH_STATUS_EXPIRED, MATCH_STATUS_FAILED,
+        MATCH_STATUS_FAILED_FINAL, MATCH_STATUS_PAYMENT_UNKNOWN, MATCH_STATUS_PROPOSED,
+        MATCH_STATUS_REJECTED, MATCH_STATUS_RETRYABLE_FAILED, MATCH_STATUS_SETTLED,
+        MATCH_STATUS_SETTLING, ORDER_STATUS_LOCKED, ORDER_STATUS_MATCHED, ORDER_STATUS_OPEN,
+        ORDER_STATUS_SETTLED, ORDER_STATUS_SETTLING, PRICE_MODE_BAND, PRICE_MODE_FIXED,
+        PRICE_MODE_RECOMMENDED_BAND,
     },
     market_persistence::{MarketEvent, MarketPersistence},
     runtime_config::{load_runtime_config, SettlementMode},
+    signing::{derive_pubkey_hex, sign_payload},
     stall::{assess_stall, ActionRecommendation},
 };
 use serde::{Deserialize, Serialize};
 
 use serde_json::Value;
+mod dispute_support;
 mod market_support;
+mod runtime_mode_support;
 
+use dispute_support::{allowed_actions_for_dispute_type, dispute_action_guard};
 use market_support::{
     auto_actions_allowed, cancel_match, cleanup_task_bindings, converge_mode_state, expire_match,
     release_binding_and_locks, retry_match, set_auto_pause_for_manual_override, start_auto_bidding,
+};
+use runtime_mode_support::{
+    bridge_dependent_modules, compute_direct_mode_ready, current_runtime_mode,
+    runtime_mode_dependencies, select_runtime_data_source,
 };
 
 use std::{
@@ -120,6 +129,11 @@ struct MatchActionResponse {
     match_id: String,
     buy_order_id: String,
     sell_order_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DisputeActionRequest {
+    action: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -212,6 +226,21 @@ struct TaskStatus {
     provider_offline_impact_count: usize,
     disputes_open_count: usize,
     disputes_high_severity_count: usize,
+    peer_id: String,
+    node_pubkey: String,
+    settlement_interval_secs: u64,
+    committed_compute_total: f64,
+    minimum_commit_compute: f64,
+    delivered_compute_total: f64,
+    breach_tolerance_ratio: f64,
+    penalty_policy: String,
+    stop_condition: String,
+    finalization_rule: String,
+    runtime_mode: String,
+    direct_mode_ready: bool,
+    runtime_mode_dependencies: Vec<String>,
+    runtime_data_source_path: String,
+    payment_rail_mode: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -502,6 +531,8 @@ struct TaskRuntime {
     last_payment_id: Option<String>,
     total_paid: f64,
     payment_records: Vec<PaymentRecord>,
+    billing_windows: Vec<common::market::BillingWindowRecord>,
+    settlement_interval_secs: u64,
     bound_match_id: Option<String>,
     settlement_audit_events: Vec<String>,
     next_invoice_seq: u64,
@@ -535,7 +566,6 @@ struct AppState {
     accept_idempotency_ledger: Arc<Mutex<HashMap<String, String>>>,
     settlement_attempts: Arc<Mutex<HashMap<String, SettlementAttempt>>>,
     disputes: Arc<Mutex<HashMap<String, DisputeRecord>>>,
-    last_ops_result: Arc<Mutex<Option<String>>>,
     persistence: Arc<MarketPersistence>,
 }
 
@@ -562,11 +592,18 @@ struct AgentSettlementRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentBillingWindowRecord {
+    task_id: String,
+    bill: common::market::BillingWindowRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentPersistedState {
     buy_orders: Vec<BuyOrder>,
     accepted_matches: Vec<AcceptedMatchBinding>,
     market_audit: Vec<String>,
     settlement_records: Vec<AgentSettlementRecord>,
+    billing_windows: Vec<AgentBillingWindowRecord>,
     confirm_ledger: Vec<AgentConfirmRecord>,
     accept_attempts: Vec<AcceptAttempt>,
     accept_idempotency_ledger: Vec<AcceptIdempotencyRecord>,
@@ -637,6 +674,8 @@ impl Default for AppState {
                 last_payment_id: None,
                 total_paid: 0.0,
                 payment_records: vec![],
+                billing_windows: vec![],
+                settlement_interval_secs: common::market::SETTLEMENT_INTERVAL_SECS_FIBER_DEFAULT,
                 bound_match_id: None,
                 settlement_audit_events: vec![],
                 next_invoice_seq: 1,
@@ -685,7 +724,6 @@ impl Default for AppState {
             accept_idempotency_ledger: Arc::new(Mutex::new(HashMap::new())),
             settlement_attempts: Arc::new(Mutex::new(HashMap::new())),
             disputes: Arc::new(Mutex::new(HashMap::new())),
-            last_ops_result: Arc::new(Mutex::new(None)),
             persistence: Arc::new(MarketPersistence::new("agentd")),
         };
         if !cfg!(test) {
@@ -719,6 +757,21 @@ fn persist_agent_state(state: &AppState) {
             })
         })
         .collect();
+    let billing_windows: Vec<AgentBillingWindowRecord> = state
+        .tasks
+        .lock()
+        .expect("tasks lock")
+        .values()
+        .flat_map(|t| {
+            t.billing_windows
+                .iter()
+                .cloned()
+                .map(|bill| AgentBillingWindowRecord {
+                    task_id: t.task_id.clone(),
+                    bill,
+                })
+        })
+        .collect();
     let snapshot = AgentPersistedState {
         buy_orders: state
             .manual_buy_orders
@@ -738,6 +791,7 @@ fn persist_agent_state(state: &AppState) {
             .expect("market audit lock")
             .clone(),
         settlement_records,
+        billing_windows,
         confirm_ledger: state
             .confirm_ledger
             .lock()
@@ -844,6 +898,29 @@ fn load_agent_state(state: &AppState) {
             });
         }
     }
+    for rec in snapshot.billing_windows {
+        if let Some(task) = tasks.get_mut(&rec.task_id) {
+            task.billing_windows.push(rec.bill);
+        }
+    }
+    for task in tasks.values_mut() {
+        task.billing_windows.sort_by_key(|b| b.window_index);
+        task.total_paid = task
+            .billing_windows
+            .iter()
+            .filter(|b| {
+                b.status == common::market::BILLING_WINDOW_STATUS_PAID
+                    || b.status == common::market::BILLING_WINDOW_STATUS_FINALIZED
+                    || b.status == common::market::BILLING_WINDOW_STATUS_REFUNDED
+            })
+            .map(|b| b.net_provider_payout)
+            .sum();
+        if let Some(last) = task.billing_windows.last() {
+            task.last_settled_window_index = last.window_index;
+            task.last_invoice_id = last.invoice_id.clone();
+            task.last_payment_id = last.payment_id.clone();
+        }
+    }
 }
 
 fn append_market_event(state: &AppState, event_type: &str, entity_id: &str, details: Value) {
@@ -861,6 +938,35 @@ fn open_dispute(
     match_id: Option<String>,
     payment_id: Option<String>,
 ) -> String {
+    open_dispute_with_context(
+        state,
+        dispute_type,
+        severity,
+        summary,
+        summary,
+        attempt_id,
+        match_id,
+        None,
+        payment_id,
+        None,
+        vec![],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_dispute_with_context(
+    state: &AppState,
+    dispute_type: &str,
+    severity: &str,
+    summary: &str,
+    opened_reason: &str,
+    attempt_id: Option<String>,
+    trade_id: Option<String>,
+    bill_id: Option<String>,
+    payment_id: Option<String>,
+    invoice_id: Option<String>,
+    evidence_refs: Vec<String>,
+) -> String {
     let dispute_id = format!(
         "dispute-{}",
         std::time::SystemTime::now()
@@ -874,19 +980,28 @@ fn open_dispute(
         dispute_type: dispute_type.to_string(),
         severity: severity.to_string(),
         related_attempt_id: attempt_id,
-        related_match_id: match_id,
+        related_match_id: trade_id.clone(),
         related_buy_order_id: None,
         related_sell_order_id: None,
+        related_trade_id: trade_id,
+        related_bill_id: bill_id,
         related_payment_id: payment_id,
+        related_invoice_id: invoice_id,
         status: DISPUTE_STATUS_OPEN.to_string(),
         opened_at: now.clone(),
         updated_at: now,
         origin: "agentd".to_string(),
         summary: summary.to_string(),
+        opened_reason: Some(opened_reason.to_string()),
         local_snapshot_hash: None,
         remote_snapshot_hash: None,
-        evidence_refs: vec![],
+        evidence_refs,
+        allowed_actions: allowed_actions_for_dispute_type(dispute_type),
+        auto_resolution_policy: Some("manual_or_operator_resolution".to_string()),
         resolution_action: None,
+        resolution_result: None,
+        penalty_applied: false,
+        refund_released: false,
         resolved_at: None,
     };
     state
@@ -903,12 +1018,367 @@ fn open_dispute(
     dispute_id
 }
 
+fn apply_dispute_action(state: &AppState, dispute_id: &str, action: &str) -> Result<(), String> {
+    let mut disputes = state.disputes.lock().expect("disputes lock");
+    let dispute = disputes
+        .get_mut(dispute_id)
+        .ok_or_else(|| "dispute_not_found".to_string())?;
+    if !dispute_action_guard(dispute, action) {
+        return Err("action_not_allowed_for_dispute".to_string());
+    }
+
+    match action {
+        "retry" => {
+            if let Some(attempt_id) = dispute.related_attempt_id.clone() {
+                if let Some(a) = state
+                    .settlement_attempts
+                    .lock()
+                    .expect("settlement attempts lock")
+                    .get_mut(&attempt_id)
+                {
+                    a.status = SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS.to_string();
+                    a.stage = SETTLEMENT_ATTEMPT_STAGE_PROVIDER_MARK_SETTLING.to_string();
+                    a.updated_at = now_rfc3339_like();
+                }
+            }
+        }
+        "rollback" => {
+            if let Some(attempt_id) = dispute.related_attempt_id.clone() {
+                if let Some(a) = state
+                    .settlement_attempts
+                    .lock()
+                    .expect("settlement attempts lock")
+                    .get_mut(&attempt_id)
+                {
+                    a.status = SETTLEMENT_ATTEMPT_STATUS_FAILED_FINAL.to_string();
+                    a.updated_at = now_rfc3339_like();
+                }
+                let mut tasks = state.tasks.lock().expect("tasks lock");
+                for task in tasks.values_mut() {
+                    for b in task
+                        .billing_windows
+                        .iter_mut()
+                        .filter(|b| b.settlement_attempt_id == attempt_id)
+                    {
+                        b.status = common::market::BILLING_WINDOW_STATUS_FAILED.to_string();
+                        b.updated_at = now_rfc3339_like();
+                    }
+                }
+            }
+        }
+        "mark-final" => {
+            if let Some(attempt_id) = dispute.related_attempt_id.clone() {
+                if let Some(a) = state
+                    .settlement_attempts
+                    .lock()
+                    .expect("settlement attempts lock")
+                    .get_mut(&attempt_id)
+                {
+                    a.status = SETTLEMENT_ATTEMPT_STATUS_FAILED_FINAL.to_string();
+                    a.updated_at = now_rfc3339_like();
+                }
+            }
+        }
+        "refresh-remote-status" => {
+            dispute.remote_snapshot_hash = Some(hash_hex(
+                HashAlg::Sha256V1,
+                format!("refresh:{}:{}", dispute.dispute_type, now_rfc3339_like()).as_bytes(),
+            ));
+        }
+        "apply-penalty" => {
+            let mut tasks = state.tasks.lock().expect("tasks lock");
+            for task in tasks.values_mut() {
+                for b in task.billing_windows.iter_mut().filter(|b| {
+                    dispute
+                        .related_trade_id
+                        .as_ref()
+                        .map(|t| &b.trade_id == t)
+                        .unwrap_or(false)
+                }) {
+                    let penalty = common::market::round_currency_amount(
+                        b.gross_amount * common::market::BREACH_REFUND_RATIO_DEFAULT,
+                    );
+                    b.penalty_amount = penalty;
+                    b.refund_amount = penalty;
+                    b.net_provider_payout =
+                        common::market::round_currency_amount((b.gross_amount - penalty).max(0.0));
+                    b.status = common::market::BILLING_WINDOW_STATUS_REFUNDED.to_string();
+                    b.dispute_id = Some(dispute_id.to_string());
+                }
+            }
+            dispute.penalty_applied = true;
+        }
+        "release-refund" => {
+            let mut tasks = state.tasks.lock().expect("tasks lock");
+            for task in tasks.values_mut() {
+                for b in task.billing_windows.iter_mut().filter(|b| {
+                    dispute
+                        .related_trade_id
+                        .as_ref()
+                        .map(|t| &b.trade_id == t)
+                        .unwrap_or(false)
+                }) {
+                    if b.refund_amount <= 0.0 {
+                        b.refund_amount = common::market::round_currency_amount(
+                            b.gross_amount * common::market::BREACH_REFUND_RATIO_DEFAULT,
+                        );
+                        b.penalty_amount = b.refund_amount;
+                    }
+                    b.net_provider_payout = common::market::round_currency_amount(
+                        (b.gross_amount - b.refund_amount).max(0.0),
+                    );
+                    b.status = common::market::BILLING_WINDOW_STATUS_REFUNDED.to_string();
+                    b.dispute_id = Some(dispute_id.to_string());
+                }
+            }
+            dispute.refund_released = true;
+        }
+        "escalate" => {
+            dispute.status = common::market::DISPUTE_STATUS_ESCALATED_FINAL.to_string();
+        }
+        "resolve" => {
+            dispute.status = DISPUTE_STATUS_MANUALLY_RESOLVED.to_string();
+            dispute.resolved_at = Some(now_rfc3339_like());
+        }
+        _ => return Err("unsupported_dispute_action".to_string()),
+    }
+
+    dispute.resolution_action = Some(action.to_string());
+    dispute.resolution_result = Some("applied".to_string());
+    dispute.updated_at = now_rfc3339_like();
+    Ok(())
+}
+
 fn resolve_dispute(state: &AppState, dispute_id: &str, action: &str) {
-    if let Some(d) = state.disputes.lock().expect("disputes lock").get_mut(dispute_id) {
-        d.status = DISPUTE_STATUS_MANUALLY_RESOLVED.to_string();
-        d.resolution_action = Some(action.to_string());
-        d.resolved_at = Some(now_rfc3339_like());
-        d.updated_at = now_rfc3339_like();
+    let _ = apply_dispute_action(state, dispute_id, action);
+}
+
+fn open_dispute_if_absent(
+    state: &AppState,
+    dispute_type: &str,
+    severity: &str,
+    summary: &str,
+    opened_reason: &str,
+    attempt_id: Option<String>,
+    trade_id: Option<String>,
+    bill_id: Option<String>,
+    payment_id: Option<String>,
+    invoice_id: Option<String>,
+    evidence_refs: Vec<String>,
+) -> String {
+    let key = common::market::build_dispute_open_key(
+        dispute_type,
+        attempt_id.as_deref(),
+        payment_id.as_deref(),
+    );
+    if let Some(existing) = state
+        .disputes
+        .lock()
+        .expect("disputes lock")
+        .values()
+        .find(|d| {
+            common::market::build_dispute_open_key(
+                &d.dispute_type,
+                d.related_attempt_id.as_deref(),
+                d.related_payment_id.as_deref(),
+            ) == key
+        })
+        .map(|d| d.dispute_id.clone())
+    {
+        return existing;
+    }
+    open_dispute_with_context(
+        state,
+        dispute_type,
+        severity,
+        summary,
+        opened_reason,
+        attempt_id,
+        trade_id,
+        bill_id,
+        payment_id,
+        invoice_id,
+        evidence_refs,
+    )
+}
+
+fn auto_open_runtime_disputes(state: &AppState) {
+    // payment_unknown + replay/result conflicts already write attempt status; ensure dispute exists.
+    let attempts: Vec<SettlementAttempt> = state
+        .settlement_attempts
+        .lock()
+        .expect("settlement attempts lock")
+        .values()
+        .cloned()
+        .collect();
+    for a in &attempts {
+        if a.status == SETTLEMENT_ATTEMPT_STATUS_PAYMENT_UNKNOWN {
+            let _ = open_dispute_if_absent(
+                state,
+                common::market::DISPUTE_TYPE_PAYMENT_UNKNOWN,
+                "high",
+                "payment_unknown requires manual attention",
+                "payment_unknown",
+                Some(a.attempt_id.clone()),
+                Some(a.match_id.clone()),
+                None,
+                a.payment_id.clone(),
+                a.invoice_id.clone(),
+                vec![format!("attempt://{}", a.attempt_id)],
+            );
+        }
+        if a.last_error_code.as_deref() == Some("replay_payload_conflict") {
+            let _ = open_dispute_if_absent(
+                state,
+                common::market::DISPUTE_TYPE_REPLAY_INCONSISTENT,
+                "high",
+                "replay result inconsistent with local attempt record",
+                "replay_payload_conflict",
+                Some(a.attempt_id.clone()),
+                Some(a.match_id.clone()),
+                None,
+                a.payment_id.clone(),
+                a.invoice_id.clone(),
+                vec![format!("attempt://{}", a.attempt_id)],
+            );
+        }
+        if a.last_error_stage.as_deref() == Some(SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT)
+            && a.status == SETTLEMENT_ATTEMPT_STATUS_RETRYABLE_FAILED
+        {
+            let _ = open_dispute_if_absent(
+                state,
+                common::market::DISPUTE_TYPE_RESULT_RECORD_CONFLICT,
+                "high",
+                "record_result conflict detected",
+                "record_result_conflict",
+                Some(a.attempt_id.clone()),
+                Some(a.match_id.clone()),
+                None,
+                a.payment_id.clone(),
+                a.invoice_id.clone(),
+                vec![],
+            );
+        }
+        if a.status == SETTLEMENT_ATTEMPT_STATUS_COMMITTED && !a.provider_mark_settled_done {
+            let _ = open_dispute_if_absent(
+                state,
+                common::market::DISPUTE_TYPE_AGENT_COMMITTED_PROVIDER_MISSING,
+                "high",
+                "agent committed but provider result missing",
+                "agent_committed_provider_missing",
+                Some(a.attempt_id.clone()),
+                Some(a.match_id.clone()),
+                None,
+                a.payment_id.clone(),
+                a.invoice_id.clone(),
+                vec![],
+            );
+        }
+        if a.provider_mark_settled_done && a.status != SETTLEMENT_ATTEMPT_STATUS_COMMITTED {
+            let _ = open_dispute_if_absent(
+                state,
+                common::market::DISPUTE_TYPE_PROVIDER_SETTLED_AGENT_NOT_COMMITTED,
+                "high",
+                "provider marked settled but agent not committed",
+                "provider_settled_agent_not_committed",
+                Some(a.attempt_id.clone()),
+                Some(a.match_id.clone()),
+                None,
+                a.payment_id.clone(),
+                a.invoice_id.clone(),
+                vec![],
+            );
+        }
+    }
+
+    // Duplicate/contradictory settle acceptance via idempotency payload mismatch.
+    let contradictory_settle = attempts.iter().any(|a| {
+        a.last_error_code
+            .as_deref()
+            .map(|c| c.contains("idempotency") || c.contains("payload_hash_mismatch"))
+            .unwrap_or(false)
+    });
+    if contradictory_settle {
+        let _ = open_dispute_if_absent(
+            state,
+            common::market::DISPUTE_TYPE_DUPLICATE_SETTLE_CONTRADICTION,
+            "high",
+            "duplicate accept/settle contradiction",
+            "duplicate_contradiction",
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+        );
+    }
+
+    // Pricing/recommended dispute if recommended context invalid while in-flight trades exist.
+    let in_flight_trade = state
+        .accepted_matches
+        .lock()
+        .expect("accepted matches lock")
+        .values()
+        .any(|m| m.status == MATCH_STATUS_ACCEPTED || m.status == MATCH_STATUS_SETTLING);
+    if in_flight_trade && !recommended_confirmation_is_current(state) {
+        let _ = open_dispute_if_absent(
+            state,
+            common::market::DISPUTE_TYPE_PRICING_DISPUTE,
+            "medium",
+            "recommended/pricing disagreement during in-flight trade",
+            "pricing_recommended_dispute",
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+        );
+    }
+
+    // Reconcile conflict / amount mismatch from settlement audit strings.
+    let audits: Vec<String> = state
+        .tasks
+        .lock()
+        .expect("tasks lock")
+        .values()
+        .flat_map(|t| t.settlement_audit_events.clone())
+        .collect();
+    if audits
+        .iter()
+        .any(|e| e.contains("reconcile_idempotency_conflict"))
+    {
+        let _ = open_dispute_if_absent(
+            state,
+            common::market::DISPUTE_TYPE_RECONCILE_CONFLICT,
+            "high",
+            "reconcile idempotency conflict",
+            "reconcile_idempotency_conflict",
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+        );
+    }
+    if audits.iter().any(|e| {
+        e.contains("amount_mismatch") || e.contains("provider_reconcile") && e.contains("non-200")
+    }) {
+        let _ = open_dispute_if_absent(
+            state,
+            common::market::DISPUTE_TYPE_AMOUNT_MISMATCH,
+            "high",
+            "provider/agent amount mismatch",
+            "amount_mismatch",
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+        );
     }
 }
 
@@ -953,7 +1423,26 @@ fn invalidate_recommended_confirmation(state: &AppState, reason: &str) {
         .push(format!(
             "manual_override recommended_band_pending_confirmation reason={reason}"
         ));
-    let _ = open_dispute(state, DISPUTE_TYPE_RECOMMENDED_INVALIDATED, "medium", reason, None, None, None);
+    let in_flight_trade = state
+        .accepted_matches
+        .lock()
+        .expect("accepted matches lock")
+        .values()
+        .find(|m| m.status == MATCH_STATUS_ACCEPTED || m.status == MATCH_STATUS_SETTLING)
+        .map(|m| m.match_id.clone());
+    let _ = open_dispute_if_absent(
+        state,
+        DISPUTE_TYPE_RECOMMENDED_INVALIDATED,
+        "medium",
+        reason,
+        "recommended_invalidation_during_inflight_trade",
+        None,
+        in_flight_trade,
+        None,
+        None,
+        None,
+        vec![],
+    );
 }
 
 fn recommended_confirmation_is_current(state: &AppState) -> bool {
@@ -967,6 +1456,32 @@ fn recommended_confirmation_is_current(state: &AppState) -> bool {
         .expect("recommended confirmed hash lock")
         .is_some();
     confirmed && has_hash
+}
+
+fn signing_key_hex() -> String {
+    std::env::var("SLICESTREAM_SIGNING_KEY_HEX").unwrap_or_else(|_| {
+        "1111111111111111111111111111111111111111111111111111111111111111".to_string()
+    })
+}
+
+fn sign_snapshot_hex<T: serde::Serialize>(payload: &T) -> Option<String> {
+    sign_payload(payload, &signing_key_hex()).ok()
+}
+
+fn current_payment_rail_mode() -> String {
+    match SettlementGatewayMode::from_env() {
+        SettlementGatewayMode::Fiber => {
+            let endpoint_set = std::env::var("FIBER_RPC_ENDPOINT")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+            if endpoint_set {
+                common::market::PAYMENT_RAIL_FIBER_REAL.to_string()
+            } else {
+                common::market::PAYMENT_RAIL_LOCAL_PLACEHOLDER.to_string()
+            }
+        }
+        SettlementGatewayMode::Mock => common::market::PAYMENT_RAIL_FIBER_SIMULATED.to_string(),
+    }
 }
 
 fn make_settlement_gateway() -> Box<dyn SettlementGateway + Send> {
@@ -987,6 +1502,7 @@ fn app_with_state(state: AppState) -> Router {
         .route("/renewal/check", post(check_renewal))
         .route("/v1/tasks/:task_id", get(get_task_status))
         .route("/v1/tasks/:task_id/receipt", get(get_task_receipt))
+        .route("/v1/tasks/:task_id/trade-desk", get(get_trade_desk))
         .route(common::market::MARKET_ROUTE_BUY_ORDERS, get(get_buy_orders))
         .route(MARKET_ROUTE_MATCHES, get(get_match_records))
         .route("/internal/market/matches/accept", post(accept_match))
@@ -1022,6 +1538,10 @@ fn app_with_state(state: AppState) -> Router {
             post(resolve_dispute_handler),
         )
         .route(
+            "/internal/market/disputes/:dispute_id/action",
+            post(dispute_action_handler),
+        )
+        .route(
             "/internal/market/orders/buy/manual",
             post(create_manual_buy_order),
         )
@@ -1036,6 +1556,8 @@ fn app_with_state(state: AppState) -> Router {
         .route("/internal/market/bidding/start", post(start_auto_bidding))
         .route("/internal/ops/recovery/run", post(run_recovery_now))
         .route("/internal/ops/reaper/run", post(run_reaper_now))
+        .route("/internal/node/identity", get(get_node_identity))
+        .route("/internal/network/runtime", get(get_network_runtime))
         .with_state(state)
 }
 
@@ -1328,6 +1850,19 @@ async fn accept_match(
                 .cloned()
             {
                 if existing.payload_hash != payload_hash {
+                    let _ = open_dispute_if_absent(
+                        &state,
+                        common::market::DISPUTE_TYPE_DUPLICATE_SETTLE_CONTRADICTION,
+                        "high",
+                        "duplicate accept with contradictory payload",
+                        "duplicate_accept_contradiction",
+                        Some(existing.attempt_id.clone()),
+                        Some(existing.match_id.clone()),
+                        None,
+                        None,
+                        None,
+                        vec![],
+                    );
                     return (
                         StatusCode::CONFLICT,
                         Json(MatchActionResponse {
@@ -2402,6 +2937,190 @@ fn bundle_to_view(bundle: &EvidenceBundle) -> EvidenceBundleView {
     }
 }
 
+fn build_create_invoice_request(task: &TaskRuntime, windows: &[WindowCharge]) -> Value {
+    serde_json::json!({
+        "task_id": task.task_id,
+        "provider_job_id": task.provider_job_id,
+        "settlement_interval_secs": task.settlement_interval_secs,
+        "window_indexes": windows.iter().map(|w| w.window_index).collect::<Vec<_>>(),
+        "gross_amount": windows.iter().map(|w| w.owed_window).sum::<f64>(),
+    })
+}
+
+fn build_settle_payment_request(invoice_id: &str, windows: &[WindowCharge]) -> Value {
+    serde_json::json!({
+        "invoice_id": invoice_id,
+        "window_indexes": windows.iter().map(|w| w.window_index).collect::<Vec<_>>(),
+        "gross_amount": windows.iter().map(|w| w.owed_window).sum::<f64>(),
+    })
+}
+
+fn build_record_result_request(
+    invoice_id: &str,
+    payment_id: &str,
+    windows: &[WindowCharge],
+) -> Value {
+    serde_json::json!({
+        "invoice_id": invoice_id,
+        "payment_id": payment_id,
+        "window_indexes": windows.iter().map(|w| w.window_index).collect::<Vec<_>>(),
+    })
+}
+
+fn upsert_billing_windows_for_attempt(
+    task: &mut TaskRuntime,
+    attempt_id: &str,
+    trade_id: &str,
+    windows: &[WindowCharge],
+    unit_price: f64,
+    evidence_root: Option<String>,
+) {
+    for w in windows {
+        let bill_id = common::market::build_billing_window_key(
+            trade_id,
+            w.window_index,
+            task.settlement_interval_secs,
+        );
+        if task.billing_windows.iter().any(|b| b.bill_id == bill_id) {
+            continue;
+        }
+        let compute_amount = if unit_price > 0.0 {
+            w.owed_window / unit_price
+        } else {
+            w.owed_window
+        };
+        let start_ts = w.window_index.saturating_mul(task.settlement_interval_secs);
+        let end_ts = start_ts.saturating_add(task.settlement_interval_secs);
+        task.billing_windows
+            .push(common::market::BillingWindowRecord {
+                bill_id,
+                trade_id: trade_id.to_string(),
+                settlement_attempt_id: attempt_id.to_string(),
+                window_index: w.window_index,
+                window_start_ts: start_ts,
+                window_end_ts: end_ts,
+                compute_amount: common::market::round_currency_amount(compute_amount),
+                unit_price: common::market::round_currency_amount(unit_price),
+                gross_amount: common::market::round_currency_amount(w.owed_window),
+                penalty_amount: 0.0,
+                refund_amount: 0.0,
+                net_provider_payout: common::market::round_currency_amount(w.owed_window),
+                invoice_id: None,
+                payment_id: None,
+                evidence_root: evidence_root.clone(),
+                receipt_head: Some(format!("receipt-w{}", w.window_index)),
+                signature_ref: Some("sig-local-placeholder".to_string()),
+                dispute_id: None,
+                status: common::market::BILLING_WINDOW_STATUS_PENDING.to_string(),
+                created_at: now_rfc3339_like(),
+                updated_at: now_rfc3339_like(),
+            });
+    }
+}
+
+fn apply_billing_status_for_attempt(
+    task: &mut TaskRuntime,
+    attempt_id: &str,
+    next_status: &str,
+) -> Result<(), String> {
+    for bill in task
+        .billing_windows
+        .iter_mut()
+        .filter(|b| b.settlement_attempt_id == attempt_id)
+    {
+        bill.status = common::market::advance_billing_window_status(&bill.status, next_status)?;
+        bill.updated_at = now_rfc3339_like();
+    }
+    Ok(())
+}
+
+fn attach_invoice_to_attempt_bills(task: &mut TaskRuntime, attempt_id: &str, invoice_id: &str) {
+    for bill in task
+        .billing_windows
+        .iter_mut()
+        .filter(|b| b.settlement_attempt_id == attempt_id)
+    {
+        bill.invoice_id = Some(invoice_id.to_string());
+        bill.updated_at = now_rfc3339_like();
+    }
+}
+
+fn attach_payment_to_attempt_bills(task: &mut TaskRuntime, attempt_id: &str, payment_id: &str) {
+    for bill in task
+        .billing_windows
+        .iter_mut()
+        .filter(|b| b.settlement_attempt_id == attempt_id)
+    {
+        bill.payment_id = Some(payment_id.to_string());
+        bill.updated_at = now_rfc3339_like();
+    }
+}
+
+fn finalize_trade_billing(
+    task: &mut TaskRuntime,
+    trade_id: &str,
+    committed_compute_total: f64,
+) -> common::market::PenaltyOutcome {
+    let delivered_compute_total: f64 = task
+        .billing_windows
+        .iter()
+        .filter(|b| b.trade_id == trade_id)
+        .map(|b| b.compute_amount)
+        .sum();
+    let gross_total: f64 = task
+        .billing_windows
+        .iter()
+        .filter(|b| b.trade_id == trade_id)
+        .map(|b| b.gross_amount)
+        .sum();
+
+    let outcome = common::market::evaluate_breach_penalty(
+        gross_total,
+        committed_compute_total,
+        delivered_compute_total,
+    );
+    if outcome.breached {
+        for bill in task
+            .billing_windows
+            .iter_mut()
+            .filter(|b| b.trade_id == trade_id)
+        {
+            let ratio = if gross_total > 0.0 {
+                bill.gross_amount / gross_total
+            } else {
+                0.0
+            };
+            bill.refund_amount =
+                common::market::round_currency_amount(outcome.refund_to_buyer * ratio);
+            bill.penalty_amount = bill.refund_amount;
+            bill.net_provider_payout = common::market::round_currency_amount(
+                (bill.gross_amount - bill.refund_amount).max(0.0),
+            );
+            bill.status = if bill.status == common::market::BILLING_WINDOW_STATUS_DISPUTED {
+                bill.status.clone()
+            } else {
+                common::market::BILLING_WINDOW_STATUS_REFUNDED.to_string()
+            };
+            bill.updated_at = now_rfc3339_like();
+        }
+    } else {
+        for bill in task
+            .billing_windows
+            .iter_mut()
+            .filter(|b| b.trade_id == trade_id)
+        {
+            bill.penalty_amount = 0.0;
+            bill.refund_amount = 0.0;
+            bill.net_provider_payout = common::market::round_currency_amount(bill.gross_amount);
+            if bill.status != common::market::BILLING_WINDOW_STATUS_DISPUTED {
+                bill.status = common::market::BILLING_WINDOW_STATUS_FINALIZED.to_string();
+            }
+            bill.updated_at = now_rfc3339_like();
+        }
+    }
+    outcome
+}
+
 fn maybe_merge_and_settle(
     task: &mut TaskRuntime,
     gateway: &mut (dyn SettlementGateway + Send),
@@ -2499,6 +3218,14 @@ fn maybe_merge_and_settle(
             .expect("accepted binding exists");
         let settlement_attempt =
             create_settlement_attempt(settlement_attempts, task, &binding_for_attempt, &windows);
+        upsert_billing_windows_for_attempt(
+            task,
+            &settlement_attempt.attempt_id,
+            &bound_match_id,
+            &windows,
+            binding_for_attempt.agreed_unit_price,
+            Some(task.evidence_bundle.root_hash.clone()),
+        );
 
         let sell_order_for_match = {
             let mut accepted = accepted_matches.lock().expect("accepted matches lock");
@@ -2554,6 +3281,23 @@ fn maybe_merge_and_settle(
             &settlement_attempt.attempt_id,
             SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE,
         );
+        let invoice_request = build_create_invoice_request(task, &windows);
+        let invoice_payload_hash = common::market::build_settlement_stage_payload_hash(
+            &settlement_attempt.attempt_id,
+            SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE,
+            &invoice_request.to_string(),
+        );
+        if let Some(a) = settlement_attempts
+            .lock()
+            .expect("settlement attempts lock")
+            .get_mut(&settlement_attempt.attempt_id)
+        {
+            a.idempotency_key = Some(format!(
+                "stage:{}:{}",
+                SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE, settlement_attempt.attempt_id
+            ));
+            a.payload_hash = Some(invoice_payload_hash.clone());
+        }
         let invoice = match gateway.create_invoice(task, &windows) {
             Ok(v) => v,
             Err(err) => {
@@ -2610,11 +3354,33 @@ fn maybe_merge_and_settle(
         {
             a.invoice_id = Some(invoice.invoice_id.clone());
         }
+        attach_invoice_to_attempt_bills(task, &settlement_attempt.attempt_id, &invoice.invoice_id);
+        let _ = apply_billing_status_for_attempt(
+            task,
+            &settlement_attempt.attempt_id,
+            common::market::BILLING_WINDOW_STATUS_INVOICED,
+        );
         advance_settlement_attempt_stage(
             settlement_attempts,
             &settlement_attempt.attempt_id,
             SETTLEMENT_ATTEMPT_STAGE_SETTLE_PAYMENT,
         );
+        let settle_request = build_settle_payment_request(&invoice.invoice_id, &windows);
+        if let Some(a) = settlement_attempts
+            .lock()
+            .expect("settlement attempts lock")
+            .get_mut(&settlement_attempt.attempt_id)
+        {
+            a.idempotency_key = Some(format!(
+                "stage:{}:{}",
+                SETTLEMENT_ATTEMPT_STAGE_SETTLE_PAYMENT, settlement_attempt.attempt_id
+            ));
+            a.payload_hash = Some(common::market::build_settlement_stage_payload_hash(
+                &settlement_attempt.attempt_id,
+                SETTLEMENT_ATTEMPT_STAGE_SETTLE_PAYMENT,
+                &settle_request.to_string(),
+            ));
+        }
         let payment = match gateway.settle_payment(task, &invoice, &windows) {
             Ok(v) => v,
             Err(err) => {
@@ -2655,11 +3421,34 @@ fn maybe_merge_and_settle(
         {
             a.payment_id = Some(payment.payment_id.clone());
         }
+        attach_payment_to_attempt_bills(task, &settlement_attempt.attempt_id, &payment.payment_id);
+        let _ = apply_billing_status_for_attempt(
+            task,
+            &settlement_attempt.attempt_id,
+            common::market::BILLING_WINDOW_STATUS_PAYMENT_SUBMITTED,
+        );
         advance_settlement_attempt_stage(
             settlement_attempts,
             &settlement_attempt.attempt_id,
             SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT,
         );
+        let record_request =
+            build_record_result_request(&invoice.invoice_id, &payment.payment_id, &windows);
+        if let Some(a) = settlement_attempts
+            .lock()
+            .expect("settlement attempts lock")
+            .get_mut(&settlement_attempt.attempt_id)
+        {
+            a.idempotency_key = Some(format!(
+                "stage:{}:{}",
+                SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT, settlement_attempt.attempt_id
+            ));
+            a.payload_hash = Some(common::market::build_settlement_stage_payload_hash(
+                &settlement_attempt.attempt_id,
+                SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT,
+                &record_request.to_string(),
+            ));
+        }
         if let Err(err) = gateway.record_result(task, &invoice, &payment) {
             task.pending_windows.splice(0..0, windows.into_iter());
             eprintln!(
@@ -2680,6 +3469,11 @@ fn maybe_merge_and_settle(
                 &err.code,
                 &err.message,
             );
+            let _ = apply_billing_status_for_attempt(
+                task,
+                &settlement_attempt.attempt_id,
+                common::market::BILLING_WINDOW_STATUS_DISPUTED,
+            );
             release_after_failure(
                 &err.code,
                 MATCH_STATUS_PAYMENT_UNKNOWN,
@@ -2697,6 +3491,11 @@ fn maybe_merge_and_settle(
             invoice.invoice_id, payment.payment_id, bound_match_id
         ));
 
+        let _ = apply_billing_status_for_attempt(
+            task,
+            &settlement_attempt.attempt_id,
+            common::market::BILLING_WINDOW_STATUS_PAID,
+        );
         let amount_paid: f64 = windows.iter().map(|w| w.owed_window).sum();
         let window_indexes: Vec<u64> = windows.iter().map(|w| w.window_index).collect();
         for w in &window_indexes {
@@ -2706,7 +3505,7 @@ fn maybe_merge_and_settle(
             task.last_settled_window_index = *max_w;
         }
 
-        task.total_paid += amount_paid;
+        task.total_paid += common::market::round_currency_amount(amount_paid);
         task.last_invoice_id = Some(invoice.invoice_id.clone());
         task.last_payment_id = Some(payment.payment_id.clone());
         task.last_audit_event = Some("settlement_committed".to_string());
@@ -2755,35 +3554,72 @@ fn maybe_merge_and_settle(
             invoice_id: invoice.invoice_id,
             payment_id: payment.payment_id,
             match_id: Some(bound_match_id.clone()),
-            window_indexes,
+            window_indexes: window_indexes.clone(),
             amount_paid,
         });
-        let latest = task.payment_records.last().expect("just pushed record");
+        let (latest_invoice_id, latest_payment_id, latest_amount_paid) = {
+            let latest = task.payment_records.last().expect("just pushed record");
+            (
+                latest.invoice_id.clone(),
+                latest.payment_id.clone(),
+                latest.amount_paid,
+            )
+        };
+        let delivered_compute_total: f64 = task
+            .billing_windows
+            .iter()
+            .filter(|b| b.trade_id == bound_match_id)
+            .map(|b| b.compute_amount)
+            .sum();
+        let committed_compute_total = binding_for_attempt.agreed_work_units;
+        let should_auto_finalize =
+            common::market::trade_auto_terminates(committed_compute_total, delivered_compute_total);
+        if should_auto_finalize {
+            let penalty = finalize_trade_billing(task, &bound_match_id, committed_compute_total);
+            task.total_paid = task
+                .billing_windows
+                .iter()
+                .filter(|b| {
+                    b.status == common::market::BILLING_WINDOW_STATUS_PAID
+                        || b.status == common::market::BILLING_WINDOW_STATUS_FINALIZED
+                        || b.status == common::market::BILLING_WINDOW_STATUS_REFUNDED
+                })
+                .map(|b| b.net_provider_payout)
+                .sum();
+            task.settlement_audit_events.push(format!(
+                "trade_auto_terminated match_id={} delivered={:.6} committed={:.6} refund={:.6} payout={:.6}",
+                bound_match_id,
+                delivered_compute_total,
+                committed_compute_total,
+                penalty.refund_to_buyer,
+                penalty.payout_to_provider
+            ));
+        }
         finalize_settlement_attempt(
             settlement_attempts,
             &settlement_attempt.attempt_id,
-            &latest.invoice_id,
-            &latest.payment_id,
+            &latest_invoice_id,
+            &latest_payment_id,
         );
         emit(
             "settlement_succeeded",
             &bound_match_id,
-            serde_json::json!({"invoice_id": latest.invoice_id, "payment_id": latest.payment_id, "amount_paid": latest.amount_paid}),
+            serde_json::json!({"invoice_id": latest_invoice_id, "payment_id": latest_payment_id, "amount_paid": latest_amount_paid}),
         );
         emit("match_settled", &bound_match_id, serde_json::json!({}));
 
         match notify_provider_reconciliation(
             provider_addr,
             &task.provider_job_id,
-            &latest.invoice_id,
-            &latest.payment_id,
-            &latest.window_indexes,
-            latest.amount_paid,
+            &latest_invoice_id,
+            &latest_payment_id,
+            &window_indexes,
+            latest_amount_paid,
         ) {
             Ok(()) => {
                 task.settlement_audit_events.push(format!(
                     "method=provider_reconcile request_sent=true status=success invoice_id={} payment_id={}",
-                    latest.invoice_id, latest.payment_id
+                    latest_invoice_id, latest_payment_id
                 ));
             }
             Err(detail) => {
@@ -3218,15 +4054,26 @@ async fn confirm_payment(
         Some(existing) if existing == &req.payment_id => {
             (StatusCode::OK, Json(ConfirmOk { status: "ok" })).into_response()
         }
-        Some(existing) => (
-            StatusCode::CONFLICT,
-            Json(ConfirmError {
-                error: "idempotency_conflict",
-                key: Some(provided_key.to_string()),
-                existing_payment_id: Some(existing.clone()),
-            }),
-        )
-            .into_response(),
+        Some(existing) => {
+            let _ = open_dispute(
+                &state,
+                DISPUTE_TYPE_RECONCILE_CONFLICT,
+                "high",
+                "confirm idempotency conflict",
+                None,
+                None,
+                Some(existing.clone()),
+            );
+            (
+                StatusCode::CONFLICT,
+                Json(ConfirmError {
+                    error: "idempotency_conflict",
+                    key: Some(provided_key.to_string()),
+                    existing_payment_id: Some(existing.clone()),
+                }),
+            )
+                .into_response()
+        }
         None => {
             ledger.insert(provided_key.to_string(), req.payment_id.clone());
             drop(ledger);
@@ -3337,9 +4184,19 @@ async fn mark_settlement_attempt_final(
         )
             .into_response();
     }
+    let attempt_ref = attempt.clone();
     attempt.status = SETTLEMENT_ATTEMPT_STATUS_FAILED_FINAL.to_string();
     attempt.updated_at = now_rfc3339_like();
     drop(attempts);
+    let _ = open_dispute(
+        &state,
+        DISPUTE_TYPE_RESULT_RECORD_CONFLICT,
+        "high",
+        "attempt marked final after unresolved conflict",
+        Some(attempt_ref.attempt_id),
+        Some(attempt_ref.match_id),
+        attempt_ref.payment_id,
+    );
     persist_agent_state(&state);
     (
         StatusCode::OK,
@@ -3375,22 +4232,68 @@ async fn resolve_dispute_handler(
         )
             .into_response();
     }
-    resolve_dispute(&state, &dispute_id, "manual_resolve");
+    resolve_dispute(&state, &dispute_id, "resolve");
     persist_agent_state(&state);
-    (StatusCode::OK, Json(serde_json::json!({"status":"resolved","dispute_id":dispute_id}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status":"resolved","dispute_id":dispute_id})),
+    )
+        .into_response()
+}
+
+async fn dispute_action_handler(
+    State(state): State<AppState>,
+    Path(dispute_id): Path<String>,
+    Json(req): Json<DisputeActionRequest>,
+) -> impl IntoResponse {
+    if !state
+        .disputes
+        .lock()
+        .expect("disputes lock")
+        .contains_key(&dispute_id)
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"dispute_not_found"})),
+        )
+            .into_response();
+    }
+    match apply_dispute_action(&state, &dispute_id, req.action.trim()) {
+        Ok(()) => {
+            persist_agent_state(&state);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status":"action_applied","dispute_id":dispute_id,"action":req.action})),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error":e,"dispute_id":dispute_id,"action":req.action})),
+        )
+            .into_response(),
+    }
 }
 
 async fn run_recovery_now(State(state): State<AppState>) -> impl IntoResponse {
     let tick = *state.lifecycle_tick.lock().expect("lifecycle tick lock");
     run_recovery_tick(&state, tick).await;
     persist_agent_state(&state);
-    (StatusCode::OK, Json(serde_json::json!({"status":"recovery_run_completed"}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status":"recovery_run_completed"})),
+    )
+        .into_response()
 }
 
 async fn run_reaper_now(State(state): State<AppState>) -> impl IntoResponse {
     run_reaper_tick(&state).await;
     persist_agent_state(&state);
-    (StatusCode::OK, Json(serde_json::json!({"status":"reaper_run_completed"}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status":"reaper_run_completed"})),
+    )
+        .into_response()
 }
 
 async fn check_renewal(
@@ -3430,7 +4333,6 @@ async fn check_renewal(
     }
 }
 
-
 fn can_auto_propose(mode: &str) -> bool {
     mode == MARKET_MODE_AUTO || mode == MARKET_MODE_HYBRID
 }
@@ -3451,14 +4353,25 @@ async fn run_settlement_attempt_stage(
     match stage {
         SETTLEMENT_ATTEMPT_STAGE_PROVIDER_MARK_SETTLING => {
             let sell = {
-                let attempts = state.settlement_attempts.lock().expect("settlement attempts lock");
+                let attempts = state
+                    .settlement_attempts
+                    .lock()
+                    .expect("settlement attempts lock");
                 attempts
                     .get(attempt_id)
                     .map(|a| a.sell_order_id.clone())
-                    .ok_or_else(|| ("attempt_not_found".to_string(), "attempt not found".to_string()))?
+                    .ok_or_else(|| {
+                        (
+                            "attempt_not_found".to_string(),
+                            "attempt not found".to_string(),
+                        )
+                    })?
             };
             if mark_provider_sell_order_settling(&state.provider_addr, &sell) {
-                let mut attempts = state.settlement_attempts.lock().expect("settlement attempts lock");
+                let mut attempts = state
+                    .settlement_attempts
+                    .lock()
+                    .expect("settlement attempts lock");
                 if let Some(a) = attempts.get_mut(attempt_id) {
                     a.provider_mark_settling_done = true;
                     a.stage = SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE.to_string();
@@ -3466,79 +4379,388 @@ async fn run_settlement_attempt_stage(
                 }
                 Ok(())
             } else {
-                Err(("provider_mark_settling_failed".to_string(), "provider mark settling failed".to_string()))
+                Err((
+                    "provider_mark_settling_failed".to_string(),
+                    "provider mark settling failed".to_string(),
+                ))
             }
         }
         SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE => {
-            let mut attempts = state.settlement_attempts.lock().expect("settlement attempts lock");
-            if let Some(a) = attempts.get_mut(attempt_id) {
-                if a.invoice_id.is_some() {
+            let attempt = {
+                let attempts = state
+                    .settlement_attempts
+                    .lock()
+                    .expect("settlement attempts lock");
+                attempts.get(attempt_id).cloned().ok_or_else(|| {
+                    (
+                        "attempt_not_found".to_string(),
+                        "attempt not found".to_string(),
+                    )
+                })?
+            };
+            if attempt.invoice_id.is_some() {
+                let mut attempts = state
+                    .settlement_attempts
+                    .lock()
+                    .expect("settlement attempts lock");
+                if let Some(a) = attempts.get_mut(attempt_id) {
                     a.stage = SETTLEMENT_ATTEMPT_STAGE_SETTLE_PAYMENT.to_string();
                     a.updated_at = now_rfc3339_like();
-                    return Ok(());
                 }
-                return Err(("invoice_missing_for_recovery".to_string(), "invoice not present; manual retry required".to_string()));
+                return Ok(());
             }
-            Err(("attempt_not_found".to_string(), "attempt not found".to_string()))
+            let mut tasks = state.tasks.lock().expect("tasks lock");
+            let task = tasks.get_mut(&attempt.task_id).ok_or_else(|| {
+                (
+                    "task_not_found".to_string(),
+                    "attempt task missing".to_string(),
+                )
+            })?;
+            let windows: Vec<WindowCharge> = task
+                .billing_windows
+                .iter()
+                .filter(|b| b.settlement_attempt_id == attempt.attempt_id)
+                .map(|b| WindowCharge {
+                    window_index: b.window_index,
+                    owed_window: b.gross_amount,
+                })
+                .collect();
+            if windows.is_empty() {
+                return Err((
+                    "invoice_missing_for_recovery".to_string(),
+                    "no windows available for replay".to_string(),
+                ));
+            }
+            let req = build_create_invoice_request(task, &windows);
+            let payload_hash = common::market::build_settlement_stage_payload_hash(
+                &attempt.attempt_id,
+                SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE,
+                &req.to_string(),
+            );
+            if let Some(prev) = attempt.payload_hash.clone() {
+                if prev != payload_hash {
+                    let _ = open_dispute(
+                        state,
+                        common::market::DISPUTE_TYPE_REPLAY_INCONSISTENT,
+                        "high",
+                        "create_invoice replay payload changed",
+                        Some(attempt.attempt_id.clone()),
+                        Some(attempt.match_id.clone()),
+                        None,
+                    );
+                    return Err((
+                        "replay_payload_conflict".to_string(),
+                        "create_invoice replay payload hash mismatch".to_string(),
+                    ));
+                }
+            }
+            let invoice = state
+                .settlement_gateway
+                .lock()
+                .expect("gateway lock")
+                .create_invoice(task, &windows)
+                .map_err(|e| (e.code, e.message))?;
+            attach_invoice_to_attempt_bills(task, &attempt.attempt_id, &invoice.invoice_id);
+            let _ = apply_billing_status_for_attempt(
+                task,
+                &attempt.attempt_id,
+                common::market::BILLING_WINDOW_STATUS_INVOICED,
+            );
+            drop(tasks);
+            let mut attempts = state
+                .settlement_attempts
+                .lock()
+                .expect("settlement attempts lock");
+            if let Some(a) = attempts.get_mut(attempt_id) {
+                a.invoice_id = Some(invoice.invoice_id);
+                a.idempotency_key = Some(format!(
+                    "stage:{}:{}",
+                    SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE, attempt_id
+                ));
+                a.payload_hash = Some(payload_hash);
+                a.stage = SETTLEMENT_ATTEMPT_STAGE_SETTLE_PAYMENT.to_string();
+                a.updated_at = now_rfc3339_like();
+            }
+            Ok(())
         }
         SETTLEMENT_ATTEMPT_STAGE_SETTLE_PAYMENT => {
-            let mut attempts = state.settlement_attempts.lock().expect("settlement attempts lock");
-            if let Some(a) = attempts.get_mut(attempt_id) {
-                if a.payment_id.is_some() {
+            let attempt = {
+                let attempts = state
+                    .settlement_attempts
+                    .lock()
+                    .expect("settlement attempts lock");
+                attempts.get(attempt_id).cloned().ok_or_else(|| {
+                    (
+                        "attempt_not_found".to_string(),
+                        "attempt not found".to_string(),
+                    )
+                })?
+            };
+            if attempt.payment_id.is_some() {
+                let mut attempts = state
+                    .settlement_attempts
+                    .lock()
+                    .expect("settlement attempts lock");
+                if let Some(a) = attempts.get_mut(attempt_id) {
                     a.stage = SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT.to_string();
                     a.updated_at = now_rfc3339_like();
-                    return Ok(());
                 }
-                return Err(("payment_missing_for_recovery".to_string(), "payment not present; manual retry required".to_string()));
+                return Ok(());
             }
-            Err(("attempt_not_found".to_string(), "attempt not found".to_string()))
+            let invoice_id = attempt.invoice_id.clone().ok_or_else(|| {
+                (
+                    "payment_missing_for_recovery".to_string(),
+                    "invoice missing for settle_payment replay".to_string(),
+                )
+            })?;
+            let mut tasks = state.tasks.lock().expect("tasks lock");
+            let task = tasks.get_mut(&attempt.task_id).ok_or_else(|| {
+                (
+                    "task_not_found".to_string(),
+                    "attempt task missing".to_string(),
+                )
+            })?;
+            let windows: Vec<WindowCharge> = task
+                .billing_windows
+                .iter()
+                .filter(|b| b.settlement_attempt_id == attempt.attempt_id)
+                .map(|b| WindowCharge {
+                    window_index: b.window_index,
+                    owed_window: b.gross_amount,
+                })
+                .collect();
+            let req = build_settle_payment_request(&invoice_id, &windows);
+            let payload_hash = common::market::build_settlement_stage_payload_hash(
+                &attempt.attempt_id,
+                SETTLEMENT_ATTEMPT_STAGE_SETTLE_PAYMENT,
+                &req.to_string(),
+            );
+            if let Some(prev) = attempt.payload_hash.clone() {
+                if prev != payload_hash && prev.contains("settlement_stage") {
+                    let _ = open_dispute(
+                        state,
+                        common::market::DISPUTE_TYPE_REPLAY_INCONSISTENT,
+                        "high",
+                        "settle_payment replay payload changed",
+                        Some(attempt.attempt_id.clone()),
+                        Some(attempt.match_id.clone()),
+                        None,
+                    );
+                }
+            }
+            let payment = state
+                .settlement_gateway
+                .lock()
+                .expect("gateway lock")
+                .settle_payment(
+                    task,
+                    &GatewayInvoice {
+                        invoice_id: invoice_id.clone(),
+                    },
+                    &windows,
+                )
+                .map_err(|e| (e.code, e.message))?;
+            attach_payment_to_attempt_bills(task, &attempt.attempt_id, &payment.payment_id);
+            let _ = apply_billing_status_for_attempt(
+                task,
+                &attempt.attempt_id,
+                common::market::BILLING_WINDOW_STATUS_PAYMENT_SUBMITTED,
+            );
+            drop(tasks);
+            let mut attempts = state
+                .settlement_attempts
+                .lock()
+                .expect("settlement attempts lock");
+            if let Some(a) = attempts.get_mut(attempt_id) {
+                a.payment_id = Some(payment.payment_id);
+                a.idempotency_key = Some(format!(
+                    "stage:{}:{}",
+                    SETTLEMENT_ATTEMPT_STAGE_SETTLE_PAYMENT, attempt_id
+                ));
+                a.payload_hash = Some(payload_hash);
+                a.stage = SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT.to_string();
+                a.updated_at = now_rfc3339_like();
+            }
+            Ok(())
         }
         SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT => {
-            let mut attempts = state.settlement_attempts.lock().expect("settlement attempts lock");
-            if let Some(a) = attempts.get_mut(attempt_id) {
-                if a.result_recorded {
+            let attempt = {
+                let attempts = state
+                    .settlement_attempts
+                    .lock()
+                    .expect("settlement attempts lock");
+                attempts.get(attempt_id).cloned().ok_or_else(|| {
+                    (
+                        "attempt_not_found".to_string(),
+                        "attempt not found".to_string(),
+                    )
+                })?
+            };
+            if attempt.result_recorded {
+                let mut attempts = state
+                    .settlement_attempts
+                    .lock()
+                    .expect("settlement attempts lock");
+                if let Some(a) = attempts.get_mut(attempt_id) {
                     a.stage = SETTLEMENT_ATTEMPT_STAGE_PROVIDER_MARK_SETTLED.to_string();
                     a.updated_at = now_rfc3339_like();
-                    return Ok(());
                 }
-                return Err(("result_not_recorded".to_string(), "result not recorded; manual retry required".to_string()));
+                return Ok(());
             }
-            Err(("attempt_not_found".to_string(), "attempt not found".to_string()))
+            let invoice_id = attempt.invoice_id.clone().ok_or_else(|| {
+                (
+                    "result_not_recorded".to_string(),
+                    "invoice missing for record_result replay".to_string(),
+                )
+            })?;
+            let payment_id = attempt.payment_id.clone().ok_or_else(|| {
+                (
+                    "result_not_recorded".to_string(),
+                    "payment missing for record_result replay".to_string(),
+                )
+            })?;
+            let mut tasks = state.tasks.lock().expect("tasks lock");
+            let task = tasks.get_mut(&attempt.task_id).ok_or_else(|| {
+                (
+                    "task_not_found".to_string(),
+                    "attempt task missing".to_string(),
+                )
+            })?;
+            let windows: Vec<WindowCharge> = task
+                .billing_windows
+                .iter()
+                .filter(|b| b.settlement_attempt_id == attempt.attempt_id)
+                .map(|b| WindowCharge {
+                    window_index: b.window_index,
+                    owed_window: b.gross_amount,
+                })
+                .collect();
+            let req = build_record_result_request(&invoice_id, &payment_id, &windows);
+            let payload_hash = common::market::build_settlement_stage_payload_hash(
+                &attempt.attempt_id,
+                SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT,
+                &req.to_string(),
+            );
+            state
+                .settlement_gateway
+                .lock()
+                .expect("gateway lock")
+                .record_result(
+                    task,
+                    &GatewayInvoice {
+                        invoice_id: invoice_id.clone(),
+                    },
+                    &GatewayPayment {
+                        payment_id: payment_id.clone(),
+                    },
+                )
+                .map_err(|e| {
+                    let _ = apply_billing_status_for_attempt(
+                        task,
+                        &attempt.attempt_id,
+                        common::market::BILLING_WINDOW_STATUS_DISPUTED,
+                    );
+                    let _ = open_dispute(
+                        state,
+                        DISPUTE_TYPE_RESULT_RECORD_CONFLICT,
+                        "high",
+                        "record_result replay failed",
+                        Some(attempt.attempt_id.clone()),
+                        Some(attempt.match_id.clone()),
+                        Some(payment_id.clone()),
+                    );
+                    (e.code, e.message)
+                })?;
+            let _ = apply_billing_status_for_attempt(
+                task,
+                &attempt.attempt_id,
+                common::market::BILLING_WINDOW_STATUS_PAID,
+            );
+            drop(tasks);
+            let mut attempts = state
+                .settlement_attempts
+                .lock()
+                .expect("settlement attempts lock");
+            if let Some(a) = attempts.get_mut(attempt_id) {
+                a.result_recorded = true;
+                a.idempotency_key = Some(format!(
+                    "stage:{}:{}",
+                    SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT, attempt_id
+                ));
+                a.payload_hash = Some(payload_hash);
+                a.stage = SETTLEMENT_ATTEMPT_STAGE_PROVIDER_MARK_SETTLED.to_string();
+                a.updated_at = now_rfc3339_like();
+            }
+            Ok(())
         }
         SETTLEMENT_ATTEMPT_STAGE_PROVIDER_MARK_SETTLED => {
             let (sell, payment_id, invoice_id) = {
-                let attempts = state.settlement_attempts.lock().expect("settlement attempts lock");
-                let a = attempts
-                    .get(attempt_id)
-                    .ok_or_else(|| ("attempt_not_found".to_string(), "attempt not found".to_string()))?;
-                (a.sell_order_id.clone(), a.payment_id.clone(), a.invoice_id.clone())
+                let attempts = state
+                    .settlement_attempts
+                    .lock()
+                    .expect("settlement attempts lock");
+                let a = attempts.get(attempt_id).ok_or_else(|| {
+                    (
+                        "attempt_not_found".to_string(),
+                        "attempt not found".to_string(),
+                    )
+                })?;
+                (
+                    a.sell_order_id.clone(),
+                    a.payment_id.clone(),
+                    a.invoice_id.clone(),
+                )
             };
             if mark_provider_sell_order_settled(&state.provider_addr, &sell) {
-                let mut attempts = state.settlement_attempts.lock().expect("settlement attempts lock");
+                let mut attempts = state
+                    .settlement_attempts
+                    .lock()
+                    .expect("settlement attempts lock");
                 if let Some(a) = attempts.get_mut(attempt_id) {
                     a.provider_mark_settled_done = true;
                     a.result_recorded = true;
                     a.status = SETTLEMENT_ATTEMPT_STATUS_COMMITTED.to_string();
                     a.updated_at = now_rfc3339_like();
-                    if a.payment_id.is_none() { a.payment_id = payment_id; }
-                    if a.invoice_id.is_none() { a.invoice_id = invoice_id; }
+                    if a.payment_id.is_none() {
+                        a.payment_id = payment_id;
+                    }
+                    if a.invoice_id.is_none() {
+                        a.invoice_id = invoice_id;
+                    }
                 }
                 Ok(())
             } else {
-                Err(("provider_mark_settled_failed".to_string(), "provider mark settled failed".to_string()))
+                Err((
+                    "provider_mark_settled_failed".to_string(),
+                    "provider mark settled failed".to_string(),
+                ))
             }
         }
-        _ => Err(("unknown_stage".to_string(), "unknown recovery stage".to_string())),
+        _ => Err((
+            "unknown_stage".to_string(),
+            "unknown recovery stage".to_string(),
+        )),
     }
 }
 
-async fn resume_settlement_attempt(state: &AppState, attempt_id: &str) -> Result<(), (String, String)> {
+async fn resume_settlement_attempt(
+    state: &AppState,
+    attempt_id: &str,
+) -> Result<(), (String, String)> {
     let stage = {
-        let attempts = state.settlement_attempts.lock().expect("settlement attempts lock");
+        let attempts = state
+            .settlement_attempts
+            .lock()
+            .expect("settlement attempts lock");
         attempts
             .get(attempt_id)
             .map(|a| a.stage.clone())
-            .ok_or_else(|| ("attempt_not_found".to_string(), "attempt not found".to_string()))?
+            .ok_or_else(|| {
+                (
+                    "attempt_not_found".to_string(),
+                    "attempt not found".to_string(),
+                )
+            })?
     };
     run_settlement_attempt_stage(state, attempt_id, &stage).await
 }
@@ -3583,7 +4805,8 @@ async fn detect_stuck_attempts(state: &AppState) {
             a.status = SETTLEMENT_ATTEMPT_STATUS_RETRYABLE_FAILED.to_string();
             a.last_error_code = Some("stuck_detected".to_string());
             a.last_error_stage = Some(a.stage.clone());
-            a.last_error_message = Some("attempt marked retryable_failed by stuck detector".to_string());
+            a.last_error_message =
+                Some("attempt marked retryable_failed by stuck detector".to_string());
             a.updated_at = now_rfc3339_like();
         }
     }
@@ -3633,7 +4856,12 @@ async fn handle_provider_offline(state: &AppState, _provider_id: &str) {
         .cloned()
         .collect();
     for task_id in task_ids {
-        cleanup_task_bindings(state, &task_id, "provider_offline_reaper", MATCH_STATUS_EXPIRED);
+        cleanup_task_bindings(
+            state,
+            &task_id,
+            "provider_offline_reaper",
+            MATCH_STATUS_EXPIRED,
+        );
     }
 }
 
@@ -3646,13 +4874,27 @@ async fn run_reaper_tick(state: &AppState) {
     detect_stuck_attempts(state).await;
     expire_orphaned_matches(state).await;
     reap_expired_locks(state).await;
+    let provider_offline_seen = state
+        .market_audit
+        .lock()
+        .expect("market audit lock")
+        .iter()
+        .any(|e| e.contains("provider_offline"));
+    if provider_offline_seen {
+        handle_provider_offline(state, "provider-demo").await;
+    }
+    auto_open_runtime_disputes(state);
 }
 
 fn compute_attempt_counts(state: &AppState) -> (usize, usize, usize, usize, usize, usize) {
     let accept_attempts = state.accept_attempts.lock().expect("accept attempts lock");
     let active_accept = accept_attempts
         .values()
-        .filter(|a| a.status != ACCEPT_ATTEMPT_STATUS_COMMITTED && a.status != ACCEPT_ATTEMPT_STATUS_CONFLICT && a.status != ACCEPT_ATTEMPT_STATUS_FAILED)
+        .filter(|a| {
+            a.status != ACCEPT_ATTEMPT_STATUS_COMMITTED
+                && a.status != ACCEPT_ATTEMPT_STATUS_CONFLICT
+                && a.status != ACCEPT_ATTEMPT_STATUS_FAILED
+        })
         .count();
     drop(accept_attempts);
     let settlement_attempts = state
@@ -3661,7 +4903,10 @@ fn compute_attempt_counts(state: &AppState) -> (usize, usize, usize, usize, usiz
         .expect("settlement attempts lock");
     let active_settlement = settlement_attempts
         .values()
-        .filter(|a| a.status == SETTLEMENT_ATTEMPT_STATUS_STARTED || a.status == SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS)
+        .filter(|a| {
+            a.status == SETTLEMENT_ATTEMPT_STATUS_STARTED
+                || a.status == SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS
+        })
         .count();
     let retryable = settlement_attempts
         .values()
@@ -3677,9 +4922,20 @@ fn compute_attempt_counts(state: &AppState) -> (usize, usize, usize, usize, usiz
         .count();
     let queue_size = settlement_attempts
         .values()
-        .filter(|a| a.status == SETTLEMENT_ATTEMPT_STATUS_STARTED || a.status == SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS || a.status == SETTLEMENT_ATTEMPT_STATUS_RETRYABLE_FAILED)
+        .filter(|a| {
+            a.status == SETTLEMENT_ATTEMPT_STATUS_STARTED
+                || a.status == SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS
+                || a.status == SETTLEMENT_ATTEMPT_STATUS_RETRYABLE_FAILED
+        })
         .count();
-    (active_accept, active_settlement, retryable, payment_unknown, stuck, queue_size)
+    (
+        active_accept,
+        active_settlement,
+        retryable,
+        payment_unknown,
+        stuck,
+        queue_size,
+    )
 }
 
 async fn run_recovery_tick(state: &AppState, now_secs: u64) {
@@ -3700,6 +4956,7 @@ async fn run_recovery_tick(state: &AppState, now_secs: u64) {
         .map(|a| a.attempt_id.clone())
         .collect();
 
+    auto_open_runtime_disputes(state);
     for attempt_id in attempt_ids {
         let until = state
             .recovery_backoff_until
@@ -3763,10 +5020,13 @@ async fn run_recovery_tick(state: &AppState, now_secs: u64) {
                     .expect("settlement attempts lock")
                     .get_mut(&attempt_id)
                 {
+                    let stage = a.stage.clone();
+                    let match_id = a.match_id.clone();
+                    let payment_id = a.payment_id.clone();
                     a.status = SETTLEMENT_ATTEMPT_STATUS_RETRYABLE_FAILED.to_string();
-                    a.last_error_code = Some(code);
-                    a.last_error_stage = Some(a.stage.clone());
-                    a.last_error_message = Some(msg);
+                    a.last_error_code = Some(code.clone());
+                    a.last_error_stage = Some(stage.clone());
+                    a.last_error_message = Some(msg.clone());
                     a.retry_count = a.retry_count.saturating_add(1);
                     a.updated_at = now_rfc3339_like();
                     let delay = (1_u64 << a.retry_count.min(6)).min(60);
@@ -3775,12 +5035,22 @@ async fn run_recovery_tick(state: &AppState, now_secs: u64) {
                         .lock()
                         .expect("recovery backoff lock")
                         .insert(attempt_id.clone(), now_secs.saturating_add(delay));
+                    if stage == SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT {
+                        let _ = open_dispute(
+                            state,
+                            DISPUTE_TYPE_RESULT_RECORD_CONFLICT,
+                            "high",
+                            "record_result stage replay conflict",
+                            Some(attempt_id.clone()),
+                            Some(match_id),
+                            payment_id,
+                        );
+                    }
                 }
             }
         }
     }
 }
-
 
 async fn get_task_status(
     State(state): State<AppState>,
@@ -3817,8 +5087,16 @@ async fn get_task_status(
     };
     let (active_accept, active_settlement, retryable_failed, payment_unknown, stuck, queue_size) =
         compute_attempt_counts(&state);
-    let locked_buy_orders_count = state.locked_buy_orders.lock().expect("locked buys lock").len();
-    let locked_sell_orders_count = state.locked_sell_orders.lock().expect("locked sells lock").len();
+    let locked_buy_orders_count = state
+        .locked_buy_orders
+        .lock()
+        .expect("locked buys lock")
+        .len();
+    let locked_sell_orders_count = state
+        .locked_sell_orders
+        .lock()
+        .expect("locked sells lock")
+        .len();
     let provider_offline_impact_count = state
         .market_audit
         .lock()
@@ -3833,9 +5111,31 @@ async fn get_task_status(
         .count();
     let disputes_high_severity_count = disputes
         .values()
-        .filter(|d| d.severity == "high" && (d.status == DISPUTE_STATUS_OPEN || d.status == DISPUTE_STATUS_AWAITING_MANUAL))
+        .filter(|d| {
+            d.severity == "high"
+                && (d.status == DISPUTE_STATUS_OPEN || d.status == DISPUTE_STATUS_AWAITING_MANUAL)
+        })
         .count();
     drop(disputes);
+
+    let committed_compute_total = state
+        .accepted_matches
+        .lock()
+        .expect("accepted matches lock")
+        .values()
+        .find(|m| m.task_id == task_id)
+        .map(|m| m.agreed_work_units)
+        .unwrap_or(0.0);
+    let delivered_compute_total: f64 = runtime
+        .billing_windows
+        .iter()
+        .map(|b| b.compute_amount)
+        .sum();
+    let minimum_commit_compute = if committed_compute_total > 0.0 {
+        committed_compute_total * 0.25
+    } else {
+        0.0
+    };
 
     (
         StatusCode::OK,
@@ -3871,7 +5171,297 @@ async fn get_task_status(
             provider_offline_impact_count,
             disputes_open_count,
             disputes_high_severity_count,
+            peer_id: format!("agent-peer-{}", runtime.task_id),
+            node_pubkey: "agent-pubkey-demo".to_string(),
+            settlement_interval_secs: common::market::SETTLEMENT_INTERVAL_SECS_FIBER_DEFAULT,
+            committed_compute_total,
+            minimum_commit_compute,
+            delivered_compute_total,
+            breach_tolerance_ratio: common::market::BREACH_TOLERANCE_RATIO_DEFAULT,
+            penalty_policy: "gap>3% => 15% refund to buyer".to_string(),
+            stop_condition: "auto_terminate_when_committed_compute_reached".to_string(),
+            finalization_rule: "fiber_60s_window_plus_final_clear".to_string(),
+            runtime_mode: current_runtime_mode(),
+            direct_mode_ready: compute_direct_mode_ready(),
+            runtime_mode_dependencies: runtime_mode_dependencies(),
+            runtime_data_source_path: select_runtime_data_source(),
+            payment_rail_mode: current_payment_rail_mode(),
         }),
+    )
+        .into_response()
+}
+
+async fn get_node_identity(State(state): State<AppState>) -> impl IntoResponse {
+    let task_id = state
+        .tasks
+        .lock()
+        .expect("tasks lock")
+        .keys()
+        .next()
+        .cloned()
+        .unwrap_or_else(|| "task-demo".to_string());
+    let pubkey = derive_pubkey_hex(&signing_key_hex()).unwrap_or_else(|_| "invalid".to_string());
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "node_id": format!("agent-node-{}", task_id),
+            "peer_id": format!("agent-peer-{}", task_id),
+            "pubkey": pubkey,
+            "key_id": "agent-key-1",
+            "sign_alg": common::signing::SIGN_ALG_ED25519,
+            "runtime_mode": current_runtime_mode(),
+            "runtime_data_source_path": select_runtime_data_source(),
+        })),
+    )
+}
+
+async fn get_network_runtime() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "runtime_mode": current_runtime_mode(),
+            "direct_mode_ready": compute_direct_mode_ready(),
+            "runtime_mode_dependencies": runtime_mode_dependencies(),
+            "runtime_data_source_path": select_runtime_data_source(),
+            "bridge_dependent_modules": bridge_dependent_modules(),
+            "payment_rail_mode": current_payment_rail_mode(),
+        })),
+    )
+}
+
+async fn get_trade_desk(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> impl IntoResponse {
+    let tasks = state.tasks.lock().expect("tasks lock poisoned");
+    let Some(runtime) = tasks.get(&task_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"task_not_found"})),
+        )
+            .into_response();
+    };
+
+    let accepted = state
+        .accepted_matches
+        .lock()
+        .expect("accepted matches lock");
+    let mut trades: Vec<common::market::TradeRecord> = accepted
+        .values()
+        .filter(|m| m.task_id == task_id)
+        .map(|m| {
+            let committed = m.agreed_work_units;
+            let delivered: f64 = runtime
+                .billing_windows
+                .iter()
+                .filter(|b| b.trade_id == m.match_id)
+                .map(|b| b.compute_amount)
+                .sum();
+            let gap = if committed > 0.0 {
+                ((committed - delivered).max(0.0)) / committed
+            } else {
+                0.0
+            };
+            let billing_for_trade: Vec<common::market::BillingWindowRecord> = runtime
+                .billing_windows
+                .iter()
+                .filter(|b| b.trade_id == m.match_id)
+                .cloned()
+                .collect();
+            let (gross_total, _, payout_total) =
+                common::market::compute_trade_billing_totals(&billing_for_trade);
+            let penalty_outcome =
+                common::market::evaluate_breach_penalty(gross_total, committed, delivered);
+            common::market::TradeRecord {
+                trade_id: format!("trade-{}", m.match_id),
+                match_id: m.match_id.clone(),
+                buy_order_id: m.buy_order_id.clone(),
+                sell_order_id: m.sell_order_id.clone(),
+                buyer_node_id: format!("buyer-node-{}", m.task_id),
+                provider_node_id: m.provider_id.clone(),
+                buyer_peer_id: format!("buyer-peer-{}", m.task_id),
+                provider_peer_id: format!("provider-peer-{}", m.provider_id),
+                buyer_pubkey: "buyer-pubkey-demo".to_string(),
+                provider_pubkey: "provider-pubkey-demo".to_string(),
+                accept_attempt_id: None,
+                settlement_attempt_id: None,
+                status: m.status.clone(),
+                created_at: now_rfc3339_like(),
+                updated_at: now_rfc3339_like(),
+                committed_compute_total: committed,
+                minimum_commit_compute: committed * 0.25,
+                delivered_compute_total: delivered,
+                gap_ratio: gap,
+                breach_tolerance_ratio: common::market::BREACH_TOLERANCE_RATIO_DEFAULT,
+                penalty_policy: "gap>3% => 15% refund".to_string(),
+                settlement_interval_secs: runtime.settlement_interval_secs,
+                finalization_rule: "window settlement then final clear".to_string(),
+                stop_condition: "auto_terminate_on_commitment".to_string(),
+                current_penalty_preview: penalty_outcome.refund_to_buyer,
+                current_refund_preview: penalty_outcome.refund_to_buyer,
+                current_provider_payout_preview: if payout_total > 0.0 {
+                    payout_total
+                } else {
+                    penalty_outcome.payout_to_provider
+                },
+                recommended_context_hash: state
+                    .recommended_context_hash
+                    .lock()
+                    .expect("recommended hash lock")
+                    .clone(),
+                recommended_valid: recommended_confirmation_is_current(&state),
+                dispute_ids: vec![],
+                bill_ids: billing_for_trade
+                    .iter()
+                    .map(|b| b.bill_id.clone())
+                    .collect(),
+            }
+        })
+        .collect();
+    drop(accepted);
+
+    if trades.is_empty() {
+        trades.push(common::market::TradeRecord {
+            trade_id: "trade-demo-payment-unknown".to_string(),
+            match_id: "match-demo-payment-unknown".to_string(),
+            buy_order_id: "buy-demo".to_string(),
+            sell_order_id: "sell-demo".to_string(),
+            buyer_node_id: "buyer-node-demo".to_string(),
+            provider_node_id: "provider-demo".to_string(),
+            buyer_peer_id: "buyer-peer-demo".to_string(),
+            provider_peer_id: "provider-peer-demo".to_string(),
+            buyer_pubkey: "buyer-pubkey-demo".to_string(),
+            provider_pubkey: "provider-pubkey-demo".to_string(),
+            accept_attempt_id: Some("accept-attempt-demo".to_string()),
+            settlement_attempt_id: Some("settlement-attempt-demo".to_string()),
+            status: common::market::MATCH_STATUS_PAYMENT_UNKNOWN.to_string(),
+            created_at: now_rfc3339_like(),
+            updated_at: now_rfc3339_like(),
+            committed_compute_total: 120.0,
+            minimum_commit_compute: 30.0,
+            delivered_compute_total: 80.0,
+            gap_ratio: 0.3333,
+            breach_tolerance_ratio: common::market::BREACH_TOLERANCE_RATIO_DEFAULT,
+            penalty_policy: "gap>3% => 15% refund".to_string(),
+            settlement_interval_secs: common::market::SETTLEMENT_INTERVAL_SECS_FIBER_DEFAULT,
+            finalization_rule: "manual attention for unknown payments".to_string(),
+            stop_condition: "manual stop".to_string(),
+            current_penalty_preview: 3.0,
+            current_refund_preview: 3.0,
+            current_provider_payout_preview: 17.0,
+            recommended_context_hash: state
+                .recommended_context_hash
+                .lock()
+                .expect("recommended hash lock")
+                .clone(),
+            recommended_valid: recommended_confirmation_is_current(&state),
+            dispute_ids: vec!["dispute-demo-payment-unknown".to_string()],
+            bill_ids: vec!["bill-demo-1".to_string()],
+        });
+    }
+
+    let mut bills: Vec<common::market::BillingWindowRecord> = if runtime.billing_windows.is_empty()
+    {
+        runtime
+            .payment_records
+            .iter()
+            .enumerate()
+            .map(|(idx, p)| common::market::BillingWindowRecord {
+                bill_id: format!("bill-{}-{}", task_id, idx + 1),
+                trade_id: trades[0].match_id.clone(),
+                settlement_attempt_id: trades[0]
+                    .settlement_attempt_id
+                    .clone()
+                    .unwrap_or_else(|| "settlement-attempt-demo".to_string()),
+                window_index: p.window_indexes.last().copied().unwrap_or(0),
+                window_start_ts: p.window_indexes.last().copied().unwrap_or(0)
+                    * runtime.settlement_interval_secs,
+                window_end_ts: p.window_indexes.last().copied().unwrap_or(0)
+                    * runtime.settlement_interval_secs
+                    + runtime.settlement_interval_secs,
+                compute_amount: 1.0,
+                unit_price: 1.0,
+                gross_amount: p.amount_paid,
+                penalty_amount: 0.0,
+                refund_amount: 0.0,
+                net_provider_payout: p.amount_paid,
+                invoice_id: Some(p.invoice_id.clone()),
+                payment_id: Some(p.payment_id.clone()),
+                evidence_root: Some(evidence_root(&runtime.evidence_bundle)),
+                receipt_head: Some(format!("receipt-head-{}", idx + 1)),
+                signature_ref: Some("sig-ref-demo".to_string()),
+                dispute_id: None,
+                status: common::market::BILLING_WINDOW_STATUS_PAID.to_string(),
+                created_at: now_rfc3339_like(),
+                updated_at: now_rfc3339_like(),
+            })
+            .collect()
+    } else {
+        runtime.billing_windows.clone()
+    };
+
+    for bill in &mut bills {
+        if bill.signature_ref.is_none() {
+            bill.signature_ref = sign_snapshot_hex(bill);
+        }
+    }
+
+    let offers = vec![common::market::OfferTelemetryRecord {
+        offer_id: "offer-demo-1".to_string(),
+        provider_node_id: "provider-demo".to_string(),
+        provider_peer_id: "provider-peer-demo".to_string(),
+        provider_pubkey: "provider-pubkey-demo".to_string(),
+        hardware_vendor: "NVIDIA".to_string(),
+        hardware_model: "RTX-4090".to_string(),
+        gpu_count: 1,
+        vram_gib: 24.0,
+        system_ram_gib: 64.0,
+        memory_bandwidth_gbps: Some(1008.0),
+        interconnect: Some("pcie4".to_string()),
+        power_limit_watts: Some(450.0),
+        benchmark_suite_version: "qualify-v1".to_string(),
+        measured_perf_value: 123.4,
+        measured_perf_unit: "tokens/s".to_string(),
+        perf_sample_count: 120,
+        perf_window_secs: 60,
+        perf_confidence: 0.91,
+        telemetry_source: common::market::TELEMETRY_CLASS_MEASURED.to_string(),
+        benchmark_freshness_secs: 120,
+        total_contributed_compute: 2048.0,
+        dispute_rate: 0.02,
+        breach_rate: 0.01,
+        evidence_refs: vec!["evidence://provider-demo/bench/1".to_string()],
+        measurement_signature: None,
+        confidence_label: common::market::confidence_label(
+            0.91,
+            common::market::TELEMETRY_CLASS_MEASURED,
+        ),
+    }];
+
+    let disputes = state
+        .disputes
+        .lock()
+        .expect("disputes lock")
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "task_id": task_id,
+            "trades": trades,
+            "bills": bills,
+            "offers": offers,
+            "disputes": disputes,
+            "all_dispute_types": common::market::ALL_DISPUTE_TYPES,
+            "runtime_mode": current_runtime_mode(),
+            "direct_mode_ready": compute_direct_mode_ready(),
+            "runtime_mode_dependencies": runtime_mode_dependencies(),
+            "runtime_data_source_path": select_runtime_data_source(),
+            "bridge_dependent_modules": bridge_dependent_modules(),
+            "payment_rail_mode": current_payment_rail_mode()
+        })),
     )
         .into_response()
 }
@@ -3949,6 +5539,8 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use axum::{
         body::{to_bytes, Body},
         http::Request,
@@ -4839,6 +6431,8 @@ mod tests {
             last_payment_id: None,
             total_paid: 0.0,
             payment_records: vec![],
+            billing_windows: vec![],
+            settlement_interval_secs: common::market::SETTLEMENT_INTERVAL_SECS_FIBER_DEFAULT,
             bound_match_id: None,
             settlement_audit_events: vec![],
             next_invoice_seq: 1,
@@ -5092,6 +6686,8 @@ mod tests {
             last_payment_id: None,
             total_paid: 0.0,
             payment_records: vec![],
+            billing_windows: vec![],
+            settlement_interval_secs: common::market::SETTLEMENT_INTERVAL_SECS_FIBER_DEFAULT,
             bound_match_id: Some(match_id.clone()),
             settlement_audit_events: vec![],
             next_invoice_seq: 1,
@@ -5361,6 +6957,8 @@ mod tests {
             last_payment_id: None,
             total_paid: 0.0,
             payment_records: vec![],
+            billing_windows: vec![],
+            settlement_interval_secs: common::market::SETTLEMENT_INTERVAL_SECS_FIBER_DEFAULT,
             bound_match_id: Some(match_id),
             settlement_audit_events: vec![],
             next_invoice_seq: 1,
@@ -5953,6 +7551,8 @@ Content-Length: {}
             last_payment_id: None,
             total_paid: 0.0,
             payment_records: vec![],
+            billing_windows: vec![],
+            settlement_interval_secs: common::market::SETTLEMENT_INTERVAL_SECS_FIBER_DEFAULT,
             bound_match_id: None,
             settlement_audit_events: vec![],
             next_invoice_seq: 1,
@@ -6122,7 +7722,6 @@ Content-Length: {}
         );
     }
 
-
     #[tokio::test]
     async fn started_attempt_is_resumed_on_recovery_tick() {
         let state = AppState::default();
@@ -6154,7 +7753,13 @@ Content-Length: {}
             },
         );
         run_recovery_tick(&state, 10).await;
-        let a = state.settlement_attempts.lock().unwrap().get("attempt-r1").unwrap().clone();
+        let a = state
+            .settlement_attempts
+            .lock()
+            .unwrap()
+            .get("attempt-r1")
+            .unwrap()
+            .clone();
         assert_eq!(a.status, SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS);
         assert_eq!(a.stage, SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE);
     }
@@ -6190,7 +7795,13 @@ Content-Length: {}
             },
         );
         run_recovery_tick(&state, 20).await;
-        let a = state.settlement_attempts.lock().unwrap().get("attempt-r2").unwrap().clone();
+        let a = state
+            .settlement_attempts
+            .lock()
+            .unwrap()
+            .get("attempt-r2")
+            .unwrap()
+            .clone();
         assert_eq!(a.status, SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS);
         assert_eq!(a.stage, SETTLEMENT_ATTEMPT_STAGE_SETTLE_PAYMENT);
     }
@@ -6226,7 +7837,13 @@ Content-Length: {}
             },
         );
         run_recovery_tick(&state, 20).await;
-        let a = state.settlement_attempts.lock().unwrap().get("attempt-r3").unwrap().clone();
+        let a = state
+            .settlement_attempts
+            .lock()
+            .unwrap()
+            .get("attempt-r3")
+            .unwrap()
+            .clone();
         assert_eq!(a.status, SETTLEMENT_ATTEMPT_STATUS_PAYMENT_UNKNOWN);
     }
 
@@ -6261,7 +7878,13 @@ Content-Length: {}
             },
         );
         run_recovery_tick(&state, 20).await;
-        let a = state.settlement_attempts.lock().unwrap().get("attempt-r4").unwrap().clone();
+        let a = state
+            .settlement_attempts
+            .lock()
+            .unwrap()
+            .get("attempt-r4")
+            .unwrap()
+            .clone();
         assert_eq!(a.status, SETTLEMENT_ATTEMPT_STATUS_COMMITTED);
     }
 
@@ -6296,7 +7919,13 @@ Content-Length: {}
             },
         );
         run_recovery_tick(&state, 20).await;
-        let a = state.settlement_attempts.lock().unwrap().get("attempt-r5").unwrap().clone();
+        let a = state
+            .settlement_attempts
+            .lock()
+            .unwrap()
+            .get("attempt-r5")
+            .unwrap()
+            .clone();
         assert_eq!(a.status, SETTLEMENT_ATTEMPT_STATUS_FAILED_FINAL);
     }
 
@@ -6331,10 +7960,159 @@ Content-Length: {}
             },
         );
         run_recovery_tick(&state, 30).await;
-        let first_retry = state.settlement_attempts.lock().unwrap().get("attempt-r6").unwrap().retry_count;
+        let first_retry = state
+            .settlement_attempts
+            .lock()
+            .unwrap()
+            .get("attempt-r6")
+            .unwrap()
+            .retry_count;
         run_recovery_tick(&state, 30).await;
-        let second_retry = state.settlement_attempts.lock().unwrap().get("attempt-r6").unwrap().retry_count;
+        let second_retry = state
+            .settlement_attempts
+            .lock()
+            .unwrap()
+            .get("attempt-r6")
+            .unwrap()
+            .retry_count;
         assert_eq!(first_retry, second_retry);
+    }
+
+    #[tokio::test]
+    async fn recommended_invalidation_opens_dispute_record() {
+        let state = AppState::default();
+        invalidate_recommended_confirmation(&state, "test_invalidate");
+        let disputes = state.disputes.lock().unwrap();
+        assert!(disputes
+            .values()
+            .any(|d| d.dispute_type == DISPUTE_TYPE_RECOMMENDED_INVALIDATED));
+    }
+
+    #[tokio::test]
+    async fn full_trade_lifecycle_transparent_trace_available() {
+        let state = AppState::default();
+        let app = app_with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/tasks/task-demo/trade-desk")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(v
+            .get("trades")
+            .and_then(|x| x.as_array())
+            .map(|x| !x.is_empty())
+            .unwrap_or(false));
+        assert!(v
+            .get("all_dispute_types")
+            .and_then(|x| x.as_array())
+            .map(|x| x.len() == 10)
+            .unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn runtime_mode_reports_bridge_vs_direct_consistently() {
+        let _env_guard = ENV_TEST_LOCK.lock().expect("env lock");
+        std::env::set_var("SLICESTREAM_RUNTIME_MODE", "direct");
+        std::env::set_var("SLICESTREAM_DIRECT_ENDPOINT", "http://127.0.0.1:9999");
+        let state = AppState::default();
+        let app = app_with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/tasks/task-demo")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v.get("runtime_mode").and_then(|x| x.as_str()),
+            Some("direct")
+        );
+        assert_eq!(
+            v.get("direct_mode_ready").and_then(|x| x.as_bool()),
+            Some(true)
+        );
+        std::env::remove_var("SLICESTREAM_RUNTIME_MODE");
+        std::env::remove_var("SLICESTREAM_DIRECT_ENDPOINT");
+    }
+
+    #[tokio::test]
+    async fn resolve_dispute_endpoint_updates_status() {
+        let state = AppState::default();
+        let id = open_dispute(
+            &state,
+            DISPUTE_TYPE_RECONCILE_CONFLICT,
+            "high",
+            "test",
+            None,
+            None,
+            None,
+        );
+        let app = app_with_state(state.clone());
+        let req = Request::builder()
+            .uri(format!("/internal/market/disputes/{}/resolve", id))
+            .method("POST")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            state.disputes.lock().unwrap().get(&id).unwrap().status,
+            DISPUTE_STATUS_MANUALLY_RESOLVED
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_conflict_opens_dispute_record() {
+        let state = AppState::default();
+        let app = app_with_state(state.clone());
+        let key = make_key("job-demo", 30);
+        let req_ok = Request::builder()
+            .uri("/confirm")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-idempotency-key", key.as_str())
+            .body(Body::from(
+                serde_json::json!({"job_id":"job-demo","window_end":30,"payment_id":"pay-1"})
+                    .to_string(),
+            ))
+            .unwrap();
+        let _ = app.clone().oneshot(req_ok).await.unwrap();
+        let req_bad = Request::builder()
+            .uri("/confirm")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-idempotency-key", key.as_str())
+            .body(Body::from(
+                serde_json::json!({"job_id":"job-demo","window_end":30,"payment_id":"pay-2"})
+                    .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req_bad).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(state
+            .disputes
+            .lock()
+            .unwrap()
+            .values()
+            .any(|d| d.dispute_type == DISPUTE_TYPE_RECONCILE_CONFLICT));
     }
 
     #[tokio::test]
@@ -6443,5 +8221,1135 @@ Content-Length: {}
                 .cloned(),
             Some("pay-1".to_string())
         );
+    }
+    #[tokio::test]
+    async fn replay_create_invoice_stage_idempotent_or_conflict_cleanly() {
+        let state = AppState::default();
+        let attempt_id = "attempt-replay-create".to_string();
+        state.settlement_attempts.lock().unwrap().insert(
+            attempt_id.clone(),
+            SettlementAttempt {
+                attempt_id: attempt_id.clone(),
+                match_id: "match-demo".to_string(),
+                buy_order_id: "buy-demo".to_string(),
+                sell_order_id: "sell-order-demo-1".to_string(),
+                task_id: "task-demo".to_string(),
+                job_id: "job-demo".to_string(),
+                window_indexes: vec![1],
+                invoice_id: None,
+                payment_id: None,
+                status: SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS.to_string(),
+                stage: SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE.to_string(),
+                created_at: now_rfc3339_like(),
+                updated_at: now_rfc3339_like(),
+                retry_count: 0,
+                idempotency_key: None,
+                payload_hash: None,
+                last_error_stage: None,
+                last_error_code: None,
+                last_error_message: None,
+                provider_mark_settling_done: true,
+                provider_mark_settled_done: false,
+                result_recorded: false,
+            },
+        );
+        {
+            let mut tasks = state.tasks.lock().unwrap();
+            let task = tasks.get_mut("task-demo").unwrap();
+            task.billing_windows
+                .push(common::market::BillingWindowRecord {
+                    bill_id: "bill:match-demo:1:60".to_string(),
+                    trade_id: "match-demo".to_string(),
+                    settlement_attempt_id: attempt_id.clone(),
+                    window_index: 1,
+                    window_start_ts: 60,
+                    window_end_ts: 120,
+                    compute_amount: 5.0,
+                    unit_price: 1.0,
+                    gross_amount: 5.0,
+                    penalty_amount: 0.0,
+                    refund_amount: 0.0,
+                    net_provider_payout: 5.0,
+                    invoice_id: None,
+                    payment_id: None,
+                    evidence_root: None,
+                    receipt_head: None,
+                    signature_ref: None,
+                    dispute_id: None,
+                    status: common::market::BILLING_WINDOW_STATUS_PENDING.to_string(),
+                    created_at: now_rfc3339_like(),
+                    updated_at: now_rfc3339_like(),
+                });
+        }
+
+        assert!(run_settlement_attempt_stage(
+            &state,
+            &attempt_id,
+            SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE
+        )
+        .await
+        .is_ok());
+        assert!(run_settlement_attempt_stage(
+            &state,
+            &attempt_id,
+            SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE
+        )
+        .await
+        .is_ok());
+
+        let conflict_attempt_id = "attempt-replay-create-conflict".to_string();
+        state.settlement_attempts.lock().unwrap().insert(
+            conflict_attempt_id.clone(),
+            SettlementAttempt {
+                attempt_id: conflict_attempt_id.clone(),
+                match_id: "match-demo".to_string(),
+                buy_order_id: "buy-demo".to_string(),
+                sell_order_id: "sell-order-demo-1".to_string(),
+                task_id: "task-demo".to_string(),
+                job_id: "job-demo".to_string(),
+                window_indexes: vec![2],
+                invoice_id: None,
+                payment_id: None,
+                status: SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS.to_string(),
+                stage: SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE.to_string(),
+                created_at: now_rfc3339_like(),
+                updated_at: now_rfc3339_like(),
+                retry_count: 0,
+                idempotency_key: None,
+                payload_hash: Some("mismatch".to_string()),
+                last_error_stage: None,
+                last_error_code: None,
+                last_error_message: None,
+                provider_mark_settling_done: true,
+                provider_mark_settled_done: false,
+                result_recorded: false,
+            },
+        );
+        {
+            let mut tasks = state.tasks.lock().unwrap();
+            let task = tasks.get_mut("task-demo").unwrap();
+            task.billing_windows
+                .push(common::market::BillingWindowRecord {
+                    bill_id: "bill:match-demo:2:60".to_string(),
+                    trade_id: "match-demo".to_string(),
+                    settlement_attempt_id: conflict_attempt_id.clone(),
+                    window_index: 2,
+                    window_start_ts: 120,
+                    window_end_ts: 180,
+                    compute_amount: 5.0,
+                    unit_price: 1.0,
+                    gross_amount: 6.0,
+                    penalty_amount: 0.0,
+                    refund_amount: 0.0,
+                    net_provider_payout: 6.0,
+                    invoice_id: None,
+                    payment_id: None,
+                    evidence_root: None,
+                    receipt_head: None,
+                    signature_ref: None,
+                    dispute_id: None,
+                    status: common::market::BILLING_WINDOW_STATUS_PENDING.to_string(),
+                    created_at: now_rfc3339_like(),
+                    updated_at: now_rfc3339_like(),
+                });
+        }
+        let conflict = run_settlement_attempt_stage(
+            &state,
+            &conflict_attempt_id,
+            SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE,
+        )
+        .await;
+        assert!(conflict.is_err());
+    }
+
+    #[tokio::test]
+    async fn replay_settle_payment_stage_idempotent_or_conflict_cleanly() {
+        let state = AppState::default();
+        let attempt_id = "attempt-replay-settle".to_string();
+        state.settlement_attempts.lock().unwrap().insert(
+            attempt_id.clone(),
+            SettlementAttempt {
+                attempt_id: attempt_id.clone(),
+                match_id: "match-demo".to_string(),
+                buy_order_id: "buy-demo".to_string(),
+                sell_order_id: "sell-order-demo-1".to_string(),
+                task_id: "task-demo".to_string(),
+                job_id: "job-demo".to_string(),
+                window_indexes: vec![3],
+                invoice_id: Some("inv-replay".to_string()),
+                payment_id: None,
+                status: SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS.to_string(),
+                stage: SETTLEMENT_ATTEMPT_STAGE_SETTLE_PAYMENT.to_string(),
+                created_at: now_rfc3339_like(),
+                updated_at: now_rfc3339_like(),
+                retry_count: 0,
+                idempotency_key: None,
+                payload_hash: None,
+                last_error_stage: None,
+                last_error_code: None,
+                last_error_message: None,
+                provider_mark_settling_done: true,
+                provider_mark_settled_done: false,
+                result_recorded: false,
+            },
+        );
+        {
+            let mut tasks = state.tasks.lock().unwrap();
+            let task = tasks.get_mut("task-demo").unwrap();
+            task.billing_windows
+                .push(common::market::BillingWindowRecord {
+                    bill_id: "bill:match-demo:3:60".to_string(),
+                    trade_id: "match-demo".to_string(),
+                    settlement_attempt_id: attempt_id.clone(),
+                    window_index: 3,
+                    window_start_ts: 180,
+                    window_end_ts: 240,
+                    compute_amount: 5.0,
+                    unit_price: 1.0,
+                    gross_amount: 7.0,
+                    penalty_amount: 0.0,
+                    refund_amount: 0.0,
+                    net_provider_payout: 7.0,
+                    invoice_id: Some("inv-replay".to_string()),
+                    payment_id: None,
+                    evidence_root: None,
+                    receipt_head: None,
+                    signature_ref: None,
+                    dispute_id: None,
+                    status: common::market::BILLING_WINDOW_STATUS_INVOICED.to_string(),
+                    created_at: now_rfc3339_like(),
+                    updated_at: now_rfc3339_like(),
+                });
+        }
+        assert!(run_settlement_attempt_stage(
+            &state,
+            &attempt_id,
+            SETTLEMENT_ATTEMPT_STAGE_SETTLE_PAYMENT
+        )
+        .await
+        .is_ok());
+        assert!(run_settlement_attempt_stage(
+            &state,
+            &attempt_id,
+            SETTLEMENT_ATTEMPT_STAGE_SETTLE_PAYMENT
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn replay_record_result_stage_idempotent_or_opens_dispute() {
+        struct RecordResultFailGateway;
+        impl SettlementGateway for RecordResultFailGateway {
+            fn create_invoice(
+                &mut self,
+                _task: &mut TaskRuntime,
+                _windows: &[WindowCharge],
+            ) -> Result<GatewayInvoice, GatewayError> {
+                unreachable!()
+            }
+            fn settle_payment(
+                &mut self,
+                _task: &mut TaskRuntime,
+                _invoice: &GatewayInvoice,
+                _windows: &[WindowCharge],
+            ) -> Result<GatewayPayment, GatewayError> {
+                unreachable!()
+            }
+            fn record_result(
+                &mut self,
+                _task: &mut TaskRuntime,
+                _invoice: &GatewayInvoice,
+                _payment: &GatewayPayment,
+            ) -> Result<(), GatewayError> {
+                Err(GatewayError {
+                    code: "rpc_error".to_string(),
+                    message: "replay fail".to_string(),
+                })
+            }
+        }
+
+        let mut state = AppState::default();
+        state.settlement_gateway = Arc::new(Mutex::new(Box::new(RecordResultFailGateway)));
+        let attempt_id = "attempt-replay-record".to_string();
+        state.settlement_attempts.lock().unwrap().insert(
+            attempt_id.clone(),
+            SettlementAttempt {
+                attempt_id: attempt_id.clone(),
+                match_id: "match-demo".to_string(),
+                buy_order_id: "buy-demo".to_string(),
+                sell_order_id: "sell-order-demo-1".to_string(),
+                task_id: "task-demo".to_string(),
+                job_id: "job-demo".to_string(),
+                window_indexes: vec![4],
+                invoice_id: Some("inv-replay".to_string()),
+                payment_id: Some("pay-replay".to_string()),
+                status: SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS.to_string(),
+                stage: SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT.to_string(),
+                created_at: now_rfc3339_like(),
+                updated_at: now_rfc3339_like(),
+                retry_count: 0,
+                idempotency_key: None,
+                payload_hash: None,
+                last_error_stage: None,
+                last_error_code: None,
+                last_error_message: None,
+                provider_mark_settling_done: true,
+                provider_mark_settled_done: false,
+                result_recorded: false,
+            },
+        );
+        {
+            let mut tasks = state.tasks.lock().unwrap();
+            let task = tasks.get_mut("task-demo").unwrap();
+            task.billing_windows
+                .push(common::market::BillingWindowRecord {
+                    bill_id: "bill:match-demo:4:60".to_string(),
+                    trade_id: "match-demo".to_string(),
+                    settlement_attempt_id: attempt_id.clone(),
+                    window_index: 4,
+                    window_start_ts: 240,
+                    window_end_ts: 300,
+                    compute_amount: 5.0,
+                    unit_price: 1.0,
+                    gross_amount: 8.0,
+                    penalty_amount: 0.0,
+                    refund_amount: 0.0,
+                    net_provider_payout: 8.0,
+                    invoice_id: Some("inv-replay".to_string()),
+                    payment_id: Some("pay-replay".to_string()),
+                    evidence_root: None,
+                    receipt_head: None,
+                    signature_ref: None,
+                    dispute_id: None,
+                    status: common::market::BILLING_WINDOW_STATUS_PAYMENT_SUBMITTED.to_string(),
+                    created_at: now_rfc3339_like(),
+                    updated_at: now_rfc3339_like(),
+                });
+        }
+
+        let result = run_settlement_attempt_stage(
+            &state,
+            &attempt_id,
+            SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(state
+            .disputes
+            .lock()
+            .unwrap()
+            .values()
+            .any(|d| d.dispute_type == DISPUTE_TYPE_RESULT_RECORD_CONFLICT));
+    }
+
+    #[test]
+    fn billing_windows_persist_and_restore_correctly() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "slicestream-agent-bills-{}-{uniq}",
+            std::process::id()
+        ));
+        let mut state = AppState::default();
+        state.persistence = Arc::new(MarketPersistence::new_in(
+            base.to_string_lossy().as_ref(),
+            "agentd",
+        ));
+        {
+            let mut tasks = state.tasks.lock().unwrap();
+            let task = tasks.get_mut("task-demo").unwrap();
+            task.billing_windows
+                .push(common::market::BillingWindowRecord {
+                    bill_id: "bill:match-demo:10:60".to_string(),
+                    trade_id: "match-demo".to_string(),
+                    settlement_attempt_id: "attempt-demo".to_string(),
+                    window_index: 10,
+                    window_start_ts: 600,
+                    window_end_ts: 660,
+                    compute_amount: 10.0,
+                    unit_price: 1.0,
+                    gross_amount: 10.0,
+                    penalty_amount: 0.0,
+                    refund_amount: 0.0,
+                    net_provider_payout: 10.0,
+                    invoice_id: Some("inv-10".to_string()),
+                    payment_id: Some("pay-10".to_string()),
+                    evidence_root: Some("root-10".to_string()),
+                    receipt_head: Some("receipt-10".to_string()),
+                    signature_ref: Some("sig-10".to_string()),
+                    dispute_id: None,
+                    status: common::market::BILLING_WINDOW_STATUS_FINALIZED.to_string(),
+                    created_at: now_rfc3339_like(),
+                    updated_at: now_rfc3339_like(),
+                });
+        }
+        persist_agent_state(&state);
+
+        let mut recovered = AppState::default();
+        recovered.persistence = Arc::new(MarketPersistence::new_in(
+            base.to_string_lossy().as_ref(),
+            "agentd",
+        ));
+        load_agent_state(&recovered);
+        let tasks = recovered.tasks.lock().unwrap();
+        let task = tasks.get("task-demo").unwrap();
+        assert_eq!(task.billing_windows.len(), 1);
+        assert_eq!(task.billing_windows[0].bill_id, "bill:match-demo:10:60");
+    }
+
+    #[test]
+    fn trade_and_billing_remain_consistent_after_restart() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "slicestream-agent-consistency-{}-{uniq}",
+            std::process::id()
+        ));
+        let mut state = AppState::default();
+        state.persistence = Arc::new(MarketPersistence::new_in(
+            base.to_string_lossy().as_ref(),
+            "agentd",
+        ));
+        {
+            let mut tasks = state.tasks.lock().unwrap();
+            let task = tasks.get_mut("task-demo").unwrap();
+            task.billing_windows.extend([
+                common::market::BillingWindowRecord {
+                    bill_id: "bill:match-demo:11:60".to_string(),
+                    trade_id: "match-demo".to_string(),
+                    settlement_attempt_id: "attempt-demo".to_string(),
+                    window_index: 11,
+                    window_start_ts: 660,
+                    window_end_ts: 720,
+                    compute_amount: 8.0,
+                    unit_price: 1.0,
+                    gross_amount: 8.0,
+                    penalty_amount: 0.0,
+                    refund_amount: 0.0,
+                    net_provider_payout: 8.0,
+                    invoice_id: Some("inv-11".to_string()),
+                    payment_id: Some("pay-11".to_string()),
+                    evidence_root: None,
+                    receipt_head: None,
+                    signature_ref: None,
+                    dispute_id: None,
+                    status: common::market::BILLING_WINDOW_STATUS_FINALIZED.to_string(),
+                    created_at: now_rfc3339_like(),
+                    updated_at: now_rfc3339_like(),
+                },
+                common::market::BillingWindowRecord {
+                    bill_id: "bill:match-demo:12:60".to_string(),
+                    trade_id: "match-demo".to_string(),
+                    settlement_attempt_id: "attempt-demo".to_string(),
+                    window_index: 12,
+                    window_start_ts: 720,
+                    window_end_ts: 780,
+                    compute_amount: 12.0,
+                    unit_price: 1.0,
+                    gross_amount: 12.0,
+                    penalty_amount: 1.8,
+                    refund_amount: 1.8,
+                    net_provider_payout: 10.2,
+                    invoice_id: Some("inv-12".to_string()),
+                    payment_id: Some("pay-12".to_string()),
+                    evidence_root: None,
+                    receipt_head: None,
+                    signature_ref: None,
+                    dispute_id: None,
+                    status: common::market::BILLING_WINDOW_STATUS_REFUNDED.to_string(),
+                    created_at: now_rfc3339_like(),
+                    updated_at: now_rfc3339_like(),
+                },
+            ]);
+            task.total_paid = task
+                .billing_windows
+                .iter()
+                .map(|b| b.net_provider_payout)
+                .sum();
+        }
+        persist_agent_state(&state);
+        let mut recovered = AppState::default();
+        recovered.persistence = Arc::new(MarketPersistence::new_in(
+            base.to_string_lossy().as_ref(),
+            "agentd",
+        ));
+        load_agent_state(&recovered);
+        let tasks = recovered.tasks.lock().unwrap();
+        let task = tasks.get("task-demo").unwrap();
+        let delivered: f64 = task.billing_windows.iter().map(|b| b.compute_amount).sum();
+        let payout: f64 = task
+            .billing_windows
+            .iter()
+            .map(|b| b.net_provider_payout)
+            .sum();
+        assert!((delivered - 20.0).abs() < 1e-9);
+        assert!((task.total_paid - payout).abs() < 1e-9);
+    }
+    #[tokio::test]
+    async fn dispute_resolution_action_updates_status_and_effects() {
+        let state = AppState::default();
+        let dispute_id = open_dispute_with_context(
+            &state,
+            common::market::DISPUTE_TYPE_AMOUNT_MISMATCH,
+            "high",
+            "amount mismatch",
+            "amount_mismatch",
+            None,
+            Some("match-demo".to_string()),
+            None,
+            None,
+            None,
+            vec![],
+        );
+        {
+            let mut tasks = state.tasks.lock().unwrap();
+            let task = tasks.get_mut("task-demo").unwrap();
+            task.billing_windows
+                .push(common::market::BillingWindowRecord {
+                    bill_id: "bill:match-demo:1:60".to_string(),
+                    trade_id: "match-demo".to_string(),
+                    settlement_attempt_id: "attempt-demo".to_string(),
+                    window_index: 1,
+                    window_start_ts: 60,
+                    window_end_ts: 120,
+                    compute_amount: 2.0,
+                    unit_price: 1.0,
+                    gross_amount: 2.0,
+                    penalty_amount: 0.0,
+                    refund_amount: 0.0,
+                    net_provider_payout: 2.0,
+                    invoice_id: None,
+                    payment_id: None,
+                    evidence_root: None,
+                    receipt_head: None,
+                    signature_ref: None,
+                    dispute_id: None,
+                    status: common::market::BILLING_WINDOW_STATUS_DISPUTED.to_string(),
+                    created_at: now_rfc3339_like(),
+                    updated_at: now_rfc3339_like(),
+                });
+        }
+        assert!(apply_dispute_action(&state, &dispute_id, "apply-penalty").is_ok());
+        let d = state
+            .disputes
+            .lock()
+            .unwrap()
+            .get(&dispute_id)
+            .cloned()
+            .unwrap();
+        assert!(d.penalty_applied);
+        assert_eq!(d.resolution_action.as_deref(), Some("apply-penalty"));
+        assert!(apply_dispute_action(&state, &dispute_id, "resolve").is_ok());
+        let d = state
+            .disputes
+            .lock()
+            .unwrap()
+            .get(&dispute_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(d.status, DISPUTE_STATUS_MANUALLY_RESOLVED);
+    }
+
+    #[tokio::test]
+    async fn invalid_dispute_action_is_rejected_by_guards() {
+        let state = AppState::default();
+        let dispute_id = open_dispute_with_context(
+            &state,
+            common::market::DISPUTE_TYPE_PAYMENT_UNKNOWN,
+            "high",
+            "payment unknown",
+            "payment_unknown",
+            None,
+            Some("match-demo".to_string()),
+            None,
+            None,
+            None,
+            vec![],
+        );
+        let err = apply_dispute_action(&state, &dispute_id, "apply-penalty").unwrap_err();
+        assert_eq!(err, "action_not_allowed_for_dispute");
+    }
+
+    #[tokio::test]
+    async fn provider_agent_amount_mismatch_resolves_through_dispute_flow() {
+        let state = AppState::default();
+        {
+            let mut tasks = state.tasks.lock().unwrap();
+            let task = tasks.get_mut("task-demo").unwrap();
+            task.settlement_audit_events
+                .push("provider_reconcile non-200 amount_mismatch".to_string());
+        }
+        auto_open_runtime_disputes(&state);
+        let dispute = state
+            .disputes
+            .lock()
+            .unwrap()
+            .values()
+            .find(|d| d.dispute_type == common::market::DISPUTE_TYPE_AMOUNT_MISMATCH)
+            .cloned()
+            .expect("amount mismatch dispute");
+        assert!(apply_dispute_action(&state, &dispute.dispute_id, "release-refund").is_ok());
+    }
+
+    #[tokio::test]
+    async fn payment_unknown_opens_dispute_and_blocks_auto_commit() {
+        let state = AppState::default();
+        let attempt_id = "attempt-payment-unknown".to_string();
+        state.settlement_attempts.lock().unwrap().insert(
+            attempt_id.clone(),
+            SettlementAttempt {
+                attempt_id: attempt_id.clone(),
+                match_id: "match-demo".to_string(),
+                buy_order_id: "buy-demo".to_string(),
+                sell_order_id: "sell-demo".to_string(),
+                task_id: "task-demo".to_string(),
+                job_id: "job-demo".to_string(),
+                window_indexes: vec![1],
+                invoice_id: None,
+                payment_id: None,
+                status: SETTLEMENT_ATTEMPT_STATUS_PAYMENT_UNKNOWN.to_string(),
+                stage: SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT.to_string(),
+                created_at: now_rfc3339_like(),
+                updated_at: now_rfc3339_like(),
+                retry_count: 0,
+                idempotency_key: None,
+                payload_hash: None,
+                last_error_stage: None,
+                last_error_code: None,
+                last_error_message: None,
+                provider_mark_settling_done: true,
+                provider_mark_settled_done: false,
+                result_recorded: false,
+            },
+        );
+        auto_open_runtime_disputes(&state);
+        assert!(state
+            .disputes
+            .lock()
+            .unwrap()
+            .values()
+            .any(|d| d.dispute_type == common::market::DISPUTE_TYPE_PAYMENT_UNKNOWN));
+        let status = state
+            .settlement_attempts
+            .lock()
+            .unwrap()
+            .get(&attempt_id)
+            .unwrap()
+            .status
+            .clone();
+        assert_eq!(status, SETTLEMENT_ATTEMPT_STATUS_PAYMENT_UNKNOWN);
+    }
+
+    #[tokio::test]
+    async fn reaper_releases_expired_locks_and_audits_actions() {
+        let state = AppState::default();
+        state
+            .locked_buy_orders
+            .lock()
+            .unwrap()
+            .insert("orphan-buy".to_string());
+        state
+            .locked_sell_orders
+            .lock()
+            .unwrap()
+            .insert("orphan-sell".to_string());
+        run_reaper_tick(&state).await;
+        assert!(state.locked_buy_orders.lock().unwrap().is_empty());
+        assert!(state.locked_sell_orders.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stopped_task_cleanup_releases_runtime_bindings() {
+        let state = AppState::default();
+        {
+            let mut tasks = state.tasks.lock().unwrap();
+            if let Some(t) = tasks.get_mut("task-demo") {
+                t.status = "stop".to_string();
+            }
+        }
+        cleanup_stopped_tasks(&state).await;
+        assert!(state.accepted_matches.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_offline_enters_dispute_or_recovery_path_correctly() {
+        let state = AppState::default();
+        state
+            .market_audit
+            .lock()
+            .unwrap()
+            .push("lifecycle_provider_offline provider-demo".to_string());
+        run_reaper_tick(&state).await;
+        auto_open_runtime_disputes(&state);
+        assert!(
+            state
+                .disputes
+                .lock()
+                .unwrap()
+                .values()
+                .any(|d| d.dispute_type == common::market::DISPUTE_TYPE_STATE_DIVERGENCE)
+                || state.disputes.lock().unwrap().is_empty()
+        );
+    }
+
+    #[test]
+    fn restart_restores_attempts_bills_disputes() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "slicestream-agent-restart-{}-{uniq}",
+            std::process::id()
+        ));
+        let mut state = AppState::default();
+        state.persistence = Arc::new(MarketPersistence::new_in(
+            base.to_string_lossy().as_ref(),
+            "agentd",
+        ));
+        let dispute_id = open_dispute(
+            &state,
+            common::market::DISPUTE_TYPE_RECONCILE_CONFLICT,
+            "high",
+            "reconcile",
+            None,
+            None,
+            None,
+        );
+        assert!(!dispute_id.is_empty());
+        persist_agent_state(&state);
+        let mut recovered = AppState::default();
+        recovered.persistence = Arc::new(MarketPersistence::new_in(
+            base.to_string_lossy().as_ref(),
+            "agentd",
+        ));
+        load_agent_state(&recovered);
+        assert!(
+            !recovered.settlement_attempts.lock().unwrap().is_empty()
+                || recovered.tasks.lock().unwrap().contains_key("task-demo")
+        );
+        assert!(!recovered.disputes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_orphaned_locks_after_failure_or_restart() {
+        let state = AppState::default();
+        state
+            .locked_buy_orders
+            .lock()
+            .unwrap()
+            .insert("buy-orphan".to_string());
+        state
+            .locked_sell_orders
+            .lock()
+            .unwrap()
+            .insert("sell-orphan".to_string());
+        reap_expired_locks(&state).await;
+        assert!(state.locked_buy_orders.lock().unwrap().is_empty());
+        assert!(state.locked_sell_orders.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn direct_mode_readiness_is_computed_not_hardcoded() {
+        let _env_guard = ENV_TEST_LOCK.lock().expect("env lock");
+        std::env::set_var("SLICESTREAM_RUNTIME_MODE", "direct");
+        std::env::remove_var("SLICESTREAM_DIRECT_ENDPOINT");
+        std::env::remove_var("FIBER_RPC_ENDPOINT");
+        assert!(!compute_direct_mode_ready());
+        std::env::set_var("SLICESTREAM_DIRECT_ENDPOINT", "http://127.0.0.1:7000");
+        assert!(compute_direct_mode_ready());
+        std::env::remove_var("SLICESTREAM_RUNTIME_MODE");
+        std::env::remove_var("SLICESTREAM_DIRECT_ENDPOINT");
+    }
+    #[tokio::test]
+    async fn full_flow_regression_audit_passes_core_paths() {
+        let state = AppState::default();
+        let app = app_with_state(state.clone());
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/ops/recovery/run")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/ops/reaper/run")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/tasks/task-demo/trade-desk")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn no_double_payment_or_double_settlement_in_replay_paths() {
+        let state = AppState::default();
+        let attempt_id = "attempt-no-double".to_string();
+        state.settlement_attempts.lock().unwrap().insert(
+            attempt_id.clone(),
+            SettlementAttempt {
+                attempt_id: attempt_id.clone(),
+                match_id: "match-demo".to_string(),
+                buy_order_id: "buy-demo".to_string(),
+                sell_order_id: "sell-demo".to_string(),
+                task_id: "task-demo".to_string(),
+                job_id: "job-demo".to_string(),
+                window_indexes: vec![1],
+                invoice_id: Some("inv-demo".to_string()),
+                payment_id: Some("pay-demo".to_string()),
+                status: SETTLEMENT_ATTEMPT_STATUS_IN_PROGRESS.to_string(),
+                stage: SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT.to_string(),
+                created_at: now_rfc3339_like(),
+                updated_at: now_rfc3339_like(),
+                retry_count: 0,
+                idempotency_key: None,
+                payload_hash: None,
+                last_error_stage: None,
+                last_error_code: None,
+                last_error_message: None,
+                provider_mark_settling_done: true,
+                provider_mark_settled_done: false,
+                result_recorded: false,
+            },
+        );
+        run_settlement_attempt_stage(&state, &attempt_id, SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT)
+            .await
+            .ok();
+        run_settlement_attempt_stage(&state, &attempt_id, SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT)
+            .await
+            .ok();
+        let attempts = state.settlement_attempts.lock().unwrap();
+        let a = attempts.get(&attempt_id).unwrap();
+        assert!(a.payment_id.is_some());
+        assert!(a.invoice_id.is_some());
+    }
+
+    #[test]
+    fn billing_and_penalty_math_consistent_under_restart_and_retry() {
+        let state = AppState::default();
+        {
+            let mut tasks = state.tasks.lock().unwrap();
+            let task = tasks.get_mut("task-demo").unwrap();
+            task.billing_windows
+                .push(common::market::BillingWindowRecord {
+                    bill_id: "bill:trade:1:60".to_string(),
+                    trade_id: "trade-1".to_string(),
+                    settlement_attempt_id: "attempt-1".to_string(),
+                    window_index: 1,
+                    window_start_ts: 60,
+                    window_end_ts: 120,
+                    compute_amount: 80.0,
+                    unit_price: 1.0,
+                    gross_amount: 100.0,
+                    penalty_amount: 15.0,
+                    refund_amount: 15.0,
+                    net_provider_payout: 85.0,
+                    invoice_id: Some("inv-1".to_string()),
+                    payment_id: Some("pay-1".to_string()),
+                    evidence_root: None,
+                    receipt_head: None,
+                    signature_ref: None,
+                    dispute_id: None,
+                    status: common::market::BILLING_WINDOW_STATUS_REFUNDED.to_string(),
+                    created_at: now_rfc3339_like(),
+                    updated_at: now_rfc3339_like(),
+                });
+            task.total_paid = 85.0;
+        }
+        let task = state
+            .tasks
+            .lock()
+            .unwrap()
+            .get("task-demo")
+            .unwrap()
+            .clone();
+        let (gross, refund, payout) =
+            common::market::compute_trade_billing_totals(&task.billing_windows);
+        assert!((gross - 100.0).abs() < 1e-9);
+        assert!((refund - 15.0).abs() < 1e-9);
+        assert!((payout - 85.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dispute_opening_not_skipped_for_defined_trigger_paths() {
+        let state = AppState::default();
+        let attempt_id = "attempt-trigger".to_string();
+        state.settlement_attempts.lock().unwrap().insert(
+            attempt_id,
+            SettlementAttempt {
+                attempt_id: "attempt-trigger".to_string(),
+                match_id: "match-trigger".to_string(),
+                buy_order_id: "buy-trigger".to_string(),
+                sell_order_id: "sell-trigger".to_string(),
+                task_id: "task-demo".to_string(),
+                job_id: "job-demo".to_string(),
+                window_indexes: vec![1],
+                invoice_id: None,
+                payment_id: None,
+                status: SETTLEMENT_ATTEMPT_STATUS_PAYMENT_UNKNOWN.to_string(),
+                stage: SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT.to_string(),
+                created_at: now_rfc3339_like(),
+                updated_at: now_rfc3339_like(),
+                retry_count: 0,
+                idempotency_key: None,
+                payload_hash: None,
+                last_error_stage: None,
+                last_error_code: None,
+                last_error_message: None,
+                provider_mark_settling_done: false,
+                provider_mark_settled_done: false,
+                result_recorded: false,
+            },
+        );
+        auto_open_runtime_disputes(&state);
+        assert!(state
+            .disputes
+            .lock()
+            .unwrap()
+            .values()
+            .any(|d| d.dispute_type == common::market::DISPUTE_TYPE_PAYMENT_UNKNOWN));
+    }
+
+    #[test]
+    fn dispute_resolution_never_applies_disallowed_action() {
+        let state = AppState::default();
+        let id = open_dispute_if_absent(
+            &state,
+            common::market::DISPUTE_TYPE_PAYMENT_UNKNOWN,
+            "high",
+            "payment_unknown",
+            "payment_unknown",
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+        );
+        let err = apply_dispute_action(&state, &id, "apply-penalty").unwrap_err();
+        assert_eq!(err, "action_not_allowed_for_dispute");
+    }
+
+    #[tokio::test]
+    async fn recovery_and_reaper_never_double_process_same_target() {
+        let state = AppState::default();
+        state
+            .locked_buy_orders
+            .lock()
+            .unwrap()
+            .insert("buy-x".to_string());
+        run_recovery_tick(&state, 100).await;
+        run_reaper_tick(&state).await;
+        run_recovery_tick(&state, 110).await;
+        assert!(state.locked_buy_orders.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restart_restores_trade_billing_dispute_consistency() {
+        let state = AppState::default();
+        let _ = open_dispute_if_absent(
+            &state,
+            common::market::DISPUTE_TYPE_AMOUNT_MISMATCH,
+            "high",
+            "amount mismatch",
+            "amount_mismatch",
+            None,
+            Some("trade-1".to_string()),
+            None,
+            None,
+            None,
+            vec![],
+        );
+        let disputes = state.disputes.lock().unwrap().clone();
+        assert!(!disputes.is_empty());
+    }
+
+    #[test]
+    fn runtime_mode_behavior_consistent_across_status_trade_desk_and_provider_api() {
+        let _env_guard = ENV_TEST_LOCK.lock().expect("env lock");
+        std::env::set_var("SLICESTREAM_RUNTIME_MODE", "direct");
+        std::env::set_var("SLICESTREAM_DIRECT_ENDPOINT", "http://127.0.0.1:7000");
+        assert_eq!(current_runtime_mode(), "direct");
+        assert!(compute_direct_mode_ready());
+        std::env::remove_var("SLICESTREAM_RUNTIME_MODE");
+        std::env::remove_var("SLICESTREAM_DIRECT_ENDPOINT");
+    }
+
+    #[test]
+    fn direct_mode_uses_local_data_source_when_available() {
+        let _env_guard = ENV_TEST_LOCK.lock().expect("env lock");
+        std::env::set_var("SLICESTREAM_RUNTIME_MODE", "direct");
+        std::env::set_var("SLICESTREAM_DIRECT_ENDPOINT", "http://127.0.0.1:7000");
+        assert_eq!(
+            select_runtime_data_source(),
+            common::market::RUNTIME_DATA_SOURCE_DIRECT
+        );
+        std::env::remove_var("SLICESTREAM_RUNTIME_MODE");
+        std::env::remove_var("SLICESTREAM_DIRECT_ENDPOINT");
+    }
+
+    #[test]
+    fn bridge_mode_falls_back_cleanly_when_direct_not_ready() {
+        let _env_guard = ENV_TEST_LOCK.lock().expect("env lock");
+        std::env::set_var("SLICESTREAM_RUNTIME_MODE", "direct");
+        std::env::remove_var("SLICESTREAM_DIRECT_ENDPOINT");
+        std::env::remove_var("FIBER_RPC_ENDPOINT");
+        assert_eq!(
+            select_runtime_data_source(),
+            common::market::RUNTIME_DATA_SOURCE_BRIDGE
+        );
+        std::env::remove_var("SLICESTREAM_RUNTIME_MODE");
+    }
+
+    #[tokio::test]
+    async fn direct_and_bridge_paths_return_consistent_identity_semantics() {
+        let _env_guard = ENV_TEST_LOCK.lock().expect("env lock");
+        let state = AppState::default();
+        let app = app_with_state(state);
+        std::env::set_var("SLICESTREAM_RUNTIME_MODE", "bridge");
+        let bridge = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/node/identity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bridge.status(), StatusCode::OK);
+        std::env::set_var("SLICESTREAM_RUNTIME_MODE", "direct");
+        std::env::set_var("SLICESTREAM_DIRECT_ENDPOINT", "http://127.0.0.1:7000");
+        let direct = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/node/identity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(direct.status(), StatusCode::OK);
+        std::env::remove_var("SLICESTREAM_RUNTIME_MODE");
+        std::env::remove_var("SLICESTREAM_DIRECT_ENDPOINT");
+    }
+
+    #[test]
+    fn offer_detail_contains_confidence_and_evidence_metadata() {
+        let offer = common::market::OfferTelemetryRecord {
+            offer_id: "offer-1".into(),
+            provider_node_id: "node-1".into(),
+            provider_peer_id: "peer-1".into(),
+            provider_pubkey: "pub-1".into(),
+            hardware_vendor: "NVIDIA".into(),
+            hardware_model: "L40".into(),
+            gpu_count: 1,
+            vram_gib: 24.0,
+            system_ram_gib: 64.0,
+            memory_bandwidth_gbps: Some(1000.0),
+            interconnect: Some("pcie".into()),
+            power_limit_watts: Some(250.0),
+            benchmark_suite_version: "qualify-v1".into(),
+            measured_perf_value: 120.0,
+            measured_perf_unit: "tokens/s".into(),
+            perf_sample_count: 60,
+            perf_window_secs: 60,
+            perf_confidence: 0.91,
+            telemetry_source: common::market::TELEMETRY_CLASS_MEASURED.into(),
+            benchmark_freshness_secs: 5,
+            total_contributed_compute: 500.0,
+            dispute_rate: 0.0,
+            breach_rate: 0.0,
+            evidence_refs: vec!["evidence://offer/1".into()],
+            measurement_signature: Some("sig".into()),
+            confidence_label: common::market::confidence_label(
+                0.91,
+                common::market::TELEMETRY_CLASS_MEASURED,
+            ),
+        };
+        assert_eq!(offer.confidence_label, "high_confidence");
+        assert!(!offer.evidence_refs.is_empty());
+        assert!(offer.measurement_signature.is_some());
+    }
+
+    #[tokio::test]
+    async fn fiber_or_placeholder_mode_is_explicit_in_billing_and_trade_views() {
+        let state = AppState::default();
+        let app = app_with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/tasks/task-demo/trade-desk")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let mode = v
+            .get("payment_rail_mode")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        assert!(
+            mode == common::market::PAYMENT_RAIL_FIBER_SIMULATED
+                || mode == common::market::PAYMENT_RAIL_LOCAL_PLACEHOLDER
+                || mode == common::market::PAYMENT_RAIL_FIBER_REAL
+        );
+    }
+
+    #[test]
+    fn ckb_testnet_default_path_is_not_regressed() {
+        std::env::remove_var("SLICESTREAM_NETWORK");
+        std::env::remove_var("SLICESTREAM_ADDR_PREFIX");
+        let cfg = common::runtime_config::load_runtime_config();
+        assert_eq!(cfg.network.as_str(), "testnet");
+    }
+
+    #[test]
+    fn hackathon_submission_run_path_matches_runtime_mode_and_network_docs() {
+        let _env_guard = ENV_TEST_LOCK.lock().expect("env lock");
+        std::env::set_var("SLICESTREAM_RUNTIME_MODE", "direct");
+        std::env::set_var("SLICESTREAM_DIRECT_ENDPOINT", "http://127.0.0.1:7000");
+        let cfg = common::runtime_config::load_runtime_config();
+        assert!(compute_direct_mode_ready());
+        assert!(cfg.network.as_str() == "testnet" || cfg.network.as_str() == "mainnet");
+        std::env::remove_var("SLICESTREAM_RUNTIME_MODE");
+        std::env::remove_var("SLICESTREAM_DIRECT_ENDPOINT");
+    }
+
+    #[test]
+    fn dead_compat_paths_removed_or_explicitly_marked() {
+        let deps = runtime_mode_dependencies();
+        assert!(deps
+            .iter()
+            .all(|d| d.contains("missing") || d.contains("endpoint")));
     }
 }

@@ -110,7 +110,10 @@ pub fn resolve_runtime_config(
     }
 
     if let Some(mainnet_ready_raw) = file_map.get("mainnet_ready") {
-        cfg.mainnet_ready = matches!(mainnet_ready_raw.trim().to_lowercase().as_str(), "true" | "1" | "yes");
+        cfg.mainnet_ready = matches!(
+            mainnet_ready_raw.trim().to_lowercase().as_str(),
+            "true" | "1" | "yes"
+        );
     }
 
     if let Some(prefix) = file_map.get("ckb_address_prefix") {
@@ -143,7 +146,8 @@ pub fn resolve_runtime_config(
     }
 
     if let Some(mode_raw) = env_map.get("SLICESTREAM_SETTLEMENT_MODE") {
-        cfg.settlement_mode = SettlementMode::from_str(mode_raw).unwrap_or(SettlementMode::Merge30s);
+        cfg.settlement_mode =
+            SettlementMode::from_str(mode_raw).unwrap_or(SettlementMode::Merge30s);
     }
 
     if let Some(prefix) = env_map.get("CKB_ADDRESS_PREFIX") {
@@ -213,7 +217,10 @@ mod tests {
 
         let mut env_map = HashMap::new();
         env_map.insert("SLICESTREAM_NETWORK".to_string(), "???".to_string());
-        env_map.insert("SLICESTREAM_SETTLEMENT_MODE".to_string(), "bad-mode".to_string());
+        env_map.insert(
+            "SLICESTREAM_SETTLEMENT_MODE".to_string(),
+            "bad-mode".to_string(),
+        );
 
         let cfg = resolve_runtime_config(&file_map, &env_map);
         assert_eq!(cfg.network, Network::Testnet);

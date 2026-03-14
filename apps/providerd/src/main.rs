@@ -22,6 +22,7 @@ use common::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 mod market_support;
+mod runtime_mode_support;
 
 use std::{
     collections::HashMap,
@@ -30,6 +31,11 @@ use std::{
     sync::{mpsc, Arc, Mutex},
     thread,
     time::Duration,
+};
+
+use runtime_mode_support::{
+    bridge_dependent_modules, compute_direct_mode_ready, current_runtime_mode,
+    runtime_mode_dependencies, select_runtime_data_source,
 };
 
 use market_support::{
@@ -565,6 +571,7 @@ fn app_with_state(state: AppState) -> Router {
         )
         .route("/internal/market/audit", get(get_market_audit))
         .route("/internal/market/events", get(get_market_events))
+        .route("/internal/runtime/mode", get(get_runtime_mode))
         .route(
             "/internal/market/orders/sell/suggested",
             get(get_suggested_sell_orders),
@@ -582,6 +589,31 @@ fn app_with_state(state: AppState) -> Router {
             post(confirm_recommended_band),
         )
         .with_state(state)
+}
+
+async fn get_runtime_mode() -> impl IntoResponse {
+    let mode = current_runtime_mode();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "runtime_mode": mode,
+            "direct_mode_ready": compute_direct_mode_ready(),
+            "settlement_interval_secs": common::market::SETTLEMENT_INTERVAL_SECS_FIBER_DEFAULT,
+            "runtime_mode_dependencies": runtime_mode_dependencies(),
+            "runtime_data_source_path": select_runtime_data_source(),
+            "bridge_dependent_modules": bridge_dependent_modules(),
+            "billing_window_statuses": [
+                common::market::BILLING_WINDOW_STATUS_PENDING,
+                common::market::BILLING_WINDOW_STATUS_INVOICED,
+                common::market::BILLING_WINDOW_STATUS_PAYMENT_SUBMITTED,
+                common::market::BILLING_WINDOW_STATUS_PAID,
+                common::market::BILLING_WINDOW_STATUS_DISPUTED,
+                common::market::BILLING_WINDOW_STATUS_REFUNDED,
+                common::market::BILLING_WINDOW_STATUS_FINALIZED,
+                common::market::BILLING_WINDOW_STATUS_FAILED
+            ]
+        })),
+    )
 }
 
 fn generate_mock_sample(job: &mut JobRuntime) -> SampleInput {
@@ -1240,7 +1272,13 @@ async fn get_sell_orders(State(state): State<AppState>) -> impl IntoResponse {
         .map(|mut o| {
             if let Some(price) = maybe_price {
                 o.unit_price_per_work_unit = price;
-            } else if state.pricing_mode.lock().expect("pricing mode lock").as_str() == PRICE_MODE_RECOMMENDED_BAND {
+            } else if state
+                .pricing_mode
+                .lock()
+                .expect("pricing mode lock")
+                .as_str()
+                == PRICE_MODE_RECOMMENDED_BAND
+            {
                 o.status = "blocked_pending_confirmation".to_string();
             }
             o

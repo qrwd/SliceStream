@@ -52,8 +52,14 @@ pub fn verify(bundle: &EvidenceBundle, root: &str) -> bool {
 
 fn bundle_to_canonical(bundle: &EvidenceBundle) -> CanonicalValue {
     let mut map = BTreeMap::new();
-    map.insert("version".to_string(), CanonicalValue::String(bundle.version.clone()));
-    map.insert("job_id".to_string(), CanonicalValue::String(bundle.job_id.clone()));
+    map.insert(
+        "version".to_string(),
+        CanonicalValue::String(bundle.version.clone()),
+    );
+    map.insert(
+        "job_id".to_string(),
+        CanonicalValue::String(bundle.job_id.clone()),
+    );
     map.insert(
         "window_range".to_string(),
         CanonicalValue::String(bundle.window_range.clone()),
@@ -126,7 +132,10 @@ fn bundle_to_canonical(bundle: &EvidenceBundle) -> CanonicalValue {
 
 fn receipt_to_canonical(receipt: &EvidenceReceipt) -> CanonicalValue {
     let mut map = BTreeMap::new();
-    map.insert("job_id".to_string(), CanonicalValue::String(receipt.job_id.clone()));
+    map.insert(
+        "job_id".to_string(),
+        CanonicalValue::String(receipt.job_id.clone()),
+    );
     map.insert(
         "window_index".to_string(),
         CanonicalValue::Number(receipt.window_index.to_string()),

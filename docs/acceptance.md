@@ -377,3 +377,113 @@ Example summary (expected):
   - disputes are queryable from `/internal/market/disputes` and resolvable from `/internal/market/disputes/{dispute_id}/resolve`.
 - Dashboard and Tauri parity checks:
   - both surfaces show mode/recommended/recovery/dispute summaries and expose recovery/reaper/reconfirm actions.
+  - tauri shell must render six operational regions: system overview, mode+automation, recommended, attempts/settlement, risk+warnings, ops action panel.
+  - tauri shell must surface action feedback states (success/failed) for retry/mark-final/recovery/reaper/reconfirm/resolve-dispute actions.
+
+
+## Hackathon-fit closure checks (CKB/Fiber focus)
+
+- `GET /v1/tasks/{task_id}/status` should expose identity-first and policy-first fields:
+  - `peer_id`, `node_pubkey`
+  - `settlement_interval_secs` (expected `60` for Fiber path)
+  - `committed_compute_total`, `minimum_commit_compute`, `delivered_compute_total`
+  - `breach_tolerance_ratio`, `penalty_policy`, `stop_condition`, `finalization_rule`
+- Penalty policy check (logic-level): gap ratio `> 3%` triggers `15%` refund to buyer; `<= 3%` has no refund penalty.
+- UI parity check:
+  - dashboard and tauri must both render commitment/penalty/recovery/dispute core fields from live API payload.
+
+
+## Stage 2 acceptance additions (settlement/billing hardening)
+
+Run the focused stage-2 checks:
+
+```bash
+cargo test -p common
+cargo test -p metering
+cargo test -p agentd replay_create_invoice_stage_idempotent_or_conflict_cleanly
+cargo test -p agentd replay_settle_payment_stage_idempotent_or_conflict_cleanly
+cargo test -p agentd replay_record_result_stage_idempotent_or_opens_dispute
+cargo test -p agentd billing_windows_persist_and_restore_correctly
+cargo test -p agentd trade_and_billing_remain_consistent_after_restart
+```
+
+Expected outcomes:
+- Billing windows persist/restore with status and invoice/payment linkage intact.
+- Replay stages are idempotent for unchanged payloads and classify/open disputes on inconsistent replay paths.
+- Penalty/refund/payout values remain consistent with breach gap rules under restart/recovery.
+
+
+## Stage 3 acceptance additions (dispute/recovery/reaper/runtime-mode)
+
+```bash
+cargo test -p agentd dispute_resolution_action_updates_status_and_effects
+cargo test -p agentd invalid_dispute_action_is_rejected_by_guards
+cargo test -p agentd provider_agent_amount_mismatch_resolves_through_dispute_flow
+cargo test -p agentd payment_unknown_opens_dispute_and_blocks_auto_commit
+cargo test -p agentd reaper_releases_expired_locks_and_audits_actions
+cargo test -p agentd stopped_task_cleanup_releases_runtime_bindings
+cargo test -p agentd provider_offline_enters_dispute_or_recovery_path_correctly
+cargo test -p agentd restart_restores_attempts_bills_disputes
+cargo test -p agentd no_orphaned_locks_after_failure_or_restart
+cargo test -p agentd direct_mode_readiness_is_computed_not_hardcoded
+```
+
+Expected outcomes:
+- 10 dispute types are runtime-routed (not only constants), including replay/pricing/amount-mismatch branches.
+- dispute actions are guard-checked and have bill/attempt side effects.
+- recovery+reaper paths converge locked/orphaned/stopped/offline resources safely.
+
+
+## Stage 4 acceptance additions (full-flow audit + anti-spaghetti closure)
+
+```bash
+cargo test -p agentd full_flow_regression_audit_passes_core_paths
+cargo test -p agentd no_double_payment_or_double_settlement_in_replay_paths
+cargo test -p agentd billing_and_penalty_math_consistent_under_restart_and_retry
+cargo test -p agentd dispute_opening_not_skipped_for_defined_trigger_paths
+cargo test -p agentd dispute_resolution_never_applies_disallowed_action
+cargo test -p agentd recovery_and_reaper_never_double_process_same_target
+cargo test -p agentd restart_restores_trade_billing_dispute_consistency
+cargo test -p agentd runtime_mode_behavior_consistent_across_status_trade_desk_and_provider_api
+cargo test -p agentd dead_compat_paths_removed_or_explicitly_marked
+```
+
+Outcome expectation:
+- replay and dispute paths are idempotent and no double-settlement is introduced;
+- recovery and reaper do not double-process the same targets;
+- runtime mode semantics are consistent across status/trade-desk/provider mode APIs.
+
+
+## Stage 5 acceptance additions (direct path + signing + CKB/Fiber hardening)
+
+```bash
+cargo test -p common signing_and_verification_succeeds_for_supported_objects
+cargo test -p common tampered_payload_fails_verification
+cargo test -p common canonical_payload_bytes_are_stable
+cargo test -p common offer_telemetry_signature_roundtrip
+cargo test -p common billing_window_signature_roundtrip
+cargo test -p common dispute_snapshot_signature_roundtrip
+cargo test -p agentd direct_mode_uses_local_data_source_when_available
+cargo test -p agentd bridge_mode_falls_back_cleanly_when_direct_not_ready
+cargo test -p agentd direct_and_bridge_paths_return_consistent_identity_semantics
+cargo test -p agentd fiber_or_placeholder_mode_is_explicit_in_billing_and_trade_views
+```
+
+Expected outcomes:
+- direct mode chooses local-node data source when direct dependencies are ready;
+- bridge fallback remains safe when direct dependencies are missing;
+- canonical signatures verify for telemetry/billing/dispute snapshots and tamper detection works.
+
+
+## Stage 6 acceptance additions (frontend productization terminal)
+
+```bash
+cargo test -p dashboard
+python apps/dashboard/src-tauri/scripts/smoke_check.py
+```
+
+Dashboard frontend checks now require:
+- 10 workspace tabs are present and populated (no blank-shell tabs).
+- Trade Terminal renders objectized trade rows + detail workspace.
+- Billing/Dispute/Node/Profile workspaces are actionable, not read-only stubs.
+- Demo scenario switcher exposes at least normal / penalty / payment_unknown paths.

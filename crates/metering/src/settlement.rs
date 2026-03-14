@@ -125,7 +125,10 @@ pub fn settle_window(input: WindowInput, previous_hash: &str) -> Receipt {
     material.insert("job_id", input.job_id.clone());
     material.insert("window_index", input.window_index.to_string());
     material.insert("valid_samples", input.valid_samples.to_string());
-    material.insert("work_units_window", format!("{:.12}", input.work_units_window));
+    material.insert(
+        "work_units_window",
+        format!("{:.12}", input.work_units_window),
+    );
     material.insert(
         "unit_price_per_work_unit",
         format!("{:.12}", input.unit_price_per_work_unit),
@@ -299,7 +302,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn same_inputs_produce_same_root_hash_across_runs() {
         let inputs = vec![
@@ -317,6 +319,33 @@ mod tests {
             assert_eq!(left.receipt_hash, right.receipt_hash);
             assert_eq!(left.hash_alg, right.hash_alg);
         }
+    }
+
+    #[test]
+    fn billing_windows_generated_every_60_seconds() {
+        let mut agg = InvoiceAggregator::new(MergePolicy::Merge60s);
+        let mut emitted = None;
+        for idx in 0..4_u64 {
+            let receipt = settle_window(window("job-a", idx, 60, 10.0, 1.0), "");
+            emitted = agg.ingest(receipt).expect("ingest must succeed");
+        }
+        let invoice = emitted.expect("invoice after 4x15s windows");
+        assert_eq!(invoice.window_indexes, vec![0, 1, 2, 3]);
+        assert_eq!(
+            invoice.window_indexes.len() as u64 * SETTLE_WINDOW_SECONDS,
+            60
+        );
+    }
+
+    #[test]
+    fn per_window_bill_contains_compute_amount_price_status_and_evidence_refs() {
+        let receipt = settle_window(window("job-a", 7, 60, 12.5, 0.8), "prev-root");
+        assert_eq!(receipt.window_index, 7);
+        assert!((receipt.work_units_window - 12.5).abs() < 1e-9);
+        assert!((receipt.unit_price_per_work_unit - 0.8).abs() < 1e-9);
+        assert!((receipt.owed_window - 10.0).abs() < 1e-9);
+        assert!(!receipt.telemetry_digest.is_empty());
+        assert_eq!(receipt.receipt_hash.len(), 64);
     }
 
     #[test]
@@ -357,10 +386,8 @@ mod tests {
 
         let mut changed_telemetry = window("job-a", 1, 30, 10.0, 1.0);
         changed_telemetry.telemetry_digest = "tampered".to_string();
-        let changed_telemetry_batch = settle_batch(&[
-            window("job-a", 0, 60, 10.0, 1.0),
-            changed_telemetry,
-        ]);
+        let changed_telemetry_batch =
+            settle_batch(&[window("job-a", 0, 60, 10.0, 1.0), changed_telemetry]);
         assert_ne!(base.root_hash, changed_telemetry_batch.root_hash);
     }
 }

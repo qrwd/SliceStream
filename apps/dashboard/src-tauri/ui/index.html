@@ -2,138 +2,192 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>SliceStream Desktop Terminal</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>SliceStream Pro Terminal</title>
   <style>
-    :root { color-scheme: dark; }
-    html, body { margin: 0; height: 100%; font-family: Inter, system-ui, sans-serif; background: #070d1a; color: #eaf0ff; }
-    .shell { height: 100%; display: grid; grid-template-rows: auto 1fr; }
-    .top {
-      display: grid;
-      grid-template-columns: repeat(6, minmax(160px, 1fr));
-      gap: 10px;
-      padding: 10px;
-      border-bottom: 1px solid #22365f;
-      background: linear-gradient(180deg, #0f1a33, #0b1428);
-    }
-    .pill { border: 1px solid #314c82; border-radius: 10px; padding: 8px 10px; background: #131f3d; }
-    .k { color: #9fb4e7; font-size: 11px; text-transform: uppercase; }
-    .v { font-size: 15px; font-weight: 700; margin-top: 4px; }
-    .sub { font-size: 11px; color: #9fb4e7; margin-top: 3px; }
-    .ok { color: #7ee6a2; }
-    .err { color: #ff8fa0; }
-    .frame-wrap { position: relative; min-height: 0; }
-    iframe { width: 100%; height: 100%; border: 0; background: #070d1a; }
-    .overlay {
-      position: absolute; inset: 0; display: none;
-      align-items: center; justify-content: center;
-      background: radial-gradient(1200px 500px at 20% 0%, rgba(90,130,255,.16), transparent 60%), #070d1a;
-    }
-    .card {
-      width: min(760px, 92%);
-      border: 1px solid #304d84;
-      border-radius: 14px;
-      background: #121f3d;
-      padding: 20px;
-    }
-    .card h2 { margin-top: 0; }
-    .line { color: #b3c4f0; margin: 8px 0; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-    button {
-      border: 1px solid #4f73bd;
-      border-radius: 8px;
-      background: #1a2f5e;
-      color: #fff;
-      padding: 8px 12px;
-      cursor: pointer;
-      margin-right: 8px;
-    }
+    :root{color-scheme:dark;--bg:#070d1a;--card:#0f1931;--line:#26447c;--muted:#9ab0db;--ok:#8ef3b2;--warn:#ffd08a;--bad:#ff9fb1;--accent:#66a3ff}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:#eaf1ff;font-family:Inter,system-ui,sans-serif}
+    .app{display:grid;grid-template-rows:auto auto 1fr auto;height:100vh;width:100%;overflow:hidden}
+    .top{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;padding:10px;border-bottom:1px solid var(--line);background:#0b152c}
+    .pill{background:#121f3d;border:1px solid #335897;border-radius:10px;padding:8px}.k{font-size:10px;color:var(--muted);text-transform:uppercase}.v{font-size:14px;font-weight:700}
+    .toolbar{display:flex;gap:6px;flex-wrap:wrap;padding:8px 10px;border-bottom:1px solid var(--line);background:#0a1328}
+    .tab{border:1px solid #456db2;background:#162c58;color:#fff;border-radius:8px;padding:7px 10px;cursor:pointer}.tab.active{background:#2a4b88}
+    .workspace{display:none;overflow:auto;padding:10px;min-width:0}.workspace.active{display:grid;gap:10px}
+    .g3{grid-template-columns:minmax(320px,1.1fr) minmax(520px,1.7fr) minmax(320px,1.1fr)}.g2{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+    .panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px;min-height:120px;min-width:0;overflow:hidden}
+    .panel h3{margin:0 0 8px 0;font-size:13px;letter-spacing:.2px}
+    table{width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed}th,td{padding:6px 5px;border-bottom:1px solid #1f3762;vertical-align:top;text-align:left;word-break:break-word}
+    th{position:sticky;top:0;background:#12213f;z-index:1}
+    .tag{padding:2px 8px;border-radius:999px;font-size:11px;border:1px solid #3d5f9f}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
+    .mono{font-family:ui-monospace,Menlo,Consolas,monospace}.row{display:flex;gap:8px;align-items:center}.btn{border:1px solid #4c74bc;background:#1d3568;color:#fff;border-radius:8px;padding:7px 9px;cursor:pointer}
+    .stack{display:grid;gap:8px}.timeline{display:grid;gap:6px}.event{border:1px solid #2e4e85;background:#0c1730;border-radius:8px;padding:8px;font-size:12px}
+    input,select{width:100%;background:#081226;color:#fff;border:1px solid #35518c;border-radius:6px;padding:7px}
+    .status{padding:8px 10px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}
+    .progress{height:8px;background:#0b1630;border:1px solid #2f4c84;border-radius:999px;overflow:hidden}.progress>span{display:block;height:100%;background:linear-gradient(90deg,#5b8df5,#67e1ff)}
   </style>
+<!-- smoke markers: Bridge Connected Disconnected mode Network / Prefix cargo run -p dashboard -->
 </head>
 <body>
-  <!-- smoke markers: Bridge / Connected / Disconnected / mode / Network / Prefix / cargo run -p dashboard -->
-  <div class="shell">
-    <section class="top">
-      <div class="pill"><div class="k">Bridge</div><div id="bridge" class="v err">Disconnected</div><div class="sub">desktop terminal host</div></div>
-      <div class="pill"><div class="k">Runtime</div><div id="mode" class="v">-</div><div id="network" class="sub">-</div></div>
-      <div class="pill"><div class="k">Terminal</div><div class="v">SliceStream Trading Terminal</div><div id="last" class="sub">-</div></div>
-      <div class="pill"><div class="k">Recommended</div><div id="rec" class="v">-</div><div id="rech" class="sub mono">-</div></div>
-      <div class="pill"><div class="k">Recovery</div><div id="recovery" class="v">-</div><div id="locks" class="sub">-</div></div>
-      <div class="pill"><div class="k">Disputes</div><div id="disputes" class="v">-</div><div id="disputeHint" class="sub">-</div></div>
-    </section>
-    <section class="frame-wrap">
-      <iframe id="terminalFrame" title="SliceStream Terminal"></iframe>
-      <div id="overlay" class="overlay">
-        <div class="card">
-          <h2>Disconnected</h2>
-          <p class="line">Desktop terminal is waiting for dashboard bridge.</p>
-          <p class="line mono">Please start: <b>cargo run -p dashboard</b></p>
-          <p class="line mono">Then keep providerd and agentd running.</p>
-          <button id="retryBtn">Retry Connection</button><button id="runRecoveryBtn">Resume Recovery</button><button id="runReaperBtn">Run Reaper</button><button id="confirmRecBtn">Reconfirm Recommended</button>
-        </div>
-      </div>
-    </section>
-  </div>
+<div class="app">
+  <section class="top">
+    <div class="pill"><div class="k">Network / Prefix</div><div id="net" class="v">-</div></div>
+    <div class="pill"><div class="k">Runtime Mode</div><div id="runtime" class="v">-</div></div>
+    <div class="pill"><div class="k">Direct Readiness</div><div id="direct" class="v">-</div></div>
+    <div class="pill"><div class="k">Node Identity</div><div id="identity" class="v mono">-</div></div>
+    <div class="pill"><div class="k">Payment Rail</div><div id="rail" class="v">-</div></div>
+    <div class="pill"><div class="k">Open Disputes</div><div id="openDisputes" class="v">-</div></div>
+    <div class="pill"><div class="k">Unknown Payments</div><div id="unknownPays" class="v">-</div></div>
+    <div class="pill"><div class="k">Recovery Queue</div><div id="recoveryQ" class="v">-</div></div>
+  </section>
 
-  <script>
-    const BRIDGE = 'http://127.0.0.1:4003';
-    const frame = document.getElementById('terminalFrame');
-    const overlay = document.getElementById('overlay');
-    const bridge = document.getElementById('bridge');
-    const mode = document.getElementById('mode');
-    const network = document.getElementById('network');
-    const last = document.getElementById('last');
-    const rec = document.getElementById('rec');
-    const rech = document.getElementById('rech');
-    const recovery = document.getElementById('recovery');
-    const locks = document.getElementById('locks');
-    const disputes = document.getElementById('disputes');
-    const disputeHint = document.getElementById('disputeHint');
+  <section class="toolbar">
+    <button class="tab active" data-tab="home">Home</button>
+    <button class="tab" data-tab="terminal">Trade Terminal</button>
+    <button class="tab" data-tab="market">Market / Offers</button>
+    <button class="tab" data-tab="orders">Orders / Trades</button>
+    <button class="tab" data-tab="billing">Billing / Settlement</button>
+    <button class="tab" data-tab="disputes">Disputes</button>
+    <button class="tab" data-tab="ops">Recovery / Ops</button>
+    <button class="tab" data-tab="evidence">Evidence / Audit</button>
+    <button class="tab" data-tab="node">Node / Network</button>
+    <button class="tab" data-tab="profile">Profile / Settings</button>
+  </section>
 
-    function setConnected(data) {
-      bridge.textContent = 'Connected';
-      bridge.className = 'v ok';
-      mode.textContent = `mode=${data?.current_market_mode || data?.agent_market_mode || '-'} settlement=${data?.settlement_mode || '-'}`;
-      network.textContent = `${data?.network || '-'} / ${data?.prefix || '-'}`;
-      rec.textContent = String(data?.recommended_confirmation_valid);
-      rech.textContent = String(data?.recommended_context_hash || '-').slice(0,24);
-      recovery.textContent = `q=${data?.recovery_queue_size ?? '-'} stuck=${data?.stuck_attempts_count ?? '-'}`;
-      locks.textContent = `locks ${data?.locked_buy_orders_count ?? 0}/${data?.locked_sell_orders_count ?? 0}`;
-      const ds=(data?.disputes||[]);
-      disputes.textContent = `${ds.length}`;
-      disputeHint.textContent = ds.length ? `${ds[0].dispute_type||'-'}:${ds[0].status||'-'}` : 'none';
-      last.textContent = new Date().toLocaleTimeString();
-      overlay.style.display = 'none';
-      if (frame.src !== `${BRIDGE}/`) {
-        frame.src = `${BRIDGE}/`;
-      }
-    }
+  <section id="tab-home" class="workspace active g3">
+    <div class="panel"><h3>Workspace KPI</h3><table><tbody id="kpiRows"></tbody></table><h3>Quick Actions</h3><div class="row"><button class="btn" id="newBuyBtn">New Buy</button><button class="btn" id="compareOffersBtn">Compare Offers</button><button class="btn" id="openTradeDeskBtn">Open Trade Desk</button></div><div class="row"><button class="btn" id="runRecoveryBtn">Run Recovery</button><button class="btn" id="runReaperBtn">Run Reaper</button><button class="btn" id="refreshNodeBtn">Refresh Node State</button></div></div>
+    <div class="panel"><h3>Risk Overview</h3><table><tbody id="riskRows"></tbody></table><h3>Telemetry Confidence Summary</h3><table><tbody id="telemetrySummary"></tbody></table></div>
+    <div class="panel"><h3>Recent Activity Stream</h3><div id="activityStream" class="timeline"></div></div>
+  </section>
 
-    function setDisconnected() {
-      bridge.textContent = 'Disconnected';
-      bridge.className = 'v err';
-      last.textContent = new Date().toLocaleTimeString();
-      overlay.style.display = 'flex';
-    }
+  <section id="tab-terminal" class="workspace g3">
+    <div class="panel"><h3>Market Watch / Recommended Offers</h3><table><thead><tr><th>Offer</th><th>Perf</th><th>Confidence</th></tr></thead><tbody id="terminalOffers"></tbody></table></div>
+    <div class="panel"><h3>Trade Rows</h3><table><thead><tr><th>trade_id</th><th>buyer/provider</th><th>progress</th><th>stage</th><th>status</th><th>penalty</th><th>bill</th><th>dispute</th><th>rail</th></tr></thead><tbody id="tradeTerminalRows"></tbody></table></div>
+    <div class="panel"><h3>Trade Detail Workspace</h3><div class="row"><span class="tag">Summary</span><span class="tag">Timeline</span><span class="tag">Attempts</span><span class="tag">Billing Windows</span><span class="tag">Evidence</span><span class="tag">Disputes</span><span class="tag">Risk</span><span class="tag">Actions</span></div><table><tbody id="tradeDetailRows"></tbody></table><h3>Buy Wizard</h3><label>Task</label><input id="buyTask" value="task-demo"/><label>Provider</label><input id="buyProvider" value="provider-demo"/><button class="btn" id="buyWizardSubmit">Place Buy</button></div>
+  </section>
 
-    async function probe() {
-      try {
-        const res = await fetch(`${BRIDGE}/api/live/task-demo?provider=provider-demo`);
-        if (!res.ok) throw new Error(`http_${res.status}`);
-        const data = await res.json();
-        setConnected(data);
-      } catch (_e) {
-        setDisconnected();
-      }
-    }
+  <section id="tab-market" class="workspace g2">
+    <div class="panel"><h3>Offers Table</h3><table><thead><tr><th>offer_id</th><th>hardware</th><th>price</th><th>perf</th><th>confidence</th><th>source</th></tr></thead><tbody id="offersRows"></tbody></table></div>
+    <div class="panel"><h3>Offer Compare</h3><label>Offer A</label><select id="offerA"></select><label>Offer B</label><select id="offerB"></select><button class="btn" id="compareDo">Compare</button><table><tbody id="offerCompareRows"></tbody></table></div>
+  </section>
 
-    async function act(path) { try { await fetch(`${BRIDGE}${path}`, { method: 'POST' }); } catch (_e) {} await probe(); }
-    document.getElementById('retryBtn').addEventListener('click', probe);
-    document.getElementById('runRecoveryBtn').addEventListener('click', () => act('/api/action/recovery_run'));
-    document.getElementById('runReaperBtn').addEventListener('click', () => act('/api/action/reaper_run'));
-    document.getElementById('confirmRecBtn').addEventListener('click', () => act('/api/action/confirm_recommended'));
-    probe();
-    setInterval(probe, 2500);
-  </script>
+  <section id="tab-orders" class="workspace g2">
+    <div class="panel"><h3>Orders / Matches</h3><table><thead><tr><th>type</th><th>id</th><th>price</th><th>status</th></tr></thead><tbody id="orderRows"></tbody></table></div>
+    <div class="panel"><h3>Trade / Attempt Links</h3><table><tbody id="orderLinks"></tbody></table></div>
+  </section>
+
+  <section id="tab-billing" class="workspace g2">
+    <div class="panel"><h3>Billing Center</h3><table><thead><tr><th>bill_id</th><th>trade_id</th><th>window</th><th>compute</th><th>price</th><th>gross</th><th>refund</th><th>penalty</th><th>payout</th><th>invoice/payment</th><th>status</th></tr></thead><tbody id="billingRows"></tbody></table></div>
+    <div class="panel"><h3>Billing Summary / Penalty Simulator</h3><table><tbody id="billingSummary"></tbody></table><label>gross total</label><input id="simGross" value="100"/><label>committed</label><input id="simCommit" value="120"/><label>delivered</label><input id="simDelivered" value="90"/><button class="btn" id="simRun">Simulate</button><table><tbody id="simOut"></tbody></table></div>
+  </section>
+
+  <section id="tab-disputes" class="workspace g2">
+    <div class="panel"><h3>Dispute List</h3><table><thead><tr><th>id</th><th>type</th><th>severity</th><th>status</th></tr></thead><tbody id="disputeRows"></tbody></table></div>
+    <div class="panel"><h3>Dispute Resolution Wizard</h3><label>Dispute ID</label><input id="disputeId"/><label>Action</label><select id="disputeAction"><option>resolve</option><option>escalate</option><option>retry</option><option>rollback</option><option>apply-penalty</option><option>release-refund</option></select><button class="btn" id="disputeApply">Apply</button><table><tbody id="disputeDetail"></tbody></table></div>
+  </section>
+
+  <section id="tab-ops" class="workspace g2">
+    <div class="panel"><h3>Recovery / Reaper Console</h3><table><tbody id="opsRows"></tbody></table><div class="row"><button class="btn" id="retryAttemptBtn">Retry Attempt</button><button class="btn" id="markFinalBtn">Mark Final</button><button class="btn" id="refreshRemoteBtn">Refresh Remote Status</button></div></div>
+    <div class="panel"><h3>Action Result Timeline</h3><div id="opsLog" class="timeline"></div></div>
+  </section>
+
+  <section id="tab-evidence" class="workspace g2">
+    <div class="panel"><h3>Evidence / Audit Timeline</h3><div id="auditTimeline" class="timeline"></div></div>
+    <div class="panel"><h3>Snapshot / Hash Explorer</h3><table><tbody id="hashRows"></tbody></table></div>
+  </section>
+
+  <section id="tab-node" class="workspace g2">
+    <div class="panel"><h3>Node / Network</h3><table><tbody id="nodeRows"></tbody></table></div>
+    <div class="panel"><h3>Direct-vs-Bridge Explainer</h3><table><tbody id="pathRows"></tbody></table></div>
+  </section>
+
+  <section id="tab-profile" class="workspace g2">
+    <div class="panel"><h3>Personal Homepage</h3><table><tbody id="profileRows"></tbody></table><h3>Recent Personal Activity</h3><div id="profileActivity" class="timeline"></div></div>
+    <div class="panel"><h3>Settings</h3><label>Theme</label><select id="themeSel"><option>dark-pro</option><option>dark-terminal</option></select><label>Density</label><select id="densitySel"><option>high</option><option>comfortable</option></select><label>Auto refresh interval (ms)</label><input id="refreshInput" value="2500"/><label>Demo Mode</label><select id="demoMode"><option>on</option><option>off</option></select><label>Scenario</label><select id="scenarioSel"><option value="normal">normal_completed_trade</option><option value="penalty">penalty_refund_trade</option><option value="payment_unknown">payment_unknown_dispute_trade</option></select><label>Show Hash Style</label><select id="hashMode"><option>truncated</option><option>full</option></select><button class="btn" id="saveSettings">Save Settings</button></div>
+  </section>
+
+  <div class="status" id="status">status: booting...</div>
+</div>
+
+<script>
+const BRIDGE='http://127.0.0.1:4003';
+const $=id=>document.getElementById(id);
+const row=(k,v)=>`<tr><td>${k}</td><td>${v}</td></tr>`;
+const evt=(h,b)=>`<div class='event'><div class='k'>${h}</div><div>${b}</div></div>`;
+function setStatus(t){$('status').textContent='status: '+t;}
+function cls(s){if(['settled','paid','finalized','resolved'].includes(s))return'ok'; if(['payment_unknown','failed','disputed','escalated_final'].includes(s))return'bad'; return'warn';}
+async function j(url,opt={}){const r=await fetch(url,opt); if(!r.ok) throw new Error(await r.text()); return r.json();}
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.querySelectorAll('.workspace').forEach(x=>x.classList.remove('active'));$('tab-'+b.dataset.tab).classList.add('active');});
+
+const settings={scenario:'normal'};
+function scenarioFilter(data){
+  const s=settings.scenario;
+  if(s==='normal') return data;
+  const out=JSON.parse(JSON.stringify(data));
+  if(s==='penalty') out.trades=(out.trades||[]).filter(t=>(t.current_penalty_preview||0)>0);
+  if(s==='payment_unknown') out.trades=(out.trades||[]).filter(t=>(t.status||'').includes('payment_unknown')|| (t.gap_ratio||0)>0.4);
+  return out;
+}
+
+async function load(){
+  try{
+    let data=await j(`${BRIDGE}/api/live/task-demo?provider=provider-demo`);
+    data=scenarioFilter(data);
+    const trades=data.trades||[]; const bills=data.billing_windows||[]; const disputes=data.disputes||[]; const offers=data.offers||[];
+    $('net').textContent=`${data.network||'-'} / ${data.prefix||'-'}`;
+    $('runtime').textContent=data.runtime_mode||'bridge';
+    $('direct').textContent=String(data.direct_mode_ready);
+    $('identity').textContent=`${data.peer_id||'-'} / ${(data.node_pubkey||'-').slice(0,20)}`;
+    $('rail').textContent=data.payment_rail_mode||'-';
+    $('openDisputes').textContent=String(disputes.filter(d=>['open','awaiting_manual_resolution'].includes(d.status)).length);
+    $('unknownPays').textContent=String(data.payment_unknown_attempts_count||0);
+    $('recoveryQ').textContent=String(data.recovery_queue_size||0);
+
+    $('kpiRows').innerHTML=[row('active trades',trades.length),row('total delivered compute',trades.reduce((a,t)=>a+(t.delivered_compute_total||0),0).toFixed(2)),row('open billing windows',bills.filter(b=>!['finalized','paid'].includes(b.status)).length),row('pending refunds',bills.filter(b=>(b.refund_amount||0)>0).length),row('penalty exposure',bills.reduce((a,b)=>a+(b.penalty_amount||0),0).toFixed(2)),row('provider offline impact',data.provider_offline_impact_count||0)].join('');
+    $('riskRows').innerHTML=[row('gap ratio distribution',trades.map(t=>(t.gap_ratio||0).toFixed(3)).join(', ')),row('unknown payment risk',data.payment_unknown_attempts_count||0),row('dispute severity summary',disputes.map(d=>d.severity).join(', ')||'none')].join('');
+    $('telemetrySummary').innerHTML=[row('offers',offers.length),row('avg confidence',offers.length?(offers.reduce((a,o)=>a+(o.perf_confidence||0),0)/offers.length).toFixed(2):'-'),row('sources',[...new Set(offers.map(o=>o.telemetry_source||'-'))].join(', '))].join('');
+    $('activityStream').innerHTML=[evt('latest trade',trades[0]?.trade_id||'-'),evt('latest bill',bills[0]?.bill_id||'-'),evt('latest dispute',disputes[0]?.dispute_id||'-'),evt('latest recovery',String(data.recovery_queue_size||0))].join('');
+
+    $('terminalOffers').innerHTML=offers.map(o=>`<tr><td>${o.offer_id||'-'}</td><td>${o.measured_perf_value||'-'} ${o.measured_perf_unit||''}</td><td>${o.confidence_label||'-'}</td></tr>`).join('')||'<tr><td colspan="3">seeded scenario active</td></tr>';
+    $('tradeTerminalRows').innerHTML=trades.map(t=>{const ratio=Math.min(1,((t.delivered_compute_total||0)/Math.max(1,t.committed_compute_total||1))); return `<tr><td>${t.trade_id}</td><td class='mono'>${(t.buyer_peer_id||'buyer')}/${(t.provider_peer_id||'provider')}</td><td><div class='progress'><span style='width:${Math.round(ratio*100)}%'></span></div>${(t.delivered_compute_total||0).toFixed(1)} / ${(t.committed_compute_total||0).toFixed(1)}</td><td>${t.status||'-'}</td><td><span class='tag ${cls(t.status)}'>${t.status||'-'}</span></td><td>${(t.current_penalty_preview||0).toFixed(2)}</td><td>${(t.bill_ids||[])[0]||'-'}</td><td>${(t.dispute_ids||[])[0]||'-'}</td><td>${data.payment_rail_mode||'-'}</td></tr>`;}).join('');
+    const s=trades[0]||{}; $('tradeDetailRows').innerHTML=[row('trade_id',s.trade_id||'-'),row('commitment',`${s.minimum_commit_compute||'-'} / ${s.committed_compute_total||'-'}`),row('delivered',s.delivered_compute_total||'-'),row('gap',s.gap_ratio||'-'),row('penalty/refund',`${s.current_penalty_preview||0} / ${s.current_refund_preview||0}`),row('stop condition',s.stop_condition||'-'),row('finalization rule',s.finalization_rule||'-'),row('runtime mode',data.runtime_mode||'-')].join('');
+
+    $('offersRows').innerHTML=offers.map(o=>`<tr><td>${o.offer_id||'-'}</td><td>${o.hardware_model||'-'} / ${o.gpu_count||'-'} GPU</td><td>${o.unit_price||o.measured_perf_value||'-'}</td><td>${o.measured_perf_value||'-'} ${o.measured_perf_unit||''}</td><td>${o.perf_confidence||'-'} / ${o.confidence_label||'-'}</td><td>${o.telemetry_source||'-'}</td></tr>`).join('');
+    $('offerA').innerHTML=offers.map(o=>`<option>${o.offer_id}</option>`).join(''); $('offerB').innerHTML=offers.map(o=>`<option>${o.offer_id}</option>`).join('');
+
+    $('orderRows').innerHTML=[...(data.buy_orders||[]).map(o=>`<tr><td>buy</td><td>${o.order_id}</td><td>${o.max_unit_price_per_work_unit||'-'}</td><td>${o.status||'-'}</td></tr>`),...(data.sell_orders||[]).map(o=>`<tr><td>sell</td><td>${o.order_id}</td><td>${o.unit_price_per_work_unit||'-'}</td><td>${o.status||'-'}</td></tr>`),...(data.match_records||[]).map(m=>`<tr><td>match</td><td>${m.match_id}</td><td>${m.agreed_unit_price||'-'}</td><td>${m.status||'-'}</td></tr>`),].join('');
+    $('orderLinks').innerHTML=trades.map(t=>row(t.trade_id,`bill=${(t.bill_ids||[]).join(',')} dispute=${(t.dispute_ids||[]).join(',')}`)).join('');
+
+    $('billingRows').innerHTML=bills.map(b=>`<tr><td>${b.bill_id}</td><td>${b.trade_id}</td><td>${b.window_index} (${b.window_start_ts}-${b.window_end_ts})</td><td>${b.compute_amount||'-'}</td><td>${b.unit_price||'-'}</td><td>${b.gross_amount||'-'}</td><td>${b.refund_amount||0}</td><td>${b.penalty_amount||0}</td><td>${b.net_provider_payout||'-'}</td><td>${b.invoice_id||'-'} / ${b.payment_id||'-'}</td><td><span class='tag ${cls(b.status)}'>${b.status||'-'}</span></td></tr>`).join('');
+    $('billingSummary').innerHTML=[row('gross total',bills.reduce((a,b)=>a+(b.gross_amount||0),0).toFixed(3)),row('refund total',bills.reduce((a,b)=>a+(b.refund_amount||0),0).toFixed(3)),row('penalty total',bills.reduce((a,b)=>a+(b.penalty_amount||0),0).toFixed(3)),row('net provider payout',bills.reduce((a,b)=>a+(b.net_provider_payout||0),0).toFixed(3))].join('');
+
+    $('disputeRows').innerHTML=disputes.map(d=>`<tr><td>${d.dispute_id}</td><td>${d.dispute_type}</td><td>${d.severity}</td><td>${d.status}</td></tr>`).join('')||'<tr><td colspan="4">No disputes in this scenario</td></tr>';
+    const d=disputes[0]||{}; $('disputeDetail').innerHTML=[row('type',d.dispute_type||'-'),row('severity',d.severity||'-'),row('related',`${d.related_trade_id||'-'} / ${d.related_bill_id||'-'} / ${d.related_attempt_id||'-'}`),row('open reason',d.opened_reason||'-'),row('evidence',(d.evidence_refs||[]).join(', ')||'-'),row('allowed actions',(d.allowed_actions||[]).join(', ')||'-'),row('penalty applied',String(d.penalty_applied||false)),row('refund released',String(d.refund_released||false))].join('');
+
+    $('opsRows').innerHTML=[row('retryable_failed attempts',data.retryable_failed_attempts_count||0),row('payment_unknown attempts',data.payment_unknown_attempts_count||0),row('locked buy/sell',`${data.locked_buy_orders_count||0}/${data.locked_sell_orders_count||0}`),row('provider offline impacts',data.provider_offline_impact_count||0),row('recovery queue',data.recovery_queue_size||0)].join('');
+    $('opsLog').innerHTML=[...(data.agent_market_audit||[]),...(data.provider_market_audit||[])].slice(-15).reverse().map(x=>evt('op',x)).join('');
+
+    $('auditTimeline').innerHTML=[...(data.agent_market_audit||[]),...(data.provider_market_audit||[])].slice(-25).reverse().map(x=>evt('audit',x)).join('');
+    $('hashRows').innerHTML=[row('evidence root',data.receipt_evidence?.evidence_root||'-'),row('verify ok',String(data.receipt_evidence?.evidence_verify_ok)),row('runtime source',data.runtime_data_source_path||'-'),row('bridge dependent modules',(data.bridge_dependent_modules||[]).join(', ')||'-')].join('');
+
+    $('nodeRows').innerHTML=[row('node_id',data.selected_task_id||'-'),row('peer_id',data.peer_id||'-'),row('pubkey',`<span class='mono'>${data.node_pubkey||'-'}</span>`),row('runtime mode',data.runtime_mode||'-'),row('direct mode readiness',String(data.direct_mode_ready)),row('data source path',data.runtime_data_source_path||'-'),row('payment rail',data.payment_rail_mode||'-'),row('network health',`${data.network}/${data.prefix}`)].join('');
+    $('pathRows').innerHTML=[row('bridge dependent modules',(data.bridge_dependent_modules||[]).join(', ')||'none'),row('compatibility dependencies',(data.warnings||[]).slice(0,4).join(' | ')||'none')].join('');
+
+    $('profileRows').innerHTML=[row('display name','SliceStream Operator'),row('current role','buyer/provider/operator'),row('node identity',`${data.peer_id||'-'}`),row('peer/pubkey',`${data.peer_id||'-'} / ${(data.node_pubkey||'-').slice(0,20)}`),row('default workspace','home'),row('recent activity',`${trades.length} trades / ${disputes.length} disputes`),row('preferences profile',`${$('themeSel').value}/${$('densitySel').value}`)].join('');
+    $('profileActivity').innerHTML=[evt('latest trade touch',trades[0]?.trade_id||'-'),evt('latest dispute touch',disputes[0]?.dispute_id||'none'),evt('latest billing touch',bills[0]?.bill_id||'-')].join('');
+
+    setStatus('connected '+new Date().toLocaleTimeString());
+  }catch(e){ setStatus('disconnected '+e.message); }
+}
+
+$('compareDo').onclick=()=>{const a=$('offerA').value,b=$('offerB').value; $('offerCompareRows').innerHTML=[row('selected',`${a} vs ${b}`),row('hint','Use perf/confidence/dispute_rate to compare')].join('');};
+$('simRun').onclick=()=>{const g=Number($('simGross').value||0),c=Number($('simCommit').value||0),d=Number($('simDelivered').value||0); const gap=c>0?Math.max(0,(c-d)/c):0; const refund=gap>0.03?g*0.15:0; $('simOut').innerHTML=[row('gap',gap.toFixed(4)),row('refund',refund.toFixed(4)),row('provider payout',(g-refund).toFixed(4))].join('');};
+$('saveSettings').onclick=()=>{settings.scenario=$('scenarioSel').value; setStatus('settings saved, scenario='+settings.scenario); load();};
+$('refreshNodeBtn').onclick=load; $('newBuyBtn').onclick=()=>$('buyWizardSubmit').click();
+$('buyWizardSubmit').onclick=async()=>{try{await j(`${BRIDGE}/api/action/manual_buy/${encodeURIComponent($('buyTask').value)}`,{method:'POST'}); setStatus('buy submitted');}catch(e){setStatus('buy failed '+e.message)}};
+$('runRecoveryBtn').onclick=async()=>{try{await j(`${BRIDGE}/api/action/recovery_run`,{method:'POST'});setStatus('recovery done');load();}catch(e){setStatus(e.message)}};
+$('runReaperBtn').onclick=async()=>{try{await j(`${BRIDGE}/api/action/reaper_run`,{method:'POST'});setStatus('reaper done');load();}catch(e){setStatus(e.message)}};
+$('disputeApply').onclick=async()=>{const id=$('disputeId').value.trim(); if(!id)return; try{await j(`${BRIDGE}/api/action/dispute_resolve/${encodeURIComponent(id)}`,{method:'POST'}); setStatus('dispute action applied');load();}catch(e){setStatus('dispute action failed '+e.message)}};
+load(); setInterval(load,2500);
+</script>
 </body>
 </html>

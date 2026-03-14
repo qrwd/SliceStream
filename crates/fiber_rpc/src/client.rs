@@ -128,8 +128,7 @@ impl FiberRpcClient {
         )?;
 
         let invoice_id = extract_json_string(&result, "invoice_id")
-            .ok_or_else(|| self.rpc_error("create_invoice", "missing invoice_id in result"))?
-            ;
+            .ok_or_else(|| self.rpc_error("create_invoice", "missing invoice_id in result"))?;
 
         let parsed_start = extract_json_u64(&result, "window_start").unwrap_or(window_start);
         let parsed_end = extract_json_u64(&result, "window_end").unwrap_or(window_end);
@@ -153,11 +152,11 @@ impl FiberRpcClient {
             .ok_or_else(|| self.rpc_error("settle_payment", "missing payment_id in result"))?
             .to_string();
 
-        let parsed_invoice_id = extract_json_string(&result, "invoice_id")
-            .unwrap_or_else(|| invoice_id.to_string());
+        let parsed_invoice_id =
+            extract_json_string(&result, "invoice_id").unwrap_or_else(|| invoice_id.to_string());
 
-        let status = extract_json_string(&result, "status")
-            .unwrap_or_else(|| "submitted".to_string());
+        let status =
+            extract_json_string(&result, "status").unwrap_or_else(|| "submitted".to_string());
 
         Ok(FiberPayment {
             payment_id,
@@ -229,15 +228,21 @@ impl FiberRpcClient {
             }
         })?;
 
-        stream.set_read_timeout(Some(Duration::from_millis(1200))).ok();
-        stream.set_write_timeout(Some(Duration::from_millis(1200))).ok();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(1200)))
+            .ok();
+        stream
+            .set_write_timeout(Some(Duration::from_millis(1200)))
+            .ok();
 
-        stream.write_all(http.as_bytes()).map_err(|e| FiberRpcError {
-            code: RpcErrorCode::RpcError,
-            message: format!(
-                "method={method} request_sent=true status=rpc_error: write failed: {e}"
-            ),
-        })?;
+        stream
+            .write_all(http.as_bytes())
+            .map_err(|e| FiberRpcError {
+                code: RpcErrorCode::RpcError,
+                message: format!(
+                    "method={method} request_sent=true status=rpc_error: write failed: {e}"
+                ),
+            })?;
 
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).map_err(|e| FiberRpcError {
@@ -262,7 +267,8 @@ impl FiberRpcClient {
         })?;
 
         if body.contains("\"error\"") {
-            let summary = extract_json_string(body, "message").unwrap_or_else(|| "unknown node error".to_string());
+            let summary = extract_json_string(body, "message")
+                .unwrap_or_else(|| "unknown node error".to_string());
             return Err(FiberRpcError {
                 code: RpcErrorCode::RpcError,
                 message: format!(
@@ -427,7 +433,7 @@ mod tests {
 
     #[test]
     fn ping_success_with_mock_server() {
-        let endpoint = serve_once("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}") ;
+        let endpoint = serve_once("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}");
         let client = FiberRpcClient::new(test_cfg(), Some(endpoint));
         let ping = client.ping().expect("reachable");
         assert_eq!(ping.network, "testnet");
