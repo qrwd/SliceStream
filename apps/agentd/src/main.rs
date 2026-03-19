@@ -54,7 +54,7 @@ use market_support::{
 };
 use runtime_mode_support::{
     bridge_dependent_modules, compute_direct_mode_ready, current_runtime_mode,
-    runtime_mode_dependencies, select_runtime_data_source,
+    legacy_bridge_requested, runtime_mode_dependencies, select_runtime_data_source,
 };
 
 use std::{
@@ -240,6 +240,7 @@ struct TaskStatus {
     direct_mode_ready: bool,
     runtime_mode_dependencies: Vec<String>,
     runtime_data_source_path: String,
+    legacy_bridge_requested: bool,
     payment_rail_mode: String,
 }
 
@@ -5185,6 +5186,7 @@ async fn get_task_status(
             direct_mode_ready: compute_direct_mode_ready(),
             runtime_mode_dependencies: runtime_mode_dependencies(),
             runtime_data_source_path: select_runtime_data_source(),
+            legacy_bridge_requested: legacy_bridge_requested(),
             payment_rail_mode: current_payment_rail_mode(),
         }),
     )
@@ -5211,6 +5213,7 @@ async fn get_node_identity(State(state): State<AppState>) -> impl IntoResponse {
             "sign_alg": common::signing::SIGN_ALG_ED25519,
             "runtime_mode": current_runtime_mode(),
             "runtime_data_source_path": select_runtime_data_source(),
+            "legacy_bridge_requested": legacy_bridge_requested(),
         })),
     )
 }
@@ -5224,6 +5227,7 @@ async fn get_network_runtime() -> impl IntoResponse {
             "runtime_mode_dependencies": runtime_mode_dependencies(),
             "runtime_data_source_path": select_runtime_data_source(),
             "bridge_dependent_modules": bridge_dependent_modules(),
+            "legacy_bridge_requested": legacy_bridge_requested(),
             "payment_rail_mode": current_payment_rail_mode(),
         })),
     )
@@ -5460,6 +5464,7 @@ async fn get_trade_desk(
             "runtime_mode_dependencies": runtime_mode_dependencies(),
             "runtime_data_source_path": select_runtime_data_source(),
             "bridge_dependent_modules": bridge_dependent_modules(),
+            "legacy_bridge_requested": legacy_bridge_requested(),
             "payment_rail_mode": current_payment_rail_mode()
         })),
     )
@@ -8020,7 +8025,7 @@ Content-Length: {}
     }
 
     #[tokio::test]
-    async fn runtime_mode_reports_bridge_vs_direct_consistently() {
+    async fn runtime_mode_reports_direct_consistently() {
         let _env_guard = ENV_TEST_LOCK.lock().expect("env lock");
         std::env::set_var("SLICESTREAM_RUNTIME_MODE", "direct");
         std::env::set_var("SLICESTREAM_DIRECT_ENDPOINT", "http://127.0.0.1:9999");
@@ -8048,6 +8053,10 @@ Content-Length: {}
         assert_eq!(
             v.get("direct_mode_ready").and_then(|x| x.as_bool()),
             Some(true)
+        );
+        assert_eq!(
+            v.get("legacy_bridge_requested").and_then(|x| x.as_bool()),
+            Some(false)
         );
         std::env::remove_var("SLICESTREAM_RUNTIME_MODE");
         std::env::remove_var("SLICESTREAM_DIRECT_ENDPOINT");
@@ -8959,8 +8968,7 @@ Content-Length: {}
         let _env_guard = ENV_TEST_LOCK.lock().expect("env lock");
         std::env::set_var("SLICESTREAM_RUNTIME_MODE", "direct");
         std::env::remove_var("SLICESTREAM_DIRECT_ENDPOINT");
-        std::env::remove_var("FIBER_RPC_ENDPOINT");
-        assert!(!compute_direct_mode_ready());
+        assert!(compute_direct_mode_ready());
         std::env::set_var("SLICESTREAM_DIRECT_ENDPOINT", "http://127.0.0.1:7000");
         assert!(compute_direct_mode_ready());
         std::env::remove_var("SLICESTREAM_RUNTIME_MODE");
@@ -9214,20 +9222,20 @@ Content-Length: {}
     }
 
     #[test]
-    fn bridge_mode_falls_back_cleanly_when_direct_not_ready() {
+    fn direct_mode_stays_direct_when_endpoint_not_explicitly_set() {
         let _env_guard = ENV_TEST_LOCK.lock().expect("env lock");
         std::env::set_var("SLICESTREAM_RUNTIME_MODE", "direct");
         std::env::remove_var("SLICESTREAM_DIRECT_ENDPOINT");
         std::env::remove_var("FIBER_RPC_ENDPOINT");
         assert_eq!(
             select_runtime_data_source(),
-            common::market::RUNTIME_DATA_SOURCE_BRIDGE
+            common::market::RUNTIME_DATA_SOURCE_DIRECT
         );
         std::env::remove_var("SLICESTREAM_RUNTIME_MODE");
     }
 
     #[tokio::test]
-    async fn direct_and_bridge_paths_return_consistent_identity_semantics() {
+    async fn legacy_bridge_env_and_direct_env_return_consistent_identity_semantics() {
         let _env_guard = ENV_TEST_LOCK.lock().expect("env lock");
         let state = AppState::default();
         let app = app_with_state(state);
@@ -9246,6 +9254,7 @@ Content-Length: {}
         std::env::set_var("SLICESTREAM_RUNTIME_MODE", "direct");
         std::env::set_var("SLICESTREAM_DIRECT_ENDPOINT", "http://127.0.0.1:7000");
         let direct = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/internal/node/identity")
@@ -9255,6 +9264,30 @@ Content-Length: {}
             .await
             .unwrap();
         assert_eq!(direct.status(), StatusCode::OK);
+
+        std::env::set_var("SLICESTREAM_RUNTIME_MODE", "bridge");
+        let runtime = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/network/runtime")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.status(), StatusCode::OK);
+        let runtime_body = axum::body::to_bytes(runtime.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let runtime_json: Value = serde_json::from_slice(&runtime_body).unwrap();
+        assert_eq!(
+            runtime_json
+                .get("legacy_bridge_requested")
+                .and_then(|x| x.as_bool()),
+            Some(true)
+        );
+
         std::env::remove_var("SLICESTREAM_RUNTIME_MODE");
         std::env::remove_var("SLICESTREAM_DIRECT_ENDPOINT");
     }
@@ -9348,8 +9381,8 @@ Content-Length: {}
     #[test]
     fn dead_compat_paths_removed_or_explicitly_marked() {
         let deps = runtime_mode_dependencies();
-        assert!(deps
-            .iter()
-            .all(|d| d.contains("missing") || d.contains("endpoint")));
+        assert!(deps.iter().all(|d| d.contains("missing")
+            || d.contains("endpoint")
+            || d.contains("legacy_bridge_mode_requested")));
     }
 }

@@ -12,8 +12,7 @@ SliceStream is an **Agent-driven compute market and settlement orchestrator** th
 ## Demo path (testnet-default)
 1. Run provider: `cargo run -p providerd`
 2. Run agent: `cargo run -p agentd`
-3. Run dashboard bridge: `cargo run -p dashboard`
-4. Run desktop: `cd apps/dashboard/src-tauri && cargo tauri dev`
+3. Run desktop: `cd apps/dashboard/src-tauri && cargo tauri dev`
 
 Default runtime uses testnet-friendly network config (`ckt` address prefix).
 
@@ -27,12 +26,11 @@ Default runtime uses testnet-friendly network config (`ckt` address prefix).
 ## Evidence artifacts for submission
 - Screenshot: dashboard/tauri runtime status with recovery/dispute panels.
 - Command logs: `cargo test --workspace`, tauri smoke check.
-- API snapshots: `/api/live/{task_id}`, `/internal/market/disputes`, `/v1/tasks/{task_id}/status`.
+- API snapshots: `/v1/tasks/{task_id}/trade-desk`, `/internal/market/disputes`, `/v1/tasks/{task_id}`.
 
 
 ## Direct vs Bridge mode
-- Current UI runtime defaults to local bridge compatibility mode (`dashboard`), while protocol identity shown to users is `peer_id`/`pubkey` first.
-- Target direction: move from compatibility bridge to direct local-node API mode without changing UI workflow.
+- UI runtime is direct local-node API mode (`agentd` + `providerd`) with no dashboard relay fallback.
 
 ## Screenshot / video checklist
 - Capture full dashboard terminal (market + attempts + disputes + ops).
@@ -43,7 +41,7 @@ Default runtime uses testnet-friendly network config (`ckt` address prefix).
 
 ## Stage 5 CKB/Fiber-native emphasis updates
 
-- Runtime now exposes direct-vs-bridge data source routing (`runtime_data_source_path`) and unresolved bridge dependencies (`bridge_dependent_modules`) for transparent decentralization progress.
+- Runtime surfaces direct data-source path (`runtime_data_source_path`) and compatibility dependency hints (`bridge_dependent_modules`) for transparent decentralization progress.
 - Settlement path is explicit in API payloads through `payment_rail_mode` to separate real Fiber, simulated Fiber, and placeholder modes.
 - Canonical object signing (telemetry/billing/dispute snapshots) strengthens evidence trust assumptions for CKB + Fiber demo narratives.
 - Current default path remains CKB testnet-friendly; Fiber remains the primary micropayment rail (Perun remains an extension path).

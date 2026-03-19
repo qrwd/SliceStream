@@ -15,8 +15,9 @@ pub(crate) fn select_runtime_data_source() -> String {
 }
 
 pub(crate) fn bridge_dependent_modules() -> Vec<String> {
-    vec![
-        "dashboard_legacy_bridge_feed".to_string(),
-        "provider_reconcile_bridge_endpoint".to_string(),
-    ]
+    vec![]
+}
+
+pub(crate) fn legacy_bridge_requested() -> bool {
+    common::runtime_mode::legacy_bridge_requested()
 }

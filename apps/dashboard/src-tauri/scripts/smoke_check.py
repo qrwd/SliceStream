@@ -26,14 +26,14 @@ assert icons == ["icons/icon.svg"], "bundle icons must stay svg-only in repo"
 
 text = ui.read_text()
 required_strings = [
-    "Bridge",
+    "Direct",
     "Connected",
     "Disconnected",
     "mode",
     "Network / Prefix",
-    "cargo run -p dashboard",
+    "cargo run -p agentd",
 ]
 for s in required_strings:
     assert s in text, f"ui missing marker: {s}"
 
-print("desktop smoke-check ok: config + bridge-status UI markers are present (binary-friendly)")
+print("desktop smoke-check ok: config + direct-connect UI markers are present (binary-friendly)")

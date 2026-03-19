@@ -14,7 +14,7 @@ cpp/telemetryd (250ms exported samples)
 
 cpp/qualify -> benchmark_score -> providerd runtime scaling
 
-SliceStream Desktop Client (Tauri shell + dashboard data bridge) reads status/result endpoints.
+SliceStream Desktop Client (Tauri shell) reads direct status/result endpoints from local nodes (`agentd` + `providerd`).
 ```
 
 ## Default network profile (contest baseline)
@@ -49,15 +49,12 @@ cargo run -p agentd
 ### 3) Desktop Client (official UI entry)
 
 ```bash
-# start local dashboard data bridge
-cargo run -p dashboard
-
 # launch desktop shell (Windows-first)
 cd apps/dashboard/src-tauri
 cargo tauri dev
 ```
 
-> Note: `apps/dashboard` now serves the official market terminal UI. Tauri is the single desktop entry that hosts this same terminal experience via the local bridge.
+> Note: `apps/dashboard` serves the same terminal UI as a lightweight static host (`/` + `/api/meta`) for web preview; Tauri and browser both read direct node APIs.
 
 
 Desktop runtime dependencies:
@@ -104,6 +101,11 @@ cargo run -p agentd
 
 Release closing P0 reconciliation (audit vs code vs historical requirements) is tracked in `docs/audit-reconciliation.md`, including classification by `still_open`, `fixed_after_audit`, and `doc_drift_only`, plus concrete closure actions.
 
+## P1 transition (now in progress)
+
+- Runtime mode is now **direct-first only** in service defaults; `SLICESTREAM_RUNTIME_MODE=bridge` is treated as a legacy compatibility input and surfaced as a dependency warning instead of enabling a relay path.
+- P1 focus: lifecycle convergence, recovery/reaper idempotency hardening, and operator-facing diagnostics quality (including explicit `legacy_bridge_requested` runtime signal).
+
 ## Demo + acceptance docs
 
 - 90–120s operator script: `docs/demo-script.md`
@@ -147,5 +149,5 @@ Desktop branding assets live under `apps/dashboard/src-tauri/icons/` and use the
 
 - **Primary UX now**: market terminal layout (top status strip, provider/order/match panels, deal ticket, controls, audit/warnings).
 - **Supported runtime controls**: market mode (`manual/auto/hybrid`) and pricing mode (`fixed/band/recommended_band`) via dashboard action APIs.
-- **Still depends on dashboard bridge**: desktop shell reads from local `apps/dashboard` HTTP bridge (`127.0.0.1:4003`).
+- **Bridge removed from runtime path**: Tauri/browser UI read direct local node APIs (`agentd` + `providerd`) by default, with no dashboard relay/proxy dependency.
 - **Future polish**: richer installer assets/signing, persistence/indexing, and deeper native integrations remain future optimization.

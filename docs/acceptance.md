@@ -160,19 +160,16 @@ cargo run -p providerd
 # terminal-2
 cargo run -p agentd
 
-# terminal-3 (internal dashboard data bridge)
-cargo run -p dashboard
 
-# terminal-4 (desktop shell)
+# terminal-3 (desktop shell)
 cd apps/dashboard/src-tauri
 cargo tauri dev
 ```
 
 Expected:
 - Window title is `SliceStream` with 1440x960 default size.
-- Desktop shell top strip shows bridge + mode + network/prefix and continuously probes the bridge.
-- If dashboard bridge is not started, the shell stays in terminal-styled disconnected state with retry guidance (`cargo run -p dashboard`).
-- After bridge recovery, Tauri window naturally switches to the same terminal UI served by `apps/dashboard` (`http://127.0.0.1:4003/`).
+- Desktop shell top strip shows runtime mode + network/prefix and direct readiness from local nodes.
+- Desktop consumes direct local node APIs (`agentd` + `providerd`) without any dashboard relay/proxy process.
 
 ### Desktop smoke-check (minimal)
 
@@ -254,18 +251,15 @@ cargo run -p providerd
 # 2) agent
 cargo run -p agentd
 
-# 3) dashboard bridge (terminal source)
-cargo run -p dashboard
-
-# 4) tauri shell (single official desktop entry)
+ # 3) tauri shell (single official desktop entry)
 cd apps/dashboard/src-tauri
 cargo tauri dev
 ```
 
 Expected:
 - Tauri desktop entry is a single shell that carries the official market terminal experience.
-- The shell no longer has a separate, style-divergent bridge-only homepage.
-- Bridge disconnected/connected states are rendered in the same terminal style and transition automatically.
+- The shell no longer has a separate, style-divergent relay-only homepage.
+- Desktop fetches direct APIs from agent/provider and no longer requires any dashboard bridge process.
 
 ## P0 audit reconciliation validation (targeted)
 
@@ -313,6 +307,8 @@ curl -s -X POST http://127.0.0.1:4002/internal/market/matches/retry \
 curl -s -X POST http://127.0.0.1:4001/internal/market/orders/sell/sell-order-demo-1/cancel | jq
 curl -s -X POST http://127.0.0.1:4001/internal/market/orders/sell/sell-order-demo-1/retry | jq
 curl -s -X POST http://127.0.0.1:4001/internal/market/orders/sell/sell-order-demo-1/expire | jq
+# runtime mode diagnostics (legacy bridge request should be explicit)
+curl -s http://127.0.0.1:4001/internal/runtime/mode | jq '{runtime_mode, runtime_data_source_path, legacy_bridge_requested, runtime_mode_dependencies}'
 ```
 
 Example summary (expected):
@@ -464,14 +460,14 @@ cargo test -p common offer_telemetry_signature_roundtrip
 cargo test -p common billing_window_signature_roundtrip
 cargo test -p common dispute_snapshot_signature_roundtrip
 cargo test -p agentd direct_mode_uses_local_data_source_when_available
-cargo test -p agentd bridge_mode_falls_back_cleanly_when_direct_not_ready
-cargo test -p agentd direct_and_bridge_paths_return_consistent_identity_semantics
+cargo test -p agentd direct_mode_stays_direct_when_endpoint_not_explicitly_set
+cargo test -p agentd legacy_bridge_env_and_direct_env_return_consistent_identity_semantics
 cargo test -p agentd fiber_or_placeholder_mode_is_explicit_in_billing_and_trade_views
 ```
 
 Expected outcomes:
 - direct mode chooses local-node data source when direct dependencies are ready;
-- bridge fallback remains safe when direct dependencies are missing;
+- legacy bridge env input is explicitly marked while runtime stays on direct data source;
 - canonical signatures verify for telemetry/billing/dispute snapshots and tamper detection works.
 
 

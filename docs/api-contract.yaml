@@ -921,6 +921,7 @@ components:
 # Stage 5 notes:
 # - direct mode exposes explicit source routing: `runtime_data_source_path` + `bridge_dependent_modules`.
 # - agent direct endpoints: GET /internal/node/identity and GET /internal/network/runtime.
+# - provider direct endpoint: GET /internal/node/identity.
 # - trade-desk/status responses include `payment_rail_mode` (`fiber_real|fiber_simulated|local_placeholder`).
 # - telemetry/billing/dispute snapshots support canonical signing and verification via common::signing.
 
@@ -928,3 +929,6 @@ components:
 # - dashboard/tauri now expose 10 enterprise workspaces: home, terminal, market, orders, billing, disputes, ops, evidence, node, profile.
 # - /api/live/{task_id} is treated as primary high-density terminal payload for KPI/risk/timeline/order/billing/dispute/evidence views.
 # - payload fields consumed by new terminal views include runtime_data_source_path, bridge_dependent_modules, payment_rail_mode, trades[], billing_windows[], disputes[], offers[].
+
+# Stage 7 notes:
+# - dashboard adds direct aggregation endpoint: GET /api/direct/live/{task_id} (same payload family as /api/live/{task_id}) for direct-first terminal clients.

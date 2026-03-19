@@ -35,7 +35,7 @@ use std::{
 
 use runtime_mode_support::{
     bridge_dependent_modules, compute_direct_mode_ready, current_runtime_mode,
-    runtime_mode_dependencies, select_runtime_data_source,
+    legacy_bridge_requested, runtime_mode_dependencies, select_runtime_data_source,
 };
 
 use market_support::{
@@ -572,6 +572,7 @@ fn app_with_state(state: AppState) -> Router {
         .route("/internal/market/audit", get(get_market_audit))
         .route("/internal/market/events", get(get_market_events))
         .route("/internal/runtime/mode", get(get_runtime_mode))
+        .route("/internal/node/identity", get(get_provider_node_identity))
         .route(
             "/internal/market/orders/sell/suggested",
             get(get_suggested_sell_orders),
@@ -602,6 +603,7 @@ async fn get_runtime_mode() -> impl IntoResponse {
             "runtime_mode_dependencies": runtime_mode_dependencies(),
             "runtime_data_source_path": select_runtime_data_source(),
             "bridge_dependent_modules": bridge_dependent_modules(),
+            "legacy_bridge_requested": legacy_bridge_requested(),
             "billing_window_statuses": [
                 common::market::BILLING_WINDOW_STATUS_PENDING,
                 common::market::BILLING_WINDOW_STATUS_INVOICED,
@@ -612,6 +614,30 @@ async fn get_runtime_mode() -> impl IntoResponse {
                 common::market::BILLING_WINDOW_STATUS_FINALIZED,
                 common::market::BILLING_WINDOW_STATUS_FAILED
             ]
+        })),
+    )
+}
+
+async fn get_provider_node_identity(State(state): State<AppState>) -> impl IntoResponse {
+    let provider_node_id = state
+        .jobs
+        .lock()
+        .expect("jobs lock")
+        .keys()
+        .next()
+        .cloned()
+        .unwrap_or_else(|| "provider-demo".to_string());
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "node_id": provider_node_id,
+            "peer_id": format!("provider-peer-{}", provider_node_id),
+            "pubkey": "provider-pubkey-demo",
+            "key_id": "provider-key-1",
+            "sign_alg": common::signing::SIGN_ALG_ED25519,
+            "runtime_mode": current_runtime_mode(),
+            "runtime_data_source_path": select_runtime_data_source(),
+            "legacy_bridge_requested": legacy_bridge_requested(),
         })),
     )
 }
@@ -1839,6 +1865,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_mode_endpoint_exposes_legacy_bridge_flag() {
+        let app = app();
+        let req = Request::builder()
+            .uri("/internal/runtime/mode")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json.get("legacy_bridge_requested")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
     async fn provider_status_returns_404_json_when_missing() {
         let app = app();
         let req = Request::builder()
@@ -2587,5 +2632,26 @@ mod tests {
         assert_eq!(status, ORDER_STATUS_SETTLED);
         let events = recovered.persistence.read_events();
         assert!(!events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_node_identity_endpoint_returns_core_fields() {
+        let app = app();
+        let req = Request::builder()
+            .uri("/internal/node/identity")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("node_id").is_some());
+        assert!(json.get("peer_id").is_some());
+        assert!(json.get("pubkey").is_some());
+        assert_eq!(
+            json.get("sign_alg").and_then(|v| v.as_str()),
+            Some("ed25519")
+        );
     }
 }
