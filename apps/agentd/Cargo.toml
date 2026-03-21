@@ -1,0 +1,16 @@
+[package]
+name = "agentd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+common = { path = "../../crates/common" }
+
+[dev-dependencies]
+tower = "0.5"
+serde_json.workspace = true
