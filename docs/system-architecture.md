@@ -7,7 +7,7 @@ This document aligns architecture wording with the current implementation, witho
 ```text
 [7] Desktop Client / Terminal UI Layer
     - apps/dashboard/src-tauri (desktop shell)
-    - apps/dashboard (terminal data bridge + action proxy)
+    - apps/dashboard (lightweight UI host; terminal tool frontend)
 
 [6] Settlement & Evidence Layer
     - apps/agentd (accepted match binding, settlement orchestration, receipt/evidence view)
@@ -51,6 +51,11 @@ This document aligns architecture wording with the current implementation, witho
 | Settlement & Evidence | `agentd`, `providerd`, `common::{evidence,idempotency,stall}`, `fiber_rpc` | accepted match -> settlement -> receipt/evidence -> reconciliation | no protocol-level redesign |
 | Desktop/UI | `apps/dashboard`, `apps/dashboard/src-tauri` | operator-facing terminal visualization and controls | no replacement of backend semantics |
 
+Fail-closed gate convention in this pass:
+- high-risk automation endpoints require accepted protocol scope **and** known-ready network state;
+- Fiber preflight mismatch/failure is treated as blocking, not warning-only;
+- protocol version drift invalidates prior acceptance until re-accept.
+
 ## 3) Naming and boundary conventions
 
 - Shared market naming remains centralized in `common::market`:
@@ -61,7 +66,7 @@ This document aligns architecture wording with the current implementation, witho
 - Market-layer types remain in `common::market`; settlement-layer evidence/receipt/idempotency remain in dedicated modules.
 - `providerd` remains source-of-truth for provider registry + sell-side runtime.
 - `agentd` remains source-of-truth for buy-side runtime + proposed/accepted match runtime.
-- `dashboard` remains terminal bridge/action proxy, not settlement owner.
+- `dashboard` is positioned as tool frontend host and does not own settlement state.
 
 ## 4) Main flow (current implemented path)
 
@@ -89,7 +94,7 @@ This document aligns architecture wording with the current implementation, witho
 - Match acceptance + settlement binding is present.
 - Market modes (`manual/auto/hybrid`) are present.
 - Pricing modes (`fixed/band/recommended_band`) are present.
-- Desktop terminal UI + bridge action control path are present.
+- Desktop terminal UI + direct local action control path are present.
 - Existing settlement/evidence/reconciliation behavior remains preserved.
 
 ### Natural next extension boundary

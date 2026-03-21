@@ -1,4 +1,4 @@
-# SliceStream 90–120s Demo Script (Fixed Runbook)
+# SliceStream 90–120s Demo Script (Submission Final)
 
 Target: 1 presenter + prepared terminal windows.
 
@@ -32,22 +32,25 @@ Expected:
 ---
 
 
-### 35–55s: Launch Desktop Client (official UI)
+### 35–55s: Launch Desktop Client (official judging path)
 Run:
 
 ```bash
 # terminal-3
-cargo run -p dashboard
-
-# terminal-4
 cd apps/dashboard/src-tauri
 cargo tauri dev
 ```
 
 Expected:
-- SliceStream desktop window opens with status row showing bridge/mode/network.
-- If bridge is up, status becomes `bridge: connected` and embedded dashboard panels are visible.
-- If bridge is down, a non-blank retry/help card appears (`cargo run -p dashboard`) until reconnect.
+- SliceStream desktop window opens with status row showing runtime mode/network.
+- UI works as local desktop tool against configured local endpoints (no relay dependency).
+- node/path panels show machine-readable gate reason + persistence mode metadata.
+
+Optional dev-only helper (not official delivery path):
+
+```bash
+SLICESTREAM_ENABLE_WEB_HELPER=1 cargo run -p dashboard
+```
 
 ---
 
@@ -117,4 +120,5 @@ cargo run -p agentd
 
 说明话术建议：
 - “Fiber 路径已具备最小真实 RPC 与错误分类，这里因现场 endpoint 不可用切回 mock，继续完整演示结算闭环。”
-
+- “本轮默认 fail-closed：协议/网络/preflight 任一未知或不通过，高风险动作直接阻断。”
+- “当前仍属工具形态，不代用户签名或托管资产；真实上链动作需要明确 signer 与 readiness。”

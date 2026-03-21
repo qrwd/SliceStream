@@ -37,13 +37,56 @@ pub struct MarketPersistence {
     pub dir: PathBuf,
     pub state_file: PathBuf,
     pub event_log_file: PathBuf,
+    pub mode: MarketPersistenceMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarketPersistenceMode {
+    RuntimeDirs,
+    CompatibilityFallback { reason: String },
+    ExplicitBase,
+}
+
+fn compatibility_fallback_enabled() -> bool {
+    std::env::var("SLICESTREAM_ALLOW_MARKET_PERSISTENCE_FALLBACK")
+        .map(|v| {
+            let t = v.trim().to_ascii_lowercase();
+            t == "1" || t == "true" || t == "yes" || t == "on"
+        })
+        .unwrap_or(false)
 }
 
 impl MarketPersistence {
     pub fn new(service: &str) -> Self {
-        let base = std::env::var("SLICESTREAM_DATA_DIR")
-            .unwrap_or_else(|_| ".slicestream-data".to_string());
-        Self::new_in(&base, service)
+        let (base, mode) = match crate::runtime_dirs::resolve_runtime_dirs("SliceStream") {
+            Ok(dirs) => (dirs.runtime_state_dir, MarketPersistenceMode::RuntimeDirs),
+            Err(err) => {
+                if compatibility_fallback_enabled() {
+                    eprintln!(
+                        "warn: market persistence runtime_dirs resolve failed ({}); using compatibility fallback .slicestream-data because SLICESTREAM_ALLOW_MARKET_PERSISTENCE_FALLBACK is enabled",
+                        err
+                    );
+                    (
+                        PathBuf::from(".slicestream-data"),
+                        MarketPersistenceMode::CompatibilityFallback { reason: err },
+                    )
+                } else {
+                    panic!(
+                        "market persistence initialization failed: runtime_dirs resolve failed ({err}). \
+set SLICESTREAM_ALLOW_MARKET_PERSISTENCE_FALLBACK=1 to temporarily enable compatibility fallback"
+                    );
+                }
+            }
+        };
+        let dir = base.join(service);
+        let state_file = dir.join("state.json");
+        let event_log_file = dir.join("market-events.ndjson");
+        Self {
+            dir,
+            state_file,
+            event_log_file,
+            mode,
+        }
     }
 
     pub fn new_in(base: &str, service: &str) -> Self {
@@ -54,6 +97,22 @@ impl MarketPersistence {
             dir,
             state_file,
             event_log_file,
+            mode: MarketPersistenceMode::ExplicitBase,
+        }
+    }
+
+    pub fn mode_code(&self) -> &'static str {
+        match self.mode {
+            MarketPersistenceMode::RuntimeDirs => "runtime_dirs",
+            MarketPersistenceMode::CompatibilityFallback { .. } => "compatibility_fallback",
+            MarketPersistenceMode::ExplicitBase => "explicit_base",
+        }
+    }
+
+    pub fn mode_detail(&self) -> Option<String> {
+        match &self.mode {
+            MarketPersistenceMode::CompatibilityFallback { reason } => Some(reason.clone()),
+            _ => None,
         }
     }
 
@@ -136,5 +195,22 @@ mod tests {
         let events = p.read_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "manual_override");
+    }
+
+    #[test]
+    fn compatibility_mode_flag_parser_understands_truthy_values() {
+        std::env::set_var("SLICESTREAM_ALLOW_MARKET_PERSISTENCE_FALLBACK", "true");
+        assert!(compatibility_fallback_enabled());
+        std::env::set_var("SLICESTREAM_ALLOW_MARKET_PERSISTENCE_FALLBACK", "1");
+        assert!(compatibility_fallback_enabled());
+        std::env::set_var("SLICESTREAM_ALLOW_MARKET_PERSISTENCE_FALLBACK", "off");
+        assert!(!compatibility_fallback_enabled());
+    }
+
+    #[test]
+    fn new_in_uses_explicit_base_mode() {
+        let p = MarketPersistence::new_in("/tmp/slicestream", "mode-test");
+        assert_eq!(p.mode_code(), "explicit_base");
+        assert!(p.mode_detail().is_none());
     }
 }

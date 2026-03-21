@@ -12,4 +12,5 @@ pub mod stall;
 pub mod types;
 
 pub mod runtime_config;
+pub mod runtime_dirs;
 pub mod runtime_mode;

@@ -6,7 +6,7 @@ fn main() {
     tauri::Builder::default()
         .setup(|app| {
             let _ = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-                .title("SliceStream")
+                .title("SliceStream Internal Preview (Staging)")
                 .inner_size(1440.0, 960.0)
                 .min_inner_size(1200.0, 760.0)
                 .resizable(true)

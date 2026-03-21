@@ -50,7 +50,8 @@ mod runtime_mode_support;
 use dispute_support::{allowed_actions_for_dispute_type, dispute_action_guard};
 use market_support::{
     auto_actions_allowed, cancel_match, cleanup_task_bindings, converge_mode_state, expire_match,
-    release_binding_and_locks, retry_match, set_auto_pause_for_manual_override, start_auto_bidding,
+    release_binding_and_locks, retry_match, set_auto_pause_for_manual_override,
+    start_auto_bidding as start_auto_bidding_impl,
 };
 use runtime_mode_support::{
     bridge_dependent_modules, compute_direct_mode_ready, current_runtime_mode,
@@ -242,6 +243,12 @@ struct TaskStatus {
     runtime_data_source_path: String,
     legacy_bridge_requested: bool,
     payment_rail_mode: String,
+    protocol_gate: Value,
+    network: String,
+    prefix: String,
+    mainnet_ready: bool,
+    market_persistence_mode: String,
+    market_persistence_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -540,6 +547,199 @@ struct TaskRuntime {
     next_payment_seq: u64,
 }
 
+const AGENT_AUTOMATION_PROTOCOL_ID: &str = "agent_automation_protocol_v1";
+const AGENT_AUTOMATION_PROTOCOL_VERSION: &str = "1.0.0";
+const FIBER_PRECONTRACT_PROTOCOL_ID: &str = "fiber_precontract_protocol_v1";
+const FIBER_PRECONTRACT_PROTOCOL_VERSION: &str = "1.0.0";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProtocolAgreementState {
+    protocol_id: String,
+    version: String,
+    accepted: bool,
+    accepted_at: Option<String>,
+    wallet_address: Option<String>,
+    signature_ref: Option<String>,
+    scopes: Vec<String>,
+    revoke_supported: bool,
+    risk_notice: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProtocolAgreementAcceptRequest {
+    wallet_address: Option<String>,
+    signature_ref: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FiberPreflightRequest {
+    action: String,
+    execution_mode: String,
+    requested_network: Option<String>,
+    chain_id: Option<String>,
+    signer_address: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeDirsView {
+    config_dir: String,
+    data_dir: String,
+    log_dir: String,
+    cache_dir: String,
+    protocol_state_dir: String,
+    runtime_state_dir: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FiberActionKind {
+    TradeRequest,
+    RecoveryRun,
+    ReaperRun,
+    SettlementRetry,
+    SettlementMarkFinal,
+    ContractCreate,
+    SignRequest,
+    SubmitTx,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FiberActionRisk {
+    Low,
+    High,
+}
+
+impl FiberActionKind {
+    fn code(self) -> &'static str {
+        match self {
+            Self::TradeRequest => "trade_request",
+            Self::RecoveryRun => "recovery_run",
+            Self::ReaperRun => "reaper_run",
+            Self::SettlementRetry => "settlement_retry",
+            Self::SettlementMarkFinal => "settlement_mark_final",
+            Self::ContractCreate => "contract_create",
+            Self::SignRequest => "sign_request",
+            Self::SubmitTx => "submit_tx",
+            Self::Unknown => "unknown_fiber_action",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::TradeRequest => "Trade Request",
+            Self::RecoveryRun => "Recovery Run",
+            Self::ReaperRun => "Reaper Run",
+            Self::SettlementRetry => "Settlement Retry",
+            Self::SettlementMarkFinal => "Settlement Mark Final",
+            Self::ContractCreate => "Contract Create",
+            Self::SignRequest => "Sign Request",
+            Self::SubmitTx => "Submit Transaction",
+            Self::Unknown => "Unknown Fiber Action",
+        }
+    }
+
+    fn risk(self) -> FiberActionRisk {
+        match self {
+            Self::TradeRequest
+            | Self::RecoveryRun
+            | Self::ReaperRun
+            | Self::SettlementRetry
+            | Self::SettlementMarkFinal => FiberActionRisk::Low,
+            Self::ContractCreate | Self::SignRequest | Self::SubmitTx | Self::Unknown => {
+                FiberActionRisk::High
+            }
+        }
+    }
+
+    fn requires_signer(self) -> bool {
+        matches!(
+            self,
+            Self::ContractCreate | Self::SignRequest | Self::SubmitTx
+        )
+    }
+
+    fn allowed_in_simulate(self) -> bool {
+        matches!(
+            self,
+            Self::TradeRequest
+                | Self::RecoveryRun
+                | Self::ReaperRun
+                | Self::SettlementRetry
+                | Self::SettlementMarkFinal
+        )
+    }
+
+    fn allowed_in_real(self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+}
+
+fn parse_fiber_action_kind(action: &str) -> FiberActionKind {
+    match action.trim() {
+        "trade_request" => FiberActionKind::TradeRequest,
+        "recovery_run" => FiberActionKind::RecoveryRun,
+        "reaper_run" => FiberActionKind::ReaperRun,
+        "settlement_retry" => FiberActionKind::SettlementRetry,
+        "settlement_mark_final" => FiberActionKind::SettlementMarkFinal,
+        "contract_create" => FiberActionKind::ContractCreate,
+        "sign_request" => FiberActionKind::SignRequest,
+        "submit_tx" => FiberActionKind::SubmitTx,
+        _ => FiberActionKind::Unknown,
+    }
+}
+
+fn enforce_fiber_action_guard(
+    action_kind: FiberActionKind,
+    execution_mode: &str,
+    signer_address: Option<&str>,
+) -> Result<(), String> {
+    if matches!(action_kind, FiberActionKind::Unknown) {
+        return Err("unknown_fiber_action".to_string());
+    }
+    let mode_real = execution_mode.eq_ignore_ascii_case("real");
+    if mode_real && !action_kind.allowed_in_real() {
+        return Err(format!("action_not_allowed_in_real:{}", action_kind.code()));
+    }
+    if !mode_real && !action_kind.allowed_in_simulate() {
+        return Err(format!(
+            "action_not_allowed_in_simulate:{}",
+            action_kind.code()
+        ));
+    }
+    let cfg = common::runtime_config::load_runtime_config();
+    if cfg.network != common::runtime_config::Network::Testnet
+        && cfg.network != common::runtime_config::Network::Mainnet
+    {
+        return Err(format!("unknown_network:{}", cfg.network.as_str()));
+    }
+    if mode_real {
+        if cfg.network == common::runtime_config::Network::Mainnet && !cfg.mainnet_ready {
+            return Err("mainnet_not_ready".to_string());
+        }
+        if action_kind.requires_signer() && signer_address.unwrap_or("").trim().is_empty() {
+            return Err("signer_address_required".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn current_fiber_execution_context() -> (String, Option<String>) {
+    let signer_address = std::env::var("SLICESTREAM_FIBER_SIGNER_ADDRESS")
+        .ok()
+        .or_else(|| std::env::var("SLICESTREAM_SIGNER_ADDRESS").ok());
+    let execution_mode = if SettlementGatewayMode::from_env() == SettlementGatewayMode::Fiber {
+        "real".to_string()
+    } else {
+        "simulate".to_string()
+    };
+    (execution_mode, signer_address)
+}
+
+fn enforce_fiber_guard_for_current_context(action_kind: FiberActionKind) -> Result<(), String> {
+    let (execution_mode, signer_address) = current_fiber_execution_context();
+    enforce_fiber_action_guard(action_kind, &execution_mode, signer_address.as_deref())
+}
+
 #[derive(Clone)]
 struct AppState {
     tasks: Arc<Mutex<HashMap<String, TaskRuntime>>>,
@@ -567,6 +767,7 @@ struct AppState {
     accept_idempotency_ledger: Arc<Mutex<HashMap<String, String>>>,
     settlement_attempts: Arc<Mutex<HashMap<String, SettlementAttempt>>>,
     disputes: Arc<Mutex<HashMap<String, DisputeRecord>>>,
+    protocol_agreements: Arc<Mutex<HashMap<String, ProtocolAgreementState>>>,
     persistence: Arc<MarketPersistence>,
 }
 
@@ -725,6 +926,7 @@ impl Default for AppState {
             accept_idempotency_ledger: Arc::new(Mutex::new(HashMap::new())),
             settlement_attempts: Arc::new(Mutex::new(HashMap::new())),
             disputes: Arc::new(Mutex::new(HashMap::new())),
+            protocol_agreements: Arc::new(Mutex::new(default_agent_protocol_agreements())),
             persistence: Arc::new(MarketPersistence::new("agentd")),
         };
         if !cfg!(test) {
@@ -1559,7 +1761,363 @@ fn app_with_state(state: AppState) -> Router {
         .route("/internal/ops/reaper/run", post(run_reaper_now))
         .route("/internal/node/identity", get(get_node_identity))
         .route("/internal/network/runtime", get(get_network_runtime))
+        .route("/internal/runtime/dirs", get(get_runtime_dirs))
+        .route(
+            "/internal/protocol/agreements",
+            get(get_protocol_agreements),
+        )
+        .route(
+            "/internal/protocol/agreements/:protocol_id/accept",
+            post(accept_protocol_agreement),
+        )
+        .route(
+            "/internal/protocol/agreements/:protocol_id/revoke",
+            post(revoke_protocol_agreement),
+        )
+        .route("/internal/fiber/preflight", post(fiber_preflight_check))
         .with_state(state)
+}
+
+fn default_agent_protocol_agreements() -> HashMap<String, ProtocolAgreementState> {
+    let mut map = HashMap::new();
+    map.insert(
+        AGENT_AUTOMATION_PROTOCOL_ID.to_string(),
+        ProtocolAgreementState {
+            protocol_id: AGENT_AUTOMATION_PROTOCOL_ID.to_string(),
+            version: AGENT_AUTOMATION_PROTOCOL_VERSION.to_string(),
+            accepted: cfg!(test),
+            accepted_at: if cfg!(test) { Some(now_rfc3339_like()) } else { None },
+            wallet_address: if cfg!(test) { Some("ckt1test-default".to_string()) } else { None },
+            signature_ref: None,
+            scopes: if cfg!(test) { vec!["smart_auto_bidding".to_string(),"smart_recovery_ops".to_string(),"smart_reaper_ops".to_string(),"smart_mode_auto".to_string()] } else { vec![] },
+            revoke_supported: true,
+            risk_notice: "Experimental automation: no guarantee of profit/success/availability; user is responsible for final signing and asset actions.".to_string(),
+        },
+    );
+    map.insert(
+        FIBER_PRECONTRACT_PROTOCOL_ID.to_string(),
+        ProtocolAgreementState {
+            protocol_id: FIBER_PRECONTRACT_PROTOCOL_ID.to_string(),
+            version: FIBER_PRECONTRACT_PROTOCOL_VERSION.to_string(),
+            accepted: cfg!(test),
+            accepted_at: if cfg!(test) { Some(now_rfc3339_like()) } else { None },
+            wallet_address: if cfg!(test) { Some("ckt1fiber-default".to_string()) } else { None },
+            signature_ref: None,
+            scopes: if cfg!(test) { vec!["fiber_preflight".to_string(),"fiber_real_execution".to_string(),"fiber_contract_create".to_string()] } else { vec![] },
+            revoke_supported: true,
+            risk_notice: "Fiber pre-contract actions are high risk; user must confirm network, chain identity, and final signing responsibility.".to_string(),
+        },
+    );
+    map
+}
+
+fn init_runtime_dirs(service: &str) {
+    match common::runtime_dirs::resolve_runtime_dirs("SliceStream") {
+        Ok(dirs) => {
+            for dir in [
+                dirs.config_dir,
+                dirs.data_dir,
+                dirs.log_dir,
+                dirs.cache_dir,
+                dirs.protocol_state_dir,
+                dirs.runtime_state_dir.join(service),
+            ] {
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    eprintln!("runtime dir ensure failed path={} err={}", dir.display(), e);
+                }
+            }
+        }
+        Err(e) => eprintln!("runtime dir resolution failed: {}", e),
+    }
+}
+
+fn ensure_protocol_scope(
+    state: &AppState,
+    protocol_id: &str,
+    required_scope: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let agreements = state
+        .protocol_agreements
+        .lock()
+        .expect("protocol agreements lock");
+    let Some(agreement) = agreements.get(protocol_id) else {
+        return Err((
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({
+                "error":"protocol_not_found",
+                "protocol_id": protocol_id,
+                "required_scope": required_scope
+            })),
+        ));
+    };
+    if !agreement.accepted {
+        return Err((
+            StatusCode::PRECONDITION_REQUIRED,
+            Json(serde_json::json!({
+                "error":"protocol_not_accepted",
+                "protocol_id": protocol_id,
+                "version": agreement.version,
+                "required_scope": required_scope,
+                "risk_notice": agreement.risk_notice
+            })),
+        ));
+    }
+    let expected_version = if protocol_id == AGENT_AUTOMATION_PROTOCOL_ID {
+        AGENT_AUTOMATION_PROTOCOL_VERSION
+    } else if protocol_id == FIBER_PRECONTRACT_PROTOCOL_ID {
+        FIBER_PRECONTRACT_PROTOCOL_VERSION
+    } else {
+        ""
+    };
+    if !expected_version.is_empty() && agreement.version != expected_version {
+        return Err((
+            StatusCode::PRECONDITION_REQUIRED,
+            Json(serde_json::json!({
+                "error":"protocol_version_mismatch",
+                "protocol_id": protocol_id,
+                "accepted_version": agreement.version,
+                "required_version": expected_version
+            })),
+        ));
+    }
+    if !agreement.scopes.iter().any(|s| s == required_scope) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error":"protocol_scope_missing",
+                "protocol_id": protocol_id,
+                "required_scope": required_scope,
+                "granted_scopes": agreement.scopes
+            })),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_risky_network_ready() -> Result<(), (StatusCode, Json<Value>)> {
+    let cfg = common::runtime_config::load_runtime_config();
+    match cfg.network {
+        common::runtime_config::Network::Testnet => Ok(()),
+        common::runtime_config::Network::Mainnet if cfg.mainnet_ready => Ok(()),
+        common::runtime_config::Network::Mainnet => Err((
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({"error":"mainnet_not_ready"})),
+        )),
+    }
+}
+
+fn ensure_automation_gate(state: &AppState, scope: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    ensure_protocol_scope(state, AGENT_AUTOMATION_PROTOCOL_ID, scope)?;
+    ensure_risky_network_ready()?;
+    Ok(())
+}
+
+fn protocol_gate_status(state: &AppState) -> Value {
+    let agreements = state
+        .protocol_agreements
+        .lock()
+        .expect("protocol agreements lock");
+    if let Some(a) = agreements.get(AGENT_AUTOMATION_PROTOCOL_ID) {
+        serde_json::json!({
+            "protocol_id": a.protocol_id,
+            "version": a.version,
+            "accepted": a.accepted,
+            "scopes": a.scopes,
+            "revoke_supported": a.revoke_supported
+        })
+    } else {
+        serde_json::json!({"protocol_id": AGENT_AUTOMATION_PROTOCOL_ID, "accepted": false})
+    }
+}
+
+async fn get_protocol_agreements(State(state): State<AppState>) -> impl IntoResponse {
+    let agreements: Vec<ProtocolAgreementState> = state
+        .protocol_agreements
+        .lock()
+        .expect("protocol agreements lock")
+        .values()
+        .cloned()
+        .collect();
+    (StatusCode::OK, Json(agreements)).into_response()
+}
+
+async fn accept_protocol_agreement(
+    State(state): State<AppState>,
+    Path(protocol_id): Path<String>,
+    Json(req): Json<ProtocolAgreementAcceptRequest>,
+) -> impl IntoResponse {
+    if req
+        .wallet_address
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"wallet_address_required"})),
+        )
+            .into_response();
+    }
+    let mut agreements = state
+        .protocol_agreements
+        .lock()
+        .expect("protocol agreements lock");
+    let Some(agreement) = agreements.get_mut(&protocol_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"protocol_not_found","protocol_id":protocol_id})),
+        )
+            .into_response();
+    };
+    agreement.accepted = true;
+    agreement.accepted_at = Some(now_rfc3339_like());
+    agreement.wallet_address = req.wallet_address;
+    agreement.signature_ref = req.signature_ref;
+    agreement.scopes = if agreement.protocol_id == AGENT_AUTOMATION_PROTOCOL_ID {
+        vec![
+            "smart_auto_bidding".to_string(),
+            "smart_recovery_ops".to_string(),
+            "smart_reaper_ops".to_string(),
+            "smart_mode_auto".to_string(),
+        ]
+    } else if agreement.protocol_id == FIBER_PRECONTRACT_PROTOCOL_ID {
+        vec![
+            "fiber_preflight".to_string(),
+            "fiber_real_execution".to_string(),
+            "fiber_contract_create".to_string(),
+        ]
+    } else {
+        vec![]
+    };
+    state
+        .market_audit
+        .lock()
+        .expect("market audit lock")
+        .push(format!(
+            "protocol_accepted id={} version={}",
+            agreement.protocol_id, agreement.version
+        ));
+    (StatusCode::OK, Json(agreement.clone())).into_response()
+}
+
+async fn revoke_protocol_agreement(
+    State(state): State<AppState>,
+    Path(protocol_id): Path<String>,
+) -> impl IntoResponse {
+    let mut agreements = state
+        .protocol_agreements
+        .lock()
+        .expect("protocol agreements lock");
+    let Some(agreement) = agreements.get_mut(&protocol_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"protocol_not_found","protocol_id":protocol_id})),
+        )
+            .into_response();
+    };
+    agreement.accepted = false;
+    agreement.accepted_at = None;
+    agreement.wallet_address = None;
+    agreement.signature_ref = None;
+    agreement.scopes.clear();
+    state
+        .market_audit
+        .lock()
+        .expect("market audit lock")
+        .push(format!(
+            "protocol_revoked id={} version={}",
+            agreement.protocol_id, agreement.version
+        ));
+    (StatusCode::OK, Json(agreement.clone())).into_response()
+}
+
+async fn fiber_preflight_check(
+    State(state): State<AppState>,
+    Json(req): Json<FiberPreflightRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = ensure_protocol_scope(&state, FIBER_PRECONTRACT_PROTOCOL_ID, "fiber_preflight")
+    {
+        return e.into_response();
+    }
+    let cfg = common::runtime_config::load_runtime_config();
+    if cfg.network != common::runtime_config::Network::Testnet
+        && cfg.network != common::runtime_config::Network::Mainnet
+    {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({"error":"unknown_network","network":cfg.network.as_str()})),
+        )
+            .into_response();
+    }
+    let configured_network = cfg.network.as_str().to_string();
+    let requested_network = req
+        .requested_network
+        .unwrap_or_else(|| configured_network.clone());
+    if requested_network != configured_network {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({
+                "error":"network_mismatch",
+                "configured_network": configured_network,
+                "requested_network": requested_network
+            })),
+        )
+            .into_response();
+    }
+    let action = req.action.trim().to_lowercase();
+    let execution_mode = req.execution_mode.trim().to_lowercase();
+    let action_kind = parse_fiber_action_kind(&action);
+    if execution_mode == "real" {
+        if let Err(e) = ensure_risky_network_ready() {
+            return e.into_response();
+        }
+        if let Err(e) = ensure_protocol_scope(
+            &state,
+            FIBER_PRECONTRACT_PROTOCOL_ID,
+            "fiber_real_execution",
+        ) {
+            return e.into_response();
+        }
+    }
+    if let Err(e) =
+        enforce_fiber_action_guard(action_kind, &execution_mode, req.signer_address.as_deref())
+    {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({
+                "error":e,
+                "action_code":action_kind.code(),
+                "action_label":action_kind.label(),
+                "requires_signer":action_kind.requires_signer()
+            })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status":"preflight_ok",
+            "action": action,
+            "action_code": action_kind.code(),
+            "action_label": action_kind.label(),
+            "action_risk": match action_kind.risk() { FiberActionRisk::Low => "low", FiberActionRisk::High => "high" },
+            "requires_signer": action_kind.requires_signer(),
+            "execution_mode": execution_mode,
+            "network": cfg.network.as_str(),
+            "chain_id": req.chain_id,
+            "mainnet_ready": cfg.mainnet_ready,
+            "phase": if execution_mode == "real" { "real_chain_execution" } else { "simulation_or_preview" }
+        })),
+    )
+        .into_response()
+}
+
+async fn start_auto_bidding(State(state): State<AppState>) -> impl IntoResponse {
+    if let Err(e) = ensure_automation_gate(&state, "smart_auto_bidding") {
+        return e.into_response();
+    }
+    start_auto_bidding_impl(State(state)).await.into_response()
 }
 
 async fn get_buy_orders(State(state): State<AppState>) -> impl IntoResponse {
@@ -2260,6 +2818,11 @@ async fn set_market_mode(
     }
     .to_string();
     let old_mode = state.market_mode.lock().expect("market mode lock").clone();
+    if mode == MARKET_MODE_AUTO || mode == MARKET_MODE_HYBRID {
+        if let Err(e) = ensure_automation_gate(&state, "smart_mode_auto") {
+            return e.into_response();
+        }
+    }
     *state.market_mode.lock().expect("market mode lock") = mode.clone();
     converge_mode_state(&state, &old_mode, &mode);
     if mode == MARKET_MODE_MANUAL || mode == MARKET_MODE_HYBRID {
@@ -2310,6 +2873,9 @@ async fn set_market_pricing(
     State(state): State<AppState>,
     Json(req): Json<MarketPricingPayload>,
 ) -> impl IntoResponse {
+    if let Err(e) = ensure_automation_gate(&state, "smart_mode_auto") {
+        return e.into_response();
+    }
     let mode = match req.price_mode.as_str() {
         PRICE_MODE_FIXED => PRICE_MODE_FIXED,
         PRICE_MODE_BAND => PRICE_MODE_BAND,
@@ -2374,10 +2940,13 @@ async fn set_market_pricing(
         .expect("market audit lock")
         .push(format!("manual_override buyer_price_mode={mode}"));
 
-    get_market_pricing(State(state)).await
+    get_market_pricing(State(state)).await.into_response()
 }
 
 async fn confirm_recommended_band(State(state): State<AppState>) -> impl IntoResponse {
+    if let Err(e) = ensure_automation_gate(&state, "smart_mode_auto") {
+        return e.into_response();
+    }
     let current_hash = current_recommended_context_hash(&state);
     *state
         .recommended_confirmed
@@ -3137,6 +3706,7 @@ fn maybe_merge_and_settle(
             persistence.append_event(&MarketEvent::now("agentd", event_type, entity_id, details));
     };
     while task.pending_windows.len() >= task.merge_window_count {
+        let (execution_mode, signer_address) = current_fiber_execution_context();
         let Some(bound_match_id) = task.bound_match_id.clone() else {
             task.settlement_audit_events
                 .push("settlement_skipped:no_accepted_match_binding".to_string());
@@ -3299,6 +3869,36 @@ fn maybe_merge_and_settle(
             ));
             a.payload_hash = Some(invoice_payload_hash.clone());
         }
+        if let Err(err_code) = enforce_fiber_action_guard(
+            FiberActionKind::ContractCreate,
+            &execution_mode,
+            signer_address.as_deref(),
+        ) {
+            task.pending_windows.splice(0..0, windows.into_iter());
+            task.settlement_audit_events.push(format!(
+                "method=create_invoice status=blocked_by_guard detail={} match_id={}",
+                err_code, bound_match_id
+            ));
+            fail_settlement_attempt(
+                settlement_attempts,
+                &settlement_attempt.attempt_id,
+                SETTLEMENT_ATTEMPT_STATUS_RETRYABLE_FAILED,
+                SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE,
+                "fiber_guard_blocked",
+                &err_code,
+            );
+            release_after_failure(
+                "fiber_guard_blocked",
+                MATCH_STATUS_RETRYABLE_FAILED,
+                task,
+                accepted_matches,
+                locked_buy_orders,
+                locked_sell_orders,
+                provider_addr,
+                &bound_match_id,
+            );
+            break;
+        }
         let invoice = match gateway.create_invoice(task, &windows) {
             Ok(v) => v,
             Err(err) => {
@@ -3382,6 +3982,28 @@ fn maybe_merge_and_settle(
                 &settle_request.to_string(),
             ));
         }
+        if let Err(err_code) = enforce_fiber_action_guard(
+            FiberActionKind::SubmitTx,
+            &execution_mode,
+            signer_address.as_deref(),
+        ) {
+            task.pending_windows.splice(0..0, windows.into_iter());
+            task.settlement_audit_events.push(format!(
+                "method=settle_payment status=blocked_by_guard detail={} match_id={}",
+                err_code, bound_match_id
+            ));
+            release_after_failure(
+                "fiber_guard_blocked",
+                MATCH_STATUS_RETRYABLE_FAILED,
+                task,
+                accepted_matches,
+                locked_buy_orders,
+                locked_sell_orders,
+                provider_addr,
+                &bound_match_id,
+            );
+            break;
+        }
         let payment = match gateway.settle_payment(task, &invoice, &windows) {
             Ok(v) => v,
             Err(err) => {
@@ -3449,6 +4071,36 @@ fn maybe_merge_and_settle(
                 SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT,
                 &record_request.to_string(),
             ));
+        }
+        if let Err(err_code) = enforce_fiber_action_guard(
+            FiberActionKind::SubmitTx,
+            &execution_mode,
+            signer_address.as_deref(),
+        ) {
+            task.pending_windows.splice(0..0, windows.into_iter());
+            task.settlement_audit_events.push(format!(
+                "method=record_result status=blocked_by_guard detail={} match_id={}",
+                err_code, bound_match_id
+            ));
+            fail_settlement_attempt(
+                settlement_attempts,
+                &settlement_attempt.attempt_id,
+                SETTLEMENT_ATTEMPT_STATUS_PAYMENT_UNKNOWN,
+                SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT,
+                "fiber_guard_blocked",
+                &err_code,
+            );
+            release_after_failure(
+                "fiber_guard_blocked",
+                MATCH_STATUS_PAYMENT_UNKNOWN,
+                task,
+                accepted_matches,
+                locked_buy_orders,
+                locked_sell_orders,
+                provider_addr,
+                &bound_match_id,
+            );
+            break;
         }
         if let Err(err) = gateway.record_result(task, &invoice, &payment) {
             task.pending_windows.splice(0..0, windows.into_iter());
@@ -4128,6 +4780,20 @@ async fn retry_settlement_attempt(
     State(state): State<AppState>,
     Path(attempt_id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(e) = ensure_automation_gate(&state, "smart_recovery_ops") {
+        return e.into_response();
+    }
+    if let Err(err) = enforce_fiber_guard_for_current_context(FiberActionKind::SettlementRetry) {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({
+                "error": err,
+                "action_code": FiberActionKind::SettlementRetry.code(),
+                "action_label": FiberActionKind::SettlementRetry.label()
+            })),
+        )
+            .into_response();
+    }
     let mut attempts = state
         .settlement_attempts
         .lock()
@@ -4165,6 +4831,21 @@ async fn mark_settlement_attempt_final(
     State(state): State<AppState>,
     Path(attempt_id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(e) = ensure_automation_gate(&state, "smart_recovery_ops") {
+        return e.into_response();
+    }
+    if let Err(err) = enforce_fiber_guard_for_current_context(FiberActionKind::SettlementMarkFinal)
+    {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({
+                "error": err,
+                "action_code": FiberActionKind::SettlementMarkFinal.code(),
+                "action_label": FiberActionKind::SettlementMarkFinal.label()
+            })),
+        )
+            .into_response();
+    }
     let mut attempts = state
         .settlement_attempts
         .lock()
@@ -4277,6 +4958,9 @@ async fn dispute_action_handler(
 }
 
 async fn run_recovery_now(State(state): State<AppState>) -> impl IntoResponse {
+    if let Err(e) = ensure_automation_gate(&state, "smart_recovery_ops") {
+        return e.into_response();
+    }
     let tick = *state.lifecycle_tick.lock().expect("lifecycle tick lock");
     run_recovery_tick(&state, tick).await;
     persist_agent_state(&state);
@@ -4288,6 +4972,9 @@ async fn run_recovery_now(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn run_reaper_now(State(state): State<AppState>) -> impl IntoResponse {
+    if let Err(e) = ensure_automation_gate(&state, "smart_reaper_ops") {
+        return e.into_response();
+    }
     run_reaper_tick(&state).await;
     persist_agent_state(&state);
     (
@@ -4438,6 +5125,17 @@ async fn run_settlement_attempt_stage(
                 SETTLEMENT_ATTEMPT_STAGE_CREATE_INVOICE,
                 &req.to_string(),
             );
+            let (execution_mode, signer_address) = current_fiber_execution_context();
+            if let Err(err_code) = enforce_fiber_action_guard(
+                FiberActionKind::ContractCreate,
+                &execution_mode,
+                signer_address.as_deref(),
+            ) {
+                return Err((
+                    "fiber_guard_blocked".to_string(),
+                    format!("create_invoice replay blocked: {}", err_code),
+                ));
+            }
             if let Some(prev) = attempt.payload_hash.clone() {
                 if prev != payload_hash {
                     let _ = open_dispute(
@@ -4536,6 +5234,17 @@ async fn run_settlement_attempt_stage(
                 SETTLEMENT_ATTEMPT_STAGE_SETTLE_PAYMENT,
                 &req.to_string(),
             );
+            let (execution_mode, signer_address) = current_fiber_execution_context();
+            if let Err(err_code) = enforce_fiber_action_guard(
+                FiberActionKind::SubmitTx,
+                &execution_mode,
+                signer_address.as_deref(),
+            ) {
+                return Err((
+                    "fiber_guard_blocked".to_string(),
+                    format!("settle_payment replay blocked: {}", err_code),
+                ));
+            }
             if let Some(prev) = attempt.payload_hash.clone() {
                 if prev != payload_hash && prev.contains("settlement_stage") {
                     let _ = open_dispute(
@@ -4642,6 +5351,17 @@ async fn run_settlement_attempt_stage(
                 SETTLEMENT_ATTEMPT_STAGE_RECORD_RESULT,
                 &req.to_string(),
             );
+            let (execution_mode, signer_address) = current_fiber_execution_context();
+            if let Err(err_code) = enforce_fiber_action_guard(
+                FiberActionKind::SubmitTx,
+                &execution_mode,
+                signer_address.as_deref(),
+            ) {
+                return Err((
+                    "fiber_guard_blocked".to_string(),
+                    format!("record_result replay blocked: {}", err_code),
+                ));
+            }
             state
                 .settlement_gateway
                 .lock()
@@ -5105,6 +5825,7 @@ async fn get_task_status(
         .iter()
         .filter(|v| v.contains("lifecycle_provider_offline"))
         .count();
+    let runtime_cfg = common::runtime_config::load_runtime_config();
     let disputes = state.disputes.lock().expect("disputes lock");
     let disputes_open_count = disputes
         .values()
@@ -5188,6 +5909,12 @@ async fn get_task_status(
             runtime_data_source_path: select_runtime_data_source(),
             legacy_bridge_requested: legacy_bridge_requested(),
             payment_rail_mode: current_payment_rail_mode(),
+            protocol_gate: protocol_gate_status(&state),
+            network: runtime_cfg.network.as_str().to_string(),
+            prefix: runtime_cfg.address_prefix,
+            mainnet_ready: runtime_cfg.mainnet_ready,
+            market_persistence_mode: state.persistence.mode_code().to_string(),
+            market_persistence_reason: state.persistence.mode_detail(),
         }),
     )
         .into_response()
@@ -5218,7 +5945,7 @@ async fn get_node_identity(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
-async fn get_network_runtime() -> impl IntoResponse {
+async fn get_network_runtime(State(state): State<AppState>) -> impl IntoResponse {
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -5228,9 +5955,37 @@ async fn get_network_runtime() -> impl IntoResponse {
             "runtime_data_source_path": select_runtime_data_source(),
             "bridge_dependent_modules": bridge_dependent_modules(),
             "legacy_bridge_requested": legacy_bridge_requested(),
+            "protocol_gate": protocol_gate_status(&state),
+            "network": common::runtime_config::load_runtime_config().network.as_str(),
+            "prefix": common::runtime_config::load_runtime_config().address_prefix,
+            "mainnet_ready": common::runtime_config::load_runtime_config().mainnet_ready,
             "payment_rail_mode": current_payment_rail_mode(),
+            "market_persistence_mode": state.persistence.mode_code(),
+            "market_persistence_reason": state.persistence.mode_detail(),
         })),
     )
+}
+
+async fn get_runtime_dirs() -> impl IntoResponse {
+    match common::runtime_dirs::resolve_runtime_dirs("SliceStream") {
+        Ok(d) => (
+            StatusCode::OK,
+            Json(RuntimeDirsView {
+                config_dir: d.config_dir.display().to_string(),
+                data_dir: d.data_dir.display().to_string(),
+                log_dir: d.log_dir.display().to_string(),
+                cache_dir: d.cache_dir.display().to_string(),
+                protocol_state_dir: d.protocol_state_dir.display().to_string(),
+                runtime_state_dir: d.runtime_state_dir.display().to_string(),
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":"runtime_dirs_resolve_failed","detail":e})),
+        )
+            .into_response(),
+    }
 }
 
 async fn get_trade_desk(
@@ -5465,7 +6220,13 @@ async fn get_trade_desk(
             "runtime_data_source_path": select_runtime_data_source(),
             "bridge_dependent_modules": bridge_dependent_modules(),
             "legacy_bridge_requested": legacy_bridge_requested(),
-            "payment_rail_mode": current_payment_rail_mode()
+            "protocol_gate": protocol_gate_status(&state),
+            "network": common::runtime_config::load_runtime_config().network.as_str(),
+            "prefix": common::runtime_config::load_runtime_config().address_prefix,
+            "mainnet_ready": common::runtime_config::load_runtime_config().mainnet_ready,
+            "payment_rail_mode": current_payment_rail_mode(),
+            "market_persistence_mode": state.persistence.mode_code(),
+            "market_persistence_reason": state.persistence.mode_detail()
         })),
     )
         .into_response()
@@ -5519,6 +6280,7 @@ async fn get_task_receipt(
 
 #[tokio::main]
 async fn main() {
+    init_runtime_dirs("agentd");
     let runtime_cfg = load_runtime_config();
     let fiber_probe = FiberRpcClient::default();
     println!(
@@ -8063,6 +8825,246 @@ Content-Length: {}
     }
 
     #[tokio::test]
+    async fn smart_ops_require_protocol_acceptance_and_support_revocation() {
+        let state = AppState::default();
+        let app = app_with_state(state.clone());
+
+        let revoke_first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/protocol/agreements/agent_automation_protocol_v1/revoke")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoke_first.status(), StatusCode::OK);
+
+        let blocked = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/ops/recovery/run")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::PRECONDITION_REQUIRED);
+
+        let accept = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/protocol/agreements/agent_automation_protocol_v1/accept")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"wallet_address":"ckt1test","signature_ref":"sig-ref"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accept.status(), StatusCode::OK);
+
+        let allowed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/ops/recovery/run")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+
+        let revoke = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/protocol/agreements/agent_automation_protocol_v1/revoke")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoke.status(), StatusCode::OK);
+
+        let blocked_again = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/ops/recovery/run")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked_again.status(), StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn fiber_preflight_real_requires_signer_address() {
+        let state = AppState::default();
+        let app = app_with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/fiber/preflight")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "action":"trade_request",
+                            "execution_mode":"real",
+                            "requested_network":"testnet",
+                            "chain_id":null
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[tokio::test]
+    async fn fiber_preflight_rejects_unknown_action_kind() {
+        let state = AppState::default();
+        let app = app_with_state(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/fiber/preflight")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "action":"mystery_action",
+                            "execution_mode":"simulate",
+                            "requested_network":"testnet",
+                            "chain_id":null
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[tokio::test]
+    async fn runtime_dirs_endpoint_returns_paths() {
+        let state = AppState::default();
+        let app = app_with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/runtime/dirs")
+                    .method("GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn fiber_worker_guard_rejects_unknown_action() {
+        let result = enforce_fiber_action_guard(FiberActionKind::Unknown, "simulate", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fiber_worker_guard_requires_signer_for_real_mode() {
+        let result = enforce_fiber_action_guard(FiberActionKind::SubmitTx, "real", None);
+        assert!(matches!(result, Err(e) if e == "signer_address_required"));
+    }
+
+    #[test]
+    fn fiber_worker_guard_rejects_high_risk_action_in_simulate_mode() {
+        let result =
+            enforce_fiber_action_guard(FiberActionKind::SubmitTx, "simulate", Some("ckt1qexample"));
+        assert!(matches!(
+            result,
+            Err(e) if e == "action_not_allowed_in_simulate:submit_tx"
+        ));
+    }
+
+    #[test]
+    fn fiber_action_kind_metadata_is_consistent() {
+        let action = parse_fiber_action_kind("submit_tx");
+        assert_eq!(action.code(), "submit_tx");
+        assert_eq!(action.label(), "Submit Transaction");
+        assert!(action.requires_signer());
+        assert!(action.allowed_in_real());
+        assert!(!action.allowed_in_simulate());
+    }
+
+    #[tokio::test]
+    async fn retry_endpoint_is_blocked_after_protocol_revoke() {
+        let state = AppState::default();
+        let app = app_with_state(state.clone());
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/protocol/agreements/agent_automation_protocol_v1/revoke")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let blocked = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/market/settlement-attempts/attempt-gate/retry")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn protocol_version_mismatch_requires_reaccept() {
+        let state = AppState::default();
+        {
+            let mut agreements = state.protocol_agreements.lock().unwrap();
+            let a = agreements
+                .get_mut(AGENT_AUTOMATION_PROTOCOL_ID)
+                .expect("agreement exists");
+            a.version = "0.9.0".to_string();
+        }
+        let app = app_with_state(state.clone());
+        let blocked = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/ops/reaper/run")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
     async fn resolve_dispute_endpoint_updates_status() {
         let state = AppState::default();
         let id = open_dispute(
@@ -9235,7 +10237,7 @@ Content-Length: {}
     }
 
     #[tokio::test]
-    async fn legacy_bridge_env_and_direct_env_return_consistent_identity_semantics() {
+    async fn legacy_bridge_env_is_ignored_and_identity_semantics_stay_direct() {
         let _env_guard = ENV_TEST_LOCK.lock().expect("env lock");
         let state = AppState::default();
         let app = app_with_state(state);
@@ -9285,7 +10287,7 @@ Content-Length: {}
             runtime_json
                 .get("legacy_bridge_requested")
                 .and_then(|x| x.as_bool()),
-            Some(true)
+            Some(false)
         );
 
         std::env::remove_var("SLICESTREAM_RUNTIME_MODE");
@@ -9381,8 +10383,8 @@ Content-Length: {}
     #[test]
     fn dead_compat_paths_removed_or_explicitly_marked() {
         let deps = runtime_mode_dependencies();
-        assert!(deps.iter().all(|d| d.contains("missing")
-            || d.contains("endpoint")
-            || d.contains("legacy_bridge_mode_requested")));
+        assert!(deps
+            .iter()
+            .all(|d| d.contains("missing") || d.contains("endpoint")));
     }
 }

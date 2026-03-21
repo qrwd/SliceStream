@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>SliceStream Pro Terminal</title>
+  <title>SliceStream Internal Preview Terminal</title>
   <style>
     :root{color-scheme:dark;--bg:#070d1a;--card:#0f1931;--line:#26447c;--muted:#9ab0db;--ok:#8ef3b2;--warn:#ffd08a;--bad:#ff9fb1;--accent:#66a3ff}
     *{box-sizing:border-box}body{margin:0;background:var(--bg);color:#eaf1ff;font-family:Inter,system-ui,sans-serif}
@@ -23,12 +23,20 @@
     .stack{display:grid;gap:8px}.timeline{display:grid;gap:6px}.event{border:1px solid #2e4e85;background:#0c1730;border-radius:8px;padding:8px;font-size:12px}
     input,select{width:100%;background:#081226;color:#fff;border:1px solid #35518c;border-radius:6px;padding:7px}
     .status{padding:8px 10px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}
+    .note{font-size:12px;color:var(--muted);line-height:1.4}
+    .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;border:1px solid}
+    .badge.ready{border-color:#2f9b64;color:#8ef3b2}
+    .badge.blocked{border-color:#a64b61;color:#ff9fb1}
+    .badge.warn{border-color:#b4863f;color:#ffd08a}
     .progress{height:8px;background:#0b1630;border:1px solid #2f4c84;border-radius:999px;overflow:hidden}.progress>span{display:block;height:100%;background:linear-gradient(90deg,#5b8df5,#67e1ff)}
   </style>
 <!-- smoke markers: Direct Connected Disconnected mode Network / Prefix cargo run -p agentd -->
 </head>
 <body>
 <div class="app">
+  <div style="padding:6px 10px;border-bottom:1px solid #3b5b96;background:#162547;color:#ffd08a;font-size:12px">
+    SliceStream v0.1.0-beta.2 • staging/internal preview • tool mode (non-custodial, user-signing required for risky on-chain actions)
+  </div>
   <section class="top">
     <div class="pill"><div class="k">Network / Prefix</div><div id="net" class="v">-</div></div>
     <div class="pill"><div class="k">Runtime Mode</div><div id="runtime" class="v">-</div></div>
@@ -38,6 +46,9 @@
     <div class="pill"><div class="k">Open Disputes</div><div id="openDisputes" class="v">-</div></div>
     <div class="pill"><div class="k">Unknown Payments</div><div id="unknownPays" class="v">-</div></div>
     <div class="pill"><div class="k">Recovery Queue</div><div id="recoveryQ" class="v">-</div></div>
+    <div class="pill"><div class="k">Endpoint State</div><div id="endpointState" class="v">-</div></div>
+    <div class="pill"><div class="k">Gate State</div><div id="gateState" class="v">-</div></div>
+    <div class="pill"><div class="k">Action Readiness</div><div id="actionReadiness" class="v">-</div></div>
   </section>
 
   <section class="toolbar">
@@ -102,17 +113,24 @@
 
   <section id="tab-profile" class="workspace g2">
     <div class="panel"><h3>Personal Homepage</h3><table><tbody id="profileRows"></tbody></table><h3>Recent Personal Activity</h3><div id="profileActivity" class="timeline"></div></div>
-    <div class="panel"><h3>Settings</h3><label>Theme</label><select id="themeSel"><option>dark-pro</option><option>dark-terminal</option></select><label>Density</label><select id="densitySel"><option>high</option><option>comfortable</option></select><label>Auto refresh interval (ms)</label><input id="refreshInput" value="2500"/><label>Demo Mode</label><select id="demoMode"><option>on</option><option>off</option></select><label>Scenario</label><select id="scenarioSel"><option value="normal">normal_completed_trade</option><option value="penalty">penalty_refund_trade</option><option value="payment_unknown">payment_unknown_dispute_trade</option></select><label>Show Hash Style</label><select id="hashMode"><option>truncated</option><option>full</option></select><button class="btn" id="saveSettings">Save Settings</button></div>
+    <div class="panel"><h3>Settings</h3><p class="note">SliceStream is a local non-custodial desktop tool. Set local agent/provider endpoints before risky actions can run.</p><label>Agent Endpoint</label><input id="agentEndpoint" placeholder="http://127.0.0.1:4002"/><label>Provider Endpoint</label><input id="providerEndpoint" placeholder="http://127.0.0.1:4001"/><h3>Local Endpoint Health</h3><table><tbody id="endpointRows"></tbody></table><label>Theme</label><select id="themeSel"><option>dark-pro</option><option>dark-terminal</option></select><label>Density</label><select id="densitySel"><option>high</option><option>comfortable</option></select><label>Auto refresh interval (ms)</label><input id="refreshInput" value="2500"/><label>Demo Mode</label><select id="demoMode"><option>on</option><option>off</option></select><label>Scenario</label><select id="scenarioSel"><option value="normal">normal_completed_trade</option><option value="penalty">penalty_refund_trade</option><option value="payment_unknown">payment_unknown_dispute_trade</option></select><label>Show Hash Style</label><select id="hashMode"><option>truncated</option><option>full</option></select><button class="btn" id="saveSettings">Save Settings</button><h3>Build / Channel</h3><table><tbody id="buildRows"></tbody></table><h3>Gate Summary</h3><table><tbody id="gateRows"></tbody></table></div>
   </section>
 
   <div class="status" id="status">status: booting...</div>
 </div>
 
 <script>
-const AGENT='http://127.0.0.1:4002';
-const PROVIDER='http://127.0.0.1:4001';
-const TASK_ID='task-demo';
-const PROVIDER_JOB_ID='job-demo';
+const runtimeCfg=(window.__SLICESTREAM_CONFIG||{});
+const AGENT=String(runtimeCfg.agent_base_url||localStorage.getItem('slicestream_agent_base_url')||'');
+const PROVIDER=String(runtimeCfg.provider_base_url||localStorage.getItem('slicestream_provider_base_url')||'');
+const TASK_ID=String(runtimeCfg.default_task_id||localStorage.getItem('slicestream_task_id')||'task-demo');
+const PROVIDER_JOB_ID=String(runtimeCfg.default_provider_job_id||localStorage.getItem('slicestream_provider_job_id')||'job-demo');
+const APP_META={
+  product:String(runtimeCfg.product_name||'SliceStream'),
+  version:String(runtimeCfg.version||'0.1.0-beta.2'),
+  channel:String(runtimeCfg.channel||'internal-preview'),
+  build:String(runtimeCfg.build||'desktop-tauri')
+};
 
 const $=id=>document.getElementById(id);
 const row=(k,v)=>`<tr><th>${k}</th><td>${v??'-'}</td></tr>`;
@@ -123,6 +141,71 @@ const tabs=[...document.querySelectorAll('.tab')];
 for(const b of tabs){b.onclick=()=>{tabs.forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.workspace').forEach(p=>p.classList.remove('active'));$('tab-'+b.dataset.tab).classList.add('active')}}
 
 const settings={scenario:'normal'};
+let latestData=null;
+let latestGateReasons={};
+const REASON_MAP={
+  local_endpoint_not_configured:{user:'Needs local endpoint configuration'},
+  protocol_not_accepted:{user:'Protocol consent required'},
+  protocol_version_mismatch:{user:'Protocol version mismatch'},
+  mainnet_not_ready:{user:'Mainnet readiness required'},
+  unknown_network:{user:'Unsupported network'},
+  network_mismatch:{user:'Requested network does not match runtime network'},
+  signer_address_required:{user:'Signer address required'},
+  unknown_fiber_action:{user:'Unsupported Fiber action'},
+};
+function extractReasonCode(reason){
+  const raw=String(reason||'');
+  if(!raw) return '';
+  const gateMatch=raw.match(/blocked_by_gate:([a-z0-9_]+)/i);
+  if(gateMatch && gateMatch[1]) return gateMatch[1].toLowerCase();
+  if(raw.includes('local_endpoint_not_configured')) return 'local_endpoint_not_configured';
+  const m=raw.match(/\{.*\}$/);
+  if(m){
+    try{
+      const parsed=JSON.parse(m[0]);
+      if(typeof parsed?.error==='string') return parsed.error;
+    }catch(_){}
+  }
+  if(raw.includes('protocol not accepted')) return 'protocol_not_accepted';
+  if(raw.includes('network unknown')) return 'unknown_network';
+  return '';
+}
+function normalizeReason(reason){
+  const code=extractReasonCode(reason);
+  if(!reason) return {code:'ready',user:'Ready',detail:'all required protocol/network checks passed'};
+  const raw=String(reason);
+  if(raw.startsWith('blocked_by_gate:')){
+    const parts=raw.replace('blocked_by_gate:','').split(':');
+    const parsedCode=parts[0]||code||'blocked_by_safety_gate';
+    const gateDetail=parts.slice(1).join(':')||'gate policy blocked action';
+    const mapped=REASON_MAP[parsedCode];
+    return {
+      code:parsedCode,
+      user:mapped?.user||'Blocked by safety gate',
+      detail:`gate_detail=${gateDetail}`
+    };
+  }
+  const mapped=REASON_MAP[code];
+  if(mapped) return {code,user:mapped.user,detail:String(reason)};
+  return {code:code||'blocked_by_safety_gate',user:'Blocked by safety gate',detail:String(reason)};
+}
+function statusWithReason(prefix, reason){
+  const normalized=normalizeReason(reason);
+  status(`${prefix}: ${normalized.user} [${normalized.code}]. detail=${normalized.detail}`);
+}
+function readinessBadge(state){
+  if(state==='ready') return `<span class="badge ready">ready</span>`;
+  if(state==='blocked') return `<span class="badge blocked">blocked</span>`;
+  return `<span class="badge warn">${state}</span>`;
+}
+function computeReadiness(endpointConfigured, gateBlockedCode){
+  if(!endpointConfigured) return 'needs-config';
+  if(!gateBlockedCode || gateBlockedCode==='ready') return 'ready';
+  if(gateBlockedCode==='signer_address_required') return 'needs-signer';
+  if(gateBlockedCode==='protocol_not_accepted' || gateBlockedCode==='protocol_version_mismatch') return 'needs-protocol';
+  if(gateBlockedCode==='unknown_network' || gateBlockedCode==='network_mismatch') return 'wrong-network';
+  return 'blocked';
+}
 function scenarioFilter(data){
   const s=settings.scenario;
   if(s==='normal') return data;
@@ -139,6 +222,9 @@ function asArray(v){return Array.isArray(v)?v:[]}
 function pushWarn(w,msg){if(msg)w.push(msg)}
 
 async function fetchDirectLive(){
+  if(!AGENT || !PROVIDER){
+    throw new Error('local_endpoint_not_configured: set slicestream_agent_base_url / slicestream_provider_base_url');
+  }
   const endpoints={
     provider_status:`${PROVIDER}/v1/provider/jobs/${PROVIDER_JOB_ID}`,
     provider_result:`${PROVIDER}/v1/provider/jobs/${PROVIDER_JOB_ID}/result`,
@@ -157,8 +243,13 @@ async function fetchDirectLive(){
     disputes:`${AGENT}/internal/market/disputes`,
     trade_desk:`${AGENT}/v1/tasks/${TASK_ID}/trade-desk`,
     network_runtime:`${AGENT}/internal/network/runtime`,
+    agent_runtime_dirs:`${AGENT}/internal/runtime/dirs`,
     node_identity:`${AGENT}/internal/node/identity`,
-    provider_node_identity:`${PROVIDER}/internal/node/identity`
+    provider_node_identity:`${PROVIDER}/internal/node/identity`,
+    provider_runtime_mode:`${PROVIDER}/internal/runtime/mode`,
+    provider_runtime_dirs:`${PROVIDER}/internal/runtime/dirs`,
+    agent_protocol_agreements:`${AGENT}/internal/protocol/agreements`,
+    provider_protocol_agreements:`${PROVIDER}/internal/protocol/agreements`
   };
   const entries=Object.entries(endpoints);
   const responses=await Promise.all(entries.map(([k,u])=>jSafe(u).then(v=>[k,v])));
@@ -174,6 +265,11 @@ async function fetchDirectLive(){
   const networkRuntime = map.network_runtime.data||{};
   const nodeIdentity = map.node_identity.data||{};
   const providerNodeIdentity = map.provider_node_identity.data||{};
+  const providerRuntimeMode = map.provider_runtime_mode.data||{};
+  const agentRuntimeDirs = map.agent_runtime_dirs.data||{};
+  const providerRuntimeDirs = map.provider_runtime_dirs.data||{};
+  const agentProtocolAgreements = asArray(map.agent_protocol_agreements.data);
+  const providerProtocolAgreements = asArray(map.provider_protocol_agreements.data);
 
   const trades = asArray(tradeDesk.trades);
   const billing_windows = asArray(tradeDesk.bills);
@@ -194,7 +290,8 @@ async function fetchDirectLive(){
   const runtime_mode = tradeDesk.runtime_mode ?? agentStatus.runtime_mode ?? networkRuntime.runtime_mode ?? 'direct';
   const direct_mode_ready = tradeDesk.direct_mode_ready ?? agentStatus.direct_mode_ready ?? networkRuntime.direct_mode_ready ?? true;
   const runtime_data_source_path = tradeDesk.runtime_data_source_path ?? networkRuntime.runtime_data_source_path ?? 'direct_local_node';
-  const bridge_dependent_modules = asArray(networkRuntime.bridge_dependent_modules);
+  const market_persistence_mode = tradeDesk.market_persistence_mode ?? networkRuntime.market_persistence_mode ?? providerRuntimeMode.market_persistence_mode ?? 'runtime_dirs';
+  const market_persistence_reason = tradeDesk.market_persistence_reason ?? networkRuntime.market_persistence_reason ?? providerRuntimeMode.market_persistence_reason ?? null;
   const payment_rail_mode = tradeDesk.payment_rail_mode ?? networkRuntime.payment_rail_mode ?? 'fiber_simulated';
 
   const total_paid = agentStatus.total_paid;
@@ -204,8 +301,8 @@ async function fetchDirectLive(){
   return {
     selected_task_id:TASK_ID,
     selected_provider_id:'provider-demo',
-    network:'testnet',
-    prefix:'ckt',
+    network:agentStatus.network ?? networkRuntime.network ?? providerRuntimeMode.network ?? "unknown",
+    prefix:agentStatus.prefix ?? networkRuntime.prefix ?? providerRuntimeMode.prefix ?? "unknown",
     settlement_mode:'fiber',
     benchmark_score:providerStatus.benchmark_score,
     task_status:agentStatus.status,
@@ -261,6 +358,8 @@ async function fetchDirectLive(){
     node_pubkey:agentStatus.node_pubkey ?? nodeIdentity.pubkey,
     provider_peer_id:providerNodeIdentity.peer_id,
     provider_node_id:providerNodeIdentity.node_id,
+    agent_runtime_dirs:agentRuntimeDirs,
+    provider_runtime_dirs:providerRuntimeDirs,
     settlement_interval_secs:agentStatus.settlement_interval_secs,
     committed_compute_total:agentStatus.committed_compute_total,
     minimum_commit_compute:agentStatus.minimum_commit_compute,
@@ -270,16 +369,78 @@ async function fetchDirectLive(){
     stop_condition:agentStatus.stop_condition,
     finalization_rule:agentStatus.finalization_rule,
     disputes,trades,billing_windows,offers,
-    runtime_mode,direct_mode_ready,runtime_data_source_path,bridge_dependent_modules,payment_rail_mode,
+    runtime_mode,direct_mode_ready,runtime_data_source_path,market_persistence_mode,market_persistence_reason,payment_rail_mode,
+    protocol_gate: tradeDesk.protocol_gate ?? networkRuntime.protocol_gate ?? {accepted:false},
+    provider_protocol_gate: providerRuntimeMode.protocol_gate ?? {accepted:false},
+    mainnet_ready: tradeDesk.mainnet_ready ?? networkRuntime.mainnet_ready ?? providerRuntimeMode.mainnet_ready ?? false,
+    agent_protocol_agreements: agentProtocolAgreements,
+    provider_protocol_agreements: providerProtocolAgreements,
     warnings,
     api_error:warnings.length?null:null
   }
+}
+
+
+function setGateDisabled(ids,disabled,reason){
+  for(const id of ids){
+    const el=$(id);
+    if(!el) continue;
+    el.disabled=disabled;
+    el.style.opacity=disabled?0.45:1;
+    el.title=disabled?(reason||'protocol gate required'):'';
+  }
+}
+
+function applyActionGates(data){
+  const agentAccepted=Boolean(data?.protocol_gate?.accepted);
+  const providerAccepted=Boolean(data?.provider_protocol_gate?.accepted);
+  const net=(data?.network||'unknown').toLowerCase();
+  const mainnetReady=Boolean(data?.mainnet_ready);
+  const netKnown=(net==='testnet'||net==='mainnet');
+  const baseRisk=[
+    'runRecoveryBtn','runReaperBtn','buyWizardSubmit','disputeApply','retryAttemptBtn','markFinalBtn'
+  ];
+  latestGateReasons={};
+  const block=(code,detail)=>{
+    const reason=`${code}${detail?`:${detail}`:''}`;
+    for(const id of baseRisk) latestGateReasons[id]=reason;
+    setGateDisabled(baseRisk,true,reason);
+  };
+  if(!agentAccepted){
+    block('protocol_not_accepted','agent');
+    return;
+  }
+  if(!providerAccepted){
+    block('protocol_not_accepted','provider');
+    return;
+  }
+  if(!netKnown){
+    block('unknown_network',net||'unknown');
+    return;
+  }
+  if(net==='mainnet' && !mainnetReady){
+    block('mainnet_not_ready','mainnet');
+    return;
+  }
+  for(const id of baseRisk) latestGateReasons[id]='';
+  setGateDisabled(baseRisk,false,'');
+}
+
+function requireActionGate(buttonId){
+  const reason=latestGateReasons?.[buttonId]||'gate status unknown';
+  if(reason) throw new Error(`blocked_by_gate:${reason}`);
+}
+
+async function fiberPreflight(action, execution_mode){
+  const payload={action,execution_mode,requested_network:latestData?.network||null,chain_id:null,signer_address:latestData?.node_pubkey||null};
+  return await j(`${AGENT}/internal/fiber/preflight`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
 }
 
 async function load(){
   try{
     let data=await fetchDirectLive();
     data=scenarioFilter(data);
+    latestData=data;
     const trades=data.trades||[]; const bills=data.billing_windows||[]; const disputes=data.disputes||[]; const offers=data.offers||[];
     $('net').textContent=`${data.network||'-'} / ${data.prefix||'-'}`;
     $('runtime').textContent=data.runtime_mode||'direct';
@@ -289,6 +450,7 @@ async function load(){
     $('openDisputes').textContent=String(disputes.filter(d=>['open','awaiting_manual_resolution'].includes(d.status)).length);
     $('unknownPays').textContent=String(data.payment_unknown_attempts_count||0);
     $('recoveryQ').textContent=String(data.recovery_queue_size||0);
+    $('endpointState').textContent=(AGENT && PROVIDER)?'configured':'missing';
 
     $('kpiRows').innerHTML=[row('active trades',trades.length),row('total delivered compute',trades.reduce((a,t)=>a+(t.delivered_compute_total||0),0).toFixed(2)),row('open billing windows',bills.filter(b=>!['finalized','paid'].includes(b.status)).length),row('pending refunds',bills.filter(b=>(b.refund_amount||0)>0).length),row('penalty exposure',bills.reduce((a,b)=>a+(b.penalty_amount||0),0).toFixed(2)),row('provider offline impact',data.provider_offline_impact_count||0)].join('');
     $('riskRows').innerHTML=[row('gap ratio distribution',trades.map(t=>(t.gap_ratio||0).toFixed(3)).join(', ')),row('unknown payment risk',data.payment_unknown_attempts_count||0),row('dispute severity summary',disputes.map(d=>d.severity).join(', ')||'none')].join('');
@@ -315,26 +477,77 @@ async function load(){
     $('opsLog').innerHTML=[...(data.agent_market_audit||[]),...(data.provider_market_audit||[])].slice(-15).reverse().map(x=>evt('op',x)).join('');
 
     $('auditTimeline').innerHTML=[...(data.agent_market_audit||[]),...(data.provider_market_audit||[])].slice(-25).reverse().map(x=>evt('audit',x)).join('');
-    $('hashRows').innerHTML=[row('evidence root',data.receipt_evidence?.evidence_root||'-'),row('verify ok',String(data.receipt_evidence?.evidence_verify_ok)),row('runtime source',data.runtime_data_source_path||'-'),row('bridge dependent modules',(data.bridge_dependent_modules||[]).join(', ')||'-')].join('');
+    $('hashRows').innerHTML=[row('evidence root',data.receipt_evidence?.evidence_root||'-'),row('verify ok',String(data.receipt_evidence?.evidence_verify_ok)),row('runtime source',data.runtime_data_source_path||'-')].join('');
 
-    $('nodeRows').innerHTML=[row('node_id',data.selected_task_id||'-'),row('peer_id',data.peer_id||'-'),row('provider_peer_id',data.provider_peer_id||'-'),row('pubkey',`<span class='mono'>${data.node_pubkey||'-'}</span>`),row('runtime mode',data.runtime_mode||'-'),row('direct mode readiness',String(data.direct_mode_ready)),row('data source path',data.runtime_data_source_path||'-'),row('payment rail',data.payment_rail_mode||'-'),row('network health',`${data.network}/${data.prefix}`)].join('');
-    $('pathRows').innerHTML=[row('bridge dependent modules',(data.bridge_dependent_modules||[]).join(', ')||'none'),row('compatibility dependencies',(data.warnings||[]).slice(0,4).join(' | ')||'none')].join('');
+    $('nodeRows').innerHTML=[row('node_id',data.selected_task_id||'-'),row('peer_id',data.peer_id||'-'),row('provider_peer_id',data.provider_peer_id||'-'),row('pubkey',`<span class='mono'>${data.node_pubkey||'-'}</span>`),row('runtime mode',data.runtime_mode||'-'),row('direct mode readiness',String(data.direct_mode_ready)),row('data source path',data.runtime_data_source_path||'-'),row('persistence mode',data.market_persistence_mode||'-'),row('payment rail',data.payment_rail_mode||'-'),row('network health',`${data.network}/${data.prefix}`),row('agent protocol accepted',String(Boolean(data.protocol_gate?.accepted))),row('provider protocol accepted',String(Boolean(data.provider_protocol_gate?.accepted))),row('mainnet ready',String(Boolean(data.mainnet_ready))),row('agent runtime dir',data.agent_runtime_dirs?.runtime_state_dir||'-'),row('provider runtime dir',data.provider_runtime_dirs?.runtime_state_dir||'-')].join('');
+    $('pathRows').innerHTML=[row('desktop data source',data.runtime_data_source_path||'direct_local_node'),row('market persistence',`${data.market_persistence_mode||'runtime_dirs'}${data.market_persistence_reason?` (${data.market_persistence_reason})`:''}`),row('compatibility dependencies',(data.warnings||[]).slice(0,4).join(' | ')||'none')].join('');
 
     $('profileRows').innerHTML=[row('display name','SliceStream Operator'),row('current role','buyer/provider/operator'),row('node identity',`${data.peer_id||'-'}`),row('peer/pubkey',`${data.peer_id||'-'} / ${(data.node_pubkey||'-').slice(0,20)}`),row('default workspace','home'),row('recent activity',`${trades.length} trades / ${disputes.length} disputes`),row('preferences profile',`${$('themeSel').value}/${$('densitySel').value}`)].join('');
     $('profileActivity').innerHTML=[evt('latest trade touch',trades[0]?.trade_id||'-'),evt('latest dispute touch',disputes[0]?.dispute_id||'none'),evt('latest billing touch',bills[0]?.bill_id||'-')].join('');
 
+    applyActionGates(data);
+    const activeReason=Object.values(latestGateReasons).find(Boolean)||'';
+    const normalized=normalizeReason(activeReason);
+    const endpointConfigured=Boolean(AGENT && PROVIDER);
+    const readinessState=computeReadiness(endpointConfigured, normalized.code);
+    $('gateState').textContent=activeReason?'blocked':'ready';
+    $('actionReadiness').innerHTML=readinessBadge(readinessState);
+    $('endpointRows').innerHTML=[
+      row('agent endpoint',AGENT||'<span class="bad">not configured</span>'),
+      row('provider endpoint',PROVIDER||'<span class="bad">not configured</span>'),
+      row('risky actions',activeReason?`<span class="bad">blocked</span>`:'<span class="ok">ready</span>'),
+      row('action readiness',readinessBadge(readinessState)),
+      row('reason code',normalized.code),
+      row('status reason',normalized.user),
+      row('technical detail',normalized.detail)
+    ].join('');
+    $('gateRows').innerHTML=[
+      row('gate state',activeReason?`<span class="bad">blocked</span>`:'<span class="ok">ready</span>'),
+      row('action readiness',readinessBadge(readinessState)),
+      row('reason code',normalized.code),
+      row('user-facing reason',normalized.user),
+      row('technical reason',normalized.detail),
+      row('protocol accepted',`${Boolean(data.protocol_gate?.accepted)} / ${Boolean(data.provider_protocol_gate?.accepted)}`),
+      row('network/mainnet',`${data.network||'-'} / mainnet_ready=${Boolean(data.mainnet_ready)}`)
+    ].join('');
     status('connected/direct '+new Date().toLocaleTimeString());
-  }catch(e){ status('disconnected '+e.message); }
+  }catch(e){
+    const msg=String(e?.message||e);
+    if(msg.includes('local_endpoint_not_configured')){
+      const normalized=normalizeReason(msg);
+      $('endpointState').textContent='missing';
+      $('gateState').textContent='needs-config';
+      $('actionReadiness').innerHTML=readinessBadge('needs-config');
+      $('endpointRows').innerHTML=[
+        row('agent endpoint',AGENT||'<span class="bad">not configured</span>'),
+        row('provider endpoint',PROVIDER||'<span class="bad">not configured</span>'),
+        row('risky actions','<span class="bad">blocked</span>'),
+        row('reason code',normalized.code),
+        row('status reason',normalized.user),
+        row('technical detail',normalized.detail)
+      ].join('');
+      $('gateRows').innerHTML=[row('gate state','<span class="bad">blocked</span>'),row('reason code',normalized.code),row('user-facing reason',normalized.user),row('technical reason',normalized.detail)].join('');
+      $('pathRows').innerHTML=[row('desktop data source','not configured'),row('gate reason','local endpoint missing (fail-closed)')].join('');
+      status('blocked: '+normalized.user+'. detail='+normalized.detail);
+      return;
+    }
+    status('disconnected '+msg);
+  }
 }
 
 $('compareDo').onclick=()=>{const a=$('offerA').value,b=$('offerB').value; $('offerCompareRows').innerHTML=[row('selected',`${a} vs ${b}`),row('hint','Use perf/confidence/dispute_rate to compare')].join('');};
 $('simRun').onclick=()=>{const g=Number($('simGross').value||0),c=Number($('simCommit').value||0),d=Number($('simDelivered').value||0); const gap=c>0?Math.max(0,(c-d)/c):0; const refund=gap>0.03?g*0.15:0; $('simOut').innerHTML=[row('gap',gap.toFixed(4)),row('refund',refund.toFixed(4)),row('provider payout',(g-refund).toFixed(4))].join('');};
-$('saveSettings').onclick=()=>{settings.scenario=$('scenarioSel').value; status('settings saved, scenario='+settings.scenario); load();};
+$('saveSettings').onclick=()=>{settings.scenario=$('scenarioSel').value; const a=$('agentEndpoint').value.trim(); const p=$('providerEndpoint').value.trim(); const isHttp=(v)=>!v||/^https?:\/\/[^ ]+$/i.test(v); if(!isHttp(a)||!isHttp(p)){status('settings save blocked: endpoint must be valid http(s) URL'); return;} if(a) localStorage.setItem('slicestream_agent_base_url',a); else localStorage.removeItem('slicestream_agent_base_url'); if(p) localStorage.setItem('slicestream_provider_base_url',p); else localStorage.removeItem('slicestream_provider_base_url'); status('settings saved, scenario='+settings.scenario+' (endpoint refresh in progress)'); load();};
 $('refreshNodeBtn').onclick=load; $('newBuyBtn').onclick=()=>$('buyWizardSubmit').click();
-$('buyWizardSubmit').onclick=async()=>{try{await j(`${AGENT}/internal/market/orders/buy/manual`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({task_id:$('buyTask').value,max_unit_price_per_work_unit:0.06,required_work_units:10.0,min_benchmark_score:80.0,capabilities_required:['fp16','llm']})}); status('buy submitted');}catch(e){status('buy failed '+e.message)}};
-$('runRecoveryBtn').onclick=async()=>{try{await j(`${AGENT}/internal/ops/recovery/run`,{method:'POST'});status('recovery done');load();}catch(e){status(e.message)}};
-$('runReaperBtn').onclick=async()=>{try{await j(`${AGENT}/internal/ops/reaper/run`,{method:'POST'});status('reaper done');load();}catch(e){status(e.message)}};
-$('disputeApply').onclick=async()=>{const id=$('disputeId').value.trim(); if(!id)return; try{await j(`${AGENT}/internal/market/disputes/${encodeURIComponent(id)}/resolve`,{method:'POST'}); status('dispute action applied');load();}catch(e){status('dispute action failed '+e.message)}};
+$('buyWizardSubmit').onclick=async()=>{try{requireActionGate('buyWizardSubmit');const mode=(latestData?.payment_rail_mode==='fiber_real')?'real':'simulate'; await fiberPreflight('trade_request',mode); await j(`${AGENT}/internal/market/orders/buy/manual`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({task_id:$('buyTask').value,max_unit_price_per_work_unit:0.06,required_work_units:10.0,min_benchmark_score:80.0,capabilities_required:['fp16','llm']})}); status('buy submitted');}catch(e){statusWithReason('buy failed', e.message)}};
+$('runRecoveryBtn').onclick=async()=>{try{requireActionGate('runRecoveryBtn');await fiberPreflight('recovery_run','simulate'); await j(`${AGENT}/internal/ops/recovery/run`,{method:'POST'});status('recovery done');load();}catch(e){statusWithReason('recovery blocked', e.message)}};
+$('runReaperBtn').onclick=async()=>{try{requireActionGate('runReaperBtn');await fiberPreflight('reaper_run','simulate'); await j(`${AGENT}/internal/ops/reaper/run`,{method:'POST'});status('reaper done');load();}catch(e){statusWithReason('reaper blocked', e.message)}};
+$('disputeApply').onclick=async()=>{const id=$('disputeId').value.trim(); if(!id)return; try{requireActionGate('disputeApply');await j(`${AGENT}/internal/market/disputes/${encodeURIComponent(id)}/resolve`,{method:'POST'}); status('dispute action applied');load();}catch(e){statusWithReason('dispute action failed', e.message)}};
+$('retryAttemptBtn').onclick=async()=>{try{requireActionGate('retryAttemptBtn');const id=prompt('settlement attempt id for retry'); if(!id) return; await fiberPreflight('settlement_retry','simulate'); await j(`${AGENT}/internal/market/settlement-attempts/${encodeURIComponent(id)}/retry`,{method:'POST'}); status('retry queued');load();}catch(e){statusWithReason('retry failed', e.message)}};
+$('markFinalBtn').onclick=async()=>{try{requireActionGate('markFinalBtn');const id=prompt('settlement attempt id for mark-final'); if(!id) return; await fiberPreflight('settlement_mark_final','simulate'); await j(`${AGENT}/internal/market/settlement-attempts/${encodeURIComponent(id)}/mark-final`,{method:'POST'}); status('attempt marked final');load();}catch(e){statusWithReason('mark-final failed', e.message)}};
+$('agentEndpoint').value=AGENT;
+$('providerEndpoint').value=PROVIDER;
+$('buildRows').innerHTML=[row('product',APP_META.product),row('version',APP_META.version),row('channel',APP_META.channel),row('build',APP_META.build),row('runtime mode','desktop-tool'),row('custody boundary','non-custodial / user-signing')].join('');
 load(); setInterval(load,2500);
 </script>
 </body>

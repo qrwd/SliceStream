@@ -54,7 +54,7 @@ cd apps/dashboard/src-tauri
 cargo tauri dev
 ```
 
-> Note: `apps/dashboard` serves the same terminal UI as a lightweight static host (`/` + `/api/meta`) for web preview; Tauri and browser both read direct node APIs.
+> Note: official delivery entry is the desktop app (`apps/dashboard/src-tauri`). The `apps/dashboard` binary is **dev-only helper** and now requires `SLICESTREAM_ENABLE_WEB_HELPER=1`.
 
 
 Desktop runtime dependencies:
@@ -103,15 +103,33 @@ Release closing P0 reconciliation (audit vs code vs historical requirements) is 
 
 ## P1 transition (now in progress)
 
-- Runtime mode is now **direct-first only** in service defaults; `SLICESTREAM_RUNTIME_MODE=bridge` is treated as a legacy compatibility input and surfaced as a dependency warning instead of enabling a relay path.
-- P1 focus: lifecycle convergence, recovery/reaper idempotency hardening, and operator-facing diagnostics quality (including explicit `legacy_bridge_requested` runtime signal).
+- Runtime mode is now **direct-only** in service defaults; legacy relay env inputs are ignored.
+- P1 focus: lifecycle convergence, recovery/reaper idempotency hardening, and operator-facing diagnostics quality.
 
 ## Demo + acceptance docs
 
 - 90–120s operator script: `docs/demo-script.md`
 - Technical deep dive: `docs/technical-breakdown.md`
 - Executable acceptance commands: `docs/acceptance.md`
+- Desktop build/package checklist: `docs/desktop-build-and-package-checklist.md`
+- Desktop runtime directory strategy: `docs/desktop-runtime-directories.md`
+- Market persistence now fails closed if runtime dir resolution fails; temporary compatibility fallback requires explicit opt-in: `SLICESTREAM_ALLOW_MARKET_PERSISTENCE_FALLBACK=1`.
+- Final submission package draft: `docs/final-submission-package.md`
 - Project scope and commitments: `docs/project-charter.md`
+
+## Protocol & risk documents
+
+- Agent intelligent automation protocol: `docs/protocols/agent-automation-protocol-v1.md`
+- Fiber pre-contract protocol: `docs/protocols/fiber-precontract-protocol-v1.md`
+- Risk disclosure draft: `docs/risk-disclosure.md`
+- Runtime agreement APIs:
+  - `GET /internal/protocol/agreements`
+  - `POST /internal/protocol/agreements/agent_automation_protocol_v1/accept`
+  - `POST /internal/protocol/agreements/agent_automation_protocol_v1/revoke`
+  - `POST /internal/fiber/preflight`
+  - fail-closed policy: unknown protocol/network/preflight state blocks risky actions by default
+  - protocol version mismatch triggers `protocol_version_mismatch` and requires re-accept
+
 
 ## Submission Checklist
 
@@ -133,11 +151,22 @@ cd apps/dashboard/src-tauri
 # optional icon generation from SS svg
 cargo tauri icon icons/icon.svg
 
-# create NSIS installer with desktop + start-menu shortcuts
-cargo tauri build --bundles nsis
+# create staging/internal-preview desktop bundles (Linux host)
+../../scripts/package-desktop.sh staging release linux
+
+# Windows host: NSIS installer
+../../scripts/package-desktop.sh release-candidate release windows
+
+# optional manual command (current OS target only)
+cargo tauri build --bundles appimage,deb
 ```
 
 Desktop branding assets live under `apps/dashboard/src-tauri/icons/` and use the `SS` mark (`icon.svg`) as source.
+Current desktop bundle name/version is explicitly **staging/internal preview** (`SliceStream-InternalPreview`, `0.1.0-beta.2`) and is not a final release.
+Packaging metadata knobs:
+- `SLICESTREAM_PUBLISHER`
+- `SLICESTREAM_RELEASE_NOTES`
+- `SLICESTREAM_CHANGELOG_FILE` (default: `docs/changelog-internal-preview.md`)
 
 
 > Repo note: to keep PR diff text-friendly, we do **not** commit generated binary icon artifacts (`.png/.ico`).
@@ -148,6 +177,7 @@ Desktop branding assets live under `apps/dashboard/src-tauri/icons/` and use the
 ## Desktop client status (current)
 
 - **Primary UX now**: market terminal layout (top status strip, provider/order/match panels, deal ticket, controls, audit/warnings).
+- **Desktop settings panel** now includes local endpoint configuration (`slicestream_agent_base_url` / `slicestream_provider_base_url`) and build-channel visibility.
 - **Supported runtime controls**: market mode (`manual/auto/hybrid`) and pricing mode (`fixed/band/recommended_band`) via dashboard action APIs.
-- **Bridge removed from runtime path**: Tauri/browser UI read direct local node APIs (`agentd` + `providerd`) by default, with no dashboard relay/proxy dependency.
+- **No relay path in runtime**: desktop UI reads direct local node APIs (`agentd` + `providerd`) with no dashboard relay/proxy dependency.
 - **Future polish**: richer installer assets/signing, persistence/indexing, and deeper native integrations remain future optimization.

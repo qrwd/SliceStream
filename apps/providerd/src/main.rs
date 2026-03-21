@@ -86,6 +86,8 @@ struct ProviderJobStatus {
     paid_window_indexes: Option<Vec<u64>>,
     total_confirmed_paid: Option<f64>,
     reconciliation_last_error: Option<String>,
+    market_persistence_mode: Option<String>,
+    market_persistence_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -231,6 +233,28 @@ struct TelemetryFeed {
     fallback_logged: bool,
 }
 
+const PROVIDER_AUTOMATION_PROTOCOL_ID: &str = "provider_automation_protocol_v1";
+const PROVIDER_AUTOMATION_PROTOCOL_VERSION: &str = "1.0.0";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderProtocolAgreementState {
+    protocol_id: String,
+    version: String,
+    accepted: bool,
+    accepted_at: Option<String>,
+    wallet_address: Option<String>,
+    signature_ref: Option<String>,
+    scopes: Vec<String>,
+    revoke_supported: bool,
+    risk_notice: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderProtocolAcceptRequest {
+    wallet_address: Option<String>,
+    signature_ref: Option<String>,
+}
+
 #[derive(Clone)]
 struct AppState {
     jobs: Arc<Mutex<HashMap<String, JobRuntime>>>,
@@ -251,6 +275,7 @@ struct AppState {
     auto_pause_until_tick: Arc<Mutex<u64>>,
     auto_pause_reason: Arc<Mutex<Option<String>>>,
     confirm_ledger: Arc<Mutex<HashMap<String, String>>>,
+    protocol_agreements: Arc<Mutex<HashMap<String, ProviderProtocolAgreementState>>>,
     persistence: Arc<MarketPersistence>,
 }
 
@@ -401,6 +426,7 @@ impl AppState {
             auto_pause_until_tick: Arc::new(Mutex::new(0)),
             auto_pause_reason: Arc::new(Mutex::new(None)),
             confirm_ledger: Arc::new(Mutex::new(HashMap::new())),
+            protocol_agreements: Arc::new(Mutex::new(default_provider_protocol_agreements())),
             persistence: Arc::new(MarketPersistence::new("providerd")),
         };
 
@@ -572,7 +598,20 @@ fn app_with_state(state: AppState) -> Router {
         .route("/internal/market/audit", get(get_market_audit))
         .route("/internal/market/events", get(get_market_events))
         .route("/internal/runtime/mode", get(get_runtime_mode))
+        .route("/internal/runtime/dirs", get(get_runtime_dirs))
         .route("/internal/node/identity", get(get_provider_node_identity))
+        .route(
+            "/internal/protocol/agreements",
+            get(get_provider_protocol_agreements),
+        )
+        .route(
+            "/internal/protocol/agreements/:protocol_id/accept",
+            post(accept_provider_protocol_agreement),
+        )
+        .route(
+            "/internal/protocol/agreements/:protocol_id/revoke",
+            post(revoke_provider_protocol_agreement),
+        )
         .route(
             "/internal/market/orders/sell/suggested",
             get(get_suggested_sell_orders),
@@ -592,8 +631,215 @@ fn app_with_state(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn get_runtime_mode() -> impl IntoResponse {
+fn default_provider_protocol_agreements() -> HashMap<String, ProviderProtocolAgreementState> {
+    let mut map = HashMap::new();
+    map.insert(
+        PROVIDER_AUTOMATION_PROTOCOL_ID.to_string(),
+        ProviderProtocolAgreementState {
+            protocol_id: PROVIDER_AUTOMATION_PROTOCOL_ID.to_string(),
+            version: PROVIDER_AUTOMATION_PROTOCOL_VERSION.to_string(),
+            accepted: cfg!(test),
+            accepted_at: if cfg!(test) { Some(now_rfc3339_like()) } else { None },
+            wallet_address: if cfg!(test) { Some("ckt1provider-default".to_string()) } else { None },
+            signature_ref: None,
+            scopes: if cfg!(test) { vec!["smart_mode_auto".to_string(),"smart_suggested_confirm".to_string(),"smart_pricing_write".to_string(),"smart_pricing_confirm".to_string(),"funds_reconcile".to_string(),"funds_settlement_write".to_string()] } else { vec![] },
+            revoke_supported: true,
+            risk_notice: "Provider automation is experimental; user remains responsible for settlement-impacting decisions and signatures.".to_string(),
+        },
+    );
+    map
+}
+
+fn ensure_provider_protocol_scope(
+    state: &AppState,
+    protocol_id: &str,
+    required_scope: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let agreements = state
+        .protocol_agreements
+        .lock()
+        .expect("provider protocol agreements lock");
+    let Some(agreement) = agreements.get(protocol_id) else {
+        return Err((
+            StatusCode::PRECONDITION_FAILED,
+            Json(
+                serde_json::json!({"error":"protocol_not_found","protocol_id":protocol_id,"required_scope":required_scope}),
+            ),
+        ));
+    };
+    if !agreement.accepted {
+        return Err((
+            StatusCode::PRECONDITION_REQUIRED,
+            Json(serde_json::json!({
+                "error":"protocol_not_accepted",
+                "protocol_id": protocol_id,
+                "version": agreement.version,
+                "required_scope": required_scope,
+                "risk_notice": agreement.risk_notice
+            })),
+        ));
+    }
+    if agreement.version != PROVIDER_AUTOMATION_PROTOCOL_VERSION {
+        return Err((
+            StatusCode::PRECONDITION_REQUIRED,
+            Json(serde_json::json!({
+                "error":"protocol_version_mismatch",
+                "protocol_id": protocol_id,
+                "accepted_version": agreement.version,
+                "required_version": PROVIDER_AUTOMATION_PROTOCOL_VERSION
+            })),
+        ));
+    }
+    if !agreement.scopes.iter().any(|s| s == required_scope) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error":"protocol_scope_missing",
+                "protocol_id": protocol_id,
+                "required_scope": required_scope,
+                "granted_scopes": agreement.scopes
+            })),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_provider_risky_network_ready() -> Result<(), (StatusCode, Json<Value>)> {
+    let cfg = common::runtime_config::load_runtime_config();
+    match cfg.network {
+        common::runtime_config::Network::Testnet => Ok(()),
+        common::runtime_config::Network::Mainnet if cfg.mainnet_ready => Ok(()),
+        common::runtime_config::Network::Mainnet => Err((
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({"error":"mainnet_not_ready"})),
+        )),
+    }
+}
+
+fn ensure_provider_automation_gate(
+    state: &AppState,
+    scope: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    ensure_provider_protocol_scope(state, PROVIDER_AUTOMATION_PROTOCOL_ID, scope)?;
+    ensure_provider_risky_network_ready()?;
+    Ok(())
+}
+
+fn provider_protocol_gate_status(state: &AppState) -> Value {
+    let agreements = state
+        .protocol_agreements
+        .lock()
+        .expect("provider protocol agreements lock");
+    if let Some(a) = agreements.get(PROVIDER_AUTOMATION_PROTOCOL_ID) {
+        serde_json::json!({
+            "protocol_id": a.protocol_id,
+            "version": a.version,
+            "accepted": a.accepted,
+            "scopes": a.scopes,
+            "revoke_supported": a.revoke_supported
+        })
+    } else {
+        serde_json::json!({"protocol_id": PROVIDER_AUTOMATION_PROTOCOL_ID, "accepted": false})
+    }
+}
+
+async fn get_provider_protocol_agreements(State(state): State<AppState>) -> impl IntoResponse {
+    let agreements: Vec<ProviderProtocolAgreementState> = state
+        .protocol_agreements
+        .lock()
+        .expect("provider protocol agreements lock")
+        .values()
+        .cloned()
+        .collect();
+    (StatusCode::OK, Json(agreements)).into_response()
+}
+
+async fn accept_provider_protocol_agreement(
+    State(state): State<AppState>,
+    Path(protocol_id): Path<String>,
+    Json(req): Json<ProviderProtocolAcceptRequest>,
+) -> impl IntoResponse {
+    if req
+        .wallet_address
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":"wallet_address_required"})),
+        )
+            .into_response();
+    }
+    let mut agreements = state
+        .protocol_agreements
+        .lock()
+        .expect("provider protocol agreements lock");
+    let Some(agreement) = agreements.get_mut(&protocol_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"protocol_not_found","protocol_id":protocol_id})),
+        )
+            .into_response();
+    };
+    agreement.accepted = true;
+    agreement.accepted_at = Some(now_rfc3339_like());
+    agreement.wallet_address = req.wallet_address;
+    agreement.signature_ref = req.signature_ref;
+    agreement.scopes = vec![
+        "smart_mode_auto".to_string(),
+        "smart_suggested_confirm".to_string(),
+        "smart_pricing_write".to_string(),
+        "smart_pricing_confirm".to_string(),
+        "funds_reconcile".to_string(),
+        "funds_settlement_write".to_string(),
+    ];
+    state
+        .market_audit
+        .lock()
+        .expect("market audit lock")
+        .push(format!(
+            "provider_protocol_accepted id={} version={}",
+            agreement.protocol_id, agreement.version
+        ));
+    (StatusCode::OK, Json(agreement.clone())).into_response()
+}
+
+async fn revoke_provider_protocol_agreement(
+    State(state): State<AppState>,
+    Path(protocol_id): Path<String>,
+) -> impl IntoResponse {
+    let mut agreements = state
+        .protocol_agreements
+        .lock()
+        .expect("provider protocol agreements lock");
+    let Some(agreement) = agreements.get_mut(&protocol_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"protocol_not_found","protocol_id":protocol_id})),
+        )
+            .into_response();
+    };
+    agreement.accepted = false;
+    agreement.accepted_at = None;
+    agreement.wallet_address = None;
+    agreement.signature_ref = None;
+    agreement.scopes.clear();
+    state
+        .market_audit
+        .lock()
+        .expect("market audit lock")
+        .push(format!(
+            "provider_protocol_revoked id={} version={}",
+            agreement.protocol_id, agreement.version
+        ));
+    (StatusCode::OK, Json(agreement.clone())).into_response()
+}
+
+async fn get_runtime_mode(State(state): State<AppState>) -> impl IntoResponse {
     let mode = current_runtime_mode();
+    let runtime_cfg = common::runtime_config::load_runtime_config();
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -604,6 +850,12 @@ async fn get_runtime_mode() -> impl IntoResponse {
             "runtime_data_source_path": select_runtime_data_source(),
             "bridge_dependent_modules": bridge_dependent_modules(),
             "legacy_bridge_requested": legacy_bridge_requested(),
+            "protocol_gate": provider_protocol_gate_status(&state),
+            "network": runtime_cfg.network.as_str(),
+            "prefix": runtime_cfg.address_prefix,
+            "mainnet_ready": runtime_cfg.mainnet_ready,
+            "market_persistence_mode": state.persistence.mode_code(),
+            "market_persistence_reason": state.persistence.mode_detail(),
             "billing_window_statuses": [
                 common::market::BILLING_WINDOW_STATUS_PENDING,
                 common::market::BILLING_WINDOW_STATUS_INVOICED,
@@ -616,6 +868,28 @@ async fn get_runtime_mode() -> impl IntoResponse {
             ]
         })),
     )
+}
+
+async fn get_runtime_dirs() -> impl IntoResponse {
+    match common::runtime_dirs::resolve_runtime_dirs("SliceStream") {
+        Ok(d) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "config_dir": d.config_dir.display().to_string(),
+                "data_dir": d.data_dir.display().to_string(),
+                "log_dir": d.log_dir.display().to_string(),
+                "cache_dir": d.cache_dir.display().to_string(),
+                "protocol_state_dir": d.protocol_state_dir.display().to_string(),
+                "runtime_state_dir": d.runtime_state_dir.display().to_string(),
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":"runtime_dirs_resolve_failed","detail":e})),
+        )
+            .into_response(),
+    }
 }
 
 async fn get_provider_node_identity(State(state): State<AppState>) -> impl IntoResponse {
@@ -638,6 +912,8 @@ async fn get_provider_node_identity(State(state): State<AppState>) -> impl IntoR
             "runtime_mode": current_runtime_mode(),
             "runtime_data_source_path": select_runtime_data_source(),
             "legacy_bridge_requested": legacy_bridge_requested(),
+            "network": common::runtime_config::load_runtime_config().network.as_str(),
+            "prefix": common::runtime_config::load_runtime_config().address_prefix,
         })),
     )
 }
@@ -935,6 +1211,9 @@ async fn confirm_payment(
     headers: HeaderMap,
     Json(req): Json<ConfirmRequest>,
 ) -> impl IntoResponse {
+    if let Err(e) = ensure_provider_automation_gate(&state, "funds_settlement_write") {
+        return e.into_response();
+    }
     let expected_key = make_key(&req.job_id, req.window_end);
     let provided_key = headers
         .get("x-idempotency-key")
@@ -991,6 +1270,10 @@ async fn reconcile_payment(
     State(state): State<AppState>,
     Json(req): Json<ReconcilePaymentRequest>,
 ) -> impl IntoResponse {
+    if let Err(e) = ensure_provider_automation_gate(&state, "funds_reconcile") {
+        return e.into_response();
+    }
+
     let mut jobs = state.jobs.lock().expect("jobs lock poisoned");
     let Some(runtime) = jobs.get_mut(&req.job_id) else {
         return (
@@ -1140,6 +1423,8 @@ async fn get_provider_job_status(
         paid_window_indexes: Some(runtime.paid_window_indexes.clone()),
         total_confirmed_paid: Some(runtime.total_confirmed_paid),
         reconciliation_last_error: runtime.reconciliation_last_error.clone(),
+        market_persistence_mode: Some(state.persistence.mode_code().to_string()),
+        market_persistence_reason: state.persistence.mode_detail(),
     };
 
     (StatusCode::OK, Json(body)).into_response()
@@ -1183,8 +1468,39 @@ async fn get_provider_job_result(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+fn now_rfc3339_like() -> String {
+    format!(
+        "ts-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    )
+}
+
+fn init_runtime_dirs(service: &str) {
+    match common::runtime_dirs::resolve_runtime_dirs("SliceStream") {
+        Ok(dirs) => {
+            for dir in [
+                dirs.config_dir,
+                dirs.data_dir,
+                dirs.log_dir,
+                dirs.cache_dir,
+                dirs.protocol_state_dir,
+                dirs.runtime_state_dir.join(service),
+            ] {
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    eprintln!("runtime dir ensure failed path={} err={}", dir.display(), e);
+                }
+            }
+        }
+        Err(e) => eprintln!("runtime dir resolution failed: {}", e),
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    init_runtime_dirs("providerd");
     let runtime_cfg = load_runtime_config();
     println!(
         "providerd runtime network={} prefix={} mainnet_ready={} settlement_mode={}",
@@ -1368,6 +1684,11 @@ async fn set_market_mode(
         _ => MARKET_MODE_MANUAL,
     }
     .to_string();
+    if mode == MARKET_MODE_AUTO || mode == MARKET_MODE_HYBRID {
+        if let Err(e) = ensure_provider_automation_gate(&state, "smart_mode_auto") {
+            return e.into_response();
+        }
+    }
     let old_mode = state.market_mode.lock().expect("market mode lock").clone();
     *state.market_mode.lock().expect("market mode lock") = mode.clone();
     converge_mode_state(&state, &old_mode, &mode);
@@ -1435,6 +1756,10 @@ async fn confirm_suggested_sell_order(
     State(state): State<AppState>,
     Path(order_id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(e) = ensure_provider_automation_gate(&state, "smart_suggested_confirm") {
+        return e.into_response();
+    }
+
     let mut suggested = state
         .suggested_sell_orders
         .lock()
@@ -1495,6 +1820,9 @@ async fn set_market_pricing(
     State(state): State<AppState>,
     Json(req): Json<MarketPricingPayload>,
 ) -> impl IntoResponse {
+    if let Err(e) = ensure_provider_automation_gate(&state, "smart_pricing_write") {
+        return e.into_response();
+    }
     let mode = match req.price_mode.as_str() {
         PRICE_MODE_FIXED => PRICE_MODE_FIXED,
         PRICE_MODE_BAND => PRICE_MODE_BAND,
@@ -1556,10 +1884,14 @@ async fn set_market_pricing(
         .expect("market audit lock")
         .push(format!("manual_override provider_price_mode={mode}"));
 
-    get_market_pricing(State(state)).await
+    get_market_pricing(State(state)).await.into_response()
 }
 
 async fn confirm_recommended_band(State(state): State<AppState>) -> impl IntoResponse {
+    if let Err(e) = ensure_provider_automation_gate(&state, "smart_pricing_confirm") {
+        return e.into_response();
+    }
+
     let current_hash = current_recommended_context_hash(&state);
     *state
         .recommended_confirmed
@@ -1710,6 +2042,10 @@ async fn mark_sell_order_settled(
     State(state): State<AppState>,
     Path(order_id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(e) = ensure_provider_automation_gate(&state, "funds_settlement_write") {
+        return e.into_response();
+    }
+
     let mut orders = state.sell_orders.lock().expect("sell orders lock");
     let Some(order) = orders.iter_mut().find(|o| o.order_id == order_id) else {
         return (
@@ -1759,6 +2095,10 @@ async fn release_sell_order(
     State(state): State<AppState>,
     Path(order_id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(e) = ensure_provider_automation_gate(&state, "funds_settlement_write") {
+        return e.into_response();
+    }
+
     let mut orders = state.sell_orders.lock().expect("sell orders lock");
     let Some(order) = orders.iter_mut().find(|o| o.order_id == order_id) else {
         return (
@@ -1881,6 +2221,93 @@ mod tests {
                 .and_then(|v| v.as_bool()),
             Some(false)
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_dirs_endpoint_returns_paths() {
+        let app = app();
+        let req = Request::builder()
+            .uri("/internal/runtime/dirs")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn provider_smart_ops_require_protocol_after_revocation() {
+        let app = app();
+
+        let revoke = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/protocol/agreements/provider_automation_protocol_v1/revoke")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoke.status(), StatusCode::OK);
+
+        let blocked = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/provider/reconcile")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "job_id":"job-demo",
+                            "invoice_id":"inv-demo",
+                            "payment_id":"pay-demo",
+                            "amount_paid":1.0,
+                            "window_indexes":[0]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn provider_protocol_version_mismatch_blocks_smart_ops() {
+        let state = AppState::default();
+        {
+            let mut agreements = state.protocol_agreements.lock().unwrap();
+            let agreement = agreements
+                .get_mut(PROVIDER_AUTOMATION_PROTOCOL_ID)
+                .expect("agreement exists");
+            agreement.version = "0.9.0".to_string();
+        }
+        let app = app_with_state(state.clone());
+        let blocked = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/provider/reconcile")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "job_id":"job-demo",
+                            "invoice_id":"inv-demo",
+                            "payment_id":"pay-demo",
+                            "amount_paid":1.0,
+                            "window_indexes":[0]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::PRECONDITION_REQUIRED);
     }
 
     #[tokio::test]

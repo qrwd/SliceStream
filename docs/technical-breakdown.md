@@ -91,7 +91,7 @@ Known limitation:
 ## 9) Desktop client conversion (Tauri)
 
 - Official UI entry is now a Tauri desktop shell named **SliceStream** (`apps/dashboard/src-tauri`).
-- Existing dashboard Rust service is reused as an internal data bridge (`cargo run -p dashboard`) so current API aggregation logic is preserved.
+- Existing dashboard Rust service is retained as a lightweight UI host (`cargo run -p dashboard`) while runtime data path is direct-first.
 - Desktop shell enforces app-like window defaults (1440x960, min size guard) and package metadata/shortcuts through NSIS config.
 - `icons/icon.svg` is the SS brand source; build can generate bundle icons via `cargo tauri icon`.
 
@@ -136,7 +136,7 @@ This keeps the core metering/evidence/fiber semantics unchanged while enforcing
 This pass is scope-limited to release alignment and does **not** change core protocol behavior:
 - documentation now matches current runtime facts for market/matching states and terminal UX,
 - `docs/api-contract.yaml` includes internal market/pricing/action extension docs,
-- Tauri desktop entry now consistently hosts the same terminal experience through the dashboard bridge path.
+- Tauri desktop entry now hosts the same terminal experience with direct-first runtime data path and protocol-gated actions.
 
 Unchanged by design:
 - metering constants/formula semantics,
@@ -155,12 +155,28 @@ This pass closes P0 gaps without changing protocol semantics:
 
 See `docs/audit-reconciliation.md` for full issue calibration (`still_open` / `fixed_after_audit` / `doc_drift_only`).
 
+## 14) Gate hardening status (third pass)
+
+- Implemented:
+  - agent/provider high-risk smart actions now apply fail-closed protocol+network gates;
+  - protocol version mismatch now invalidates previous acceptance (`protocol_version_mismatch`);
+  - dashboard risky buttons are disabled and guarded again at click-time by unified gate reason checks;
+  - fiber preflight action taxonomy now uses explicit known action kinds (unknown action => fail-closed reject).
+- Partially implemented:
+  - Fiber preflight + core worker settlement + replay settlement stages now share the same fail-closed action guard, but non-settlement future Fiber entrypoints are not yet fully taxonomy-bound.
+  - dashboard web helper remains only as dev-local helper path (desktop entry is official delivery path).
+  - future action coverage is still an active lane, but high-risk chain actions are now explicitly blocked in `simulate` mode by guard policy.
+- Not yet implemented:
+  - full protocol version migration workflow (catalog upgrade + persistent invalidation history);
+  - exhaustive Fiber action taxonomy covering every future contract/channel/swap API variant.
+  - complete removal of compatibility fallback migration path for market persistence (current fallback exists only with explicit env opt-in).
+
 
 ## 13) P2 structure/maintainability pass (behavior-preserving)
 
 This pass keeps routes/status codes/JSON payloads unchanged while reducing monolithic file pressure:
 - `apps/providerd/src/market_support.rs` now hosts provider market support helpers and sell-order lifecycle action handlers (cancel/expire/retry).
 - `apps/agentd/src/market_support.rs` now hosts agent market support helpers and match lifecycle/bidding handlers (cancel/expire/retry/start).
-- `apps/dashboard/src/http_helpers.rs` now hosts shared HTTP/warning helper logic used by the bridge aggregation path.
+- `apps/dashboard/src/http_helpers.rs` now hosts shared HTTP/warning helper logic used by the desktop direct aggregation path.
 
 The runtime ownership and API contract behavior are unchanged; this is a structural extraction only.

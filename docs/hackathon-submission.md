@@ -1,7 +1,9 @@
-# SliceStream Hackathon Submission Guide (CKB AI Agent Hackathon)
+# SliceStream Hackathon Submission (Final Form Text)
+
+> Final handoff draft: see `docs/final-submission-package.md` for form-ready copy blocks and missing manual fields checklist.
 
 ## Project one-liner
-SliceStream is an **Agent-driven compute market and settlement orchestrator** that runs on a CKB/Fiber-oriented payment path, with recovery/reaper/dispute controls and operator-grade UI (dashboard + tauri).
+SliceStream is a desktop-first, non-custodial compute-market settlement console for CKB/Fiber workflows, with fail-closed safety gates, recovery/reaper operations, and dispute handling.
 
 ## Why this fits the track
 - Agent-first automation: matching, settlement stage progression, recovery ticks, reaper lifecycle cleanup.
@@ -41,7 +43,7 @@ Default runtime uses testnet-friendly network config (`ckt` address prefix).
 
 ## Stage 5 CKB/Fiber-native emphasis updates
 
-- Runtime surfaces direct data-source path (`runtime_data_source_path`) and compatibility dependency hints (`bridge_dependent_modules`) for transparent decentralization progress.
+- Runtime surfaces direct data-source path (`runtime_data_source_path`) and compatibility dependency hints for transparent decentralization progress.
 - Settlement path is explicit in API payloads through `payment_rail_mode` to separate real Fiber, simulated Fiber, and placeholder modes.
 - Canonical object signing (telemetry/billing/dispute snapshots) strengthens evidence trust assumptions for CKB + Fiber demo narratives.
 - Current default path remains CKB testnet-friendly; Fiber remains the primary micropayment rail (Perun remains an extension path).
@@ -52,3 +54,8 @@ Default runtime uses testnet-friendly network config (`ckt` address prefix).
 - Frontend is upgraded from thin debug panel to a dense enterprise terminal with 10 workspaces and seeded scenario switching for live storytelling.
 - Trade terminal, billing center, dispute center, evidence timeline, and node/profile panels are now all first-class demo surfaces.
 - Tauri UI remains parity-aligned with dashboard core workspace architecture for consistent desktop judging flow.
+
+## Current boundary (honest scope statement)
+
+- Completed: desktop-first fail-closed operator workflow, protocol gating, Fiber preflight/guard enforcement, recovery/retry/finalize handling, runtime directory strategy in services.
+- In progress: signed/notarized public installer pipeline and final production release channel (including macOS packaging/signing track).

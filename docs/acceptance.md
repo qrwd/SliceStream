@@ -288,6 +288,88 @@ Expected:
 - replayed reconciliation pair does not double-count paid amount,
 - recommended-band must be confirmed again after context changes.
 
+## Protocol gate checks (agent intelligent automation)
+
+```bash
+# list agreements
+curl -s http://127.0.0.1:4002/internal/protocol/agreements | jq
+
+# verify gate blocks smart operation before acceptance
+curl -s -X POST http://127.0.0.1:4002/internal/ops/recovery/run | jq
+
+# accept protocol with wallet context
+curl -s -X POST http://127.0.0.1:4002/internal/protocol/agreements/agent_automation_protocol_v1/accept   -H 'content-type: application/json'   -d '{"wallet_address":"ckt1demo...","signature_ref":"sig-demo-ref"}' | jq
+
+# now gated operations are allowed
+curl -s -X POST http://127.0.0.1:4002/internal/ops/recovery/run | jq
+
+# revoke and verify gate closes again
+curl -s -X POST http://127.0.0.1:4002/internal/protocol/agreements/agent_automation_protocol_v1/revoke | jq
+```
+
+Expected:
+- unaccepted protocol returns precondition error for smart ops;
+- accept call grants scoped capabilities;
+- revoke call removes capability and blocks gated smart ops again.
+
+
+## Provider protocol gate checks
+
+```bash
+# provider agreements
+curl -s http://127.0.0.1:4001/internal/protocol/agreements | jq
+
+# accept provider automation protocol
+curl -s -X POST http://127.0.0.1:4001/internal/protocol/agreements/provider_automation_protocol_v1/accept \
+  -H 'content-type: application/json' \
+  -d '{"wallet_address":"ckt1provider...","signature_ref":"sig-provider"}' | jq
+```
+
+## Fiber preflight checks
+
+```bash
+# accept fiber pre-contract protocol (agent)
+curl -s -X POST http://127.0.0.1:4002/internal/protocol/agreements/fiber_precontract_protocol_v1/accept \
+  -H 'content-type: application/json' \
+  -d '{"wallet_address":"ckt1fiber...","signature_ref":"sig-fiber"}' | jq
+
+# run preflight in simulate mode
+curl -s -X POST http://127.0.0.1:4002/internal/fiber/preflight \
+  -H 'content-type: application/json' \
+  -d '{"action":"trade_request","execution_mode":"simulate","requested_network":"testnet"}' | jq
+```
+
+Expected (fail-closed):
+- missing/unknown gate status => block risky actions;
+- `execution_mode=real` without `signer_address` => `PRECONDITION_FAILED`;
+- protocol version mismatch => `PRECONDITION_REQUIRED` and requires re-accept.
+
+## Action-scope matrix (implemented)
+
+| Service | Action | Protocol ID | Required scope | Status |
+|---|---|---|---|---|
+| agentd | `/internal/ops/recovery/run` | `agent_automation_protocol_v1` | `smart_recovery_ops` | implemented |
+| agentd | `/internal/ops/reaper/run` | `agent_automation_protocol_v1` | `smart_reaper_ops` | implemented |
+| agentd | `/internal/market/mode` auto/hybrid | `agent_automation_protocol_v1` | `smart_mode_auto` | implemented |
+| agentd | `/internal/market/pricing` write | `agent_automation_protocol_v1` | `smart_mode_auto` | implemented |
+| agentd | `/internal/fiber/preflight` | `fiber_precontract_protocol_v1` | `fiber_preflight` (+ `fiber_real_execution` for real mode) | implemented |
+| providerd | `/internal/provider/reconcile` | `provider_automation_protocol_v1` | `funds_reconcile` | implemented |
+| providerd | `/confirm` | `provider_automation_protocol_v1` | `funds_settlement_write` | implemented |
+| providerd | `/internal/market/mode` auto/hybrid | `provider_automation_protocol_v1` | `smart_mode_auto` | implemented |
+| providerd | `/internal/market/pricing` write | `provider_automation_protocol_v1` | `smart_pricing_write` | implemented |
+
+## Action-network matrix (implemented fail-closed policy)
+
+| Network state | Risk action result |
+|---|---|
+| unknown | reject |
+| testnet | allow (scope/protocol satisfied) |
+| mainnet not ready | reject |
+| mainnet ready | allow (scope/protocol satisfied) |
+| network mismatch (preflight requested vs configured) | reject |
+| preflight fail | reject |
+| signer missing for real execution | reject |
+
 ## P1 mode/lifecycle hardening quick checks
 
 ```bash
@@ -307,9 +389,26 @@ curl -s -X POST http://127.0.0.1:4002/internal/market/matches/retry \
 curl -s -X POST http://127.0.0.1:4001/internal/market/orders/sell/sell-order-demo-1/cancel | jq
 curl -s -X POST http://127.0.0.1:4001/internal/market/orders/sell/sell-order-demo-1/retry | jq
 curl -s -X POST http://127.0.0.1:4001/internal/market/orders/sell/sell-order-demo-1/expire | jq
-# runtime mode diagnostics (legacy bridge request should be explicit)
-curl -s http://127.0.0.1:4001/internal/runtime/mode | jq '{runtime_mode, runtime_data_source_path, legacy_bridge_requested, runtime_mode_dependencies}'
+# runtime mode diagnostics (direct-only desktop path)
+curl -s http://127.0.0.1:4001/internal/runtime/mode | jq '{runtime_mode, runtime_data_source_path, runtime_mode_dependencies}'
 ```
+
+## Desktop staging package checks (pre-release only)
+
+```bash
+# build staging desktop bundles (linux appimage/deb where toolchain available)
+./scripts/package-desktop.sh staging release linux
+
+# windows host path (nsis)
+./scripts/package-desktop.sh release-candidate release windows
+```
+
+Expected:
+- app title/branding includes staging/internal-preview wording;
+- UI still shows gate/network state and fail-closed blocking behavior;
+- this package is for internal testing, not final/public release.
+- dashboard web helper is dev-only and requires `SLICESTREAM_ENABLE_WEB_HELPER=1`.
+- script preflight prints clear reasons for missing tauri CLI / dependency / metadata fields.
 
 Example summary (expected):
 - mode switch leaves no dirty lock residue (`locked_buy_orders`/`locked_sell_orders` cleared, bound match released with lifecycle audit).
@@ -461,13 +560,13 @@ cargo test -p common billing_window_signature_roundtrip
 cargo test -p common dispute_snapshot_signature_roundtrip
 cargo test -p agentd direct_mode_uses_local_data_source_when_available
 cargo test -p agentd direct_mode_stays_direct_when_endpoint_not_explicitly_set
-cargo test -p agentd legacy_bridge_env_and_direct_env_return_consistent_identity_semantics
+cargo test -p agentd legacy_bridge_env_is_ignored_and_identity_semantics_stay_direct
 cargo test -p agentd fiber_or_placeholder_mode_is_explicit_in_billing_and_trade_views
 ```
 
 Expected outcomes:
 - direct mode chooses local-node data source when direct dependencies are ready;
-- legacy bridge env input is explicitly marked while runtime stays on direct data source;
+- legacy relay env input is ignored while runtime stays on direct data source;
 - canonical signatures verify for telemetry/billing/dispute snapshots and tamper detection works.
 
 

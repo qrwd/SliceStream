@@ -18,13 +18,35 @@ struct ProviderOption {
     label: String,
 }
 
+fn web_helper_enabled() -> Result<(), &'static str> {
+    if !cfg!(debug_assertions) {
+        return Err("dashboard web helper is disabled in release builds");
+    }
+    if std::env::var("SLICESTREAM_ENABLE_WEB_HELPER")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return Err(
+            "dashboard web helper is dev-only. set SLICESTREAM_ENABLE_WEB_HELPER=1 to run local helper.",
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
+    if let Err(msg) = web_helper_enabled() {
+        eprintln!("{msg}");
+        return;
+    }
     let app = Router::new()
         .route("/", get(index))
         .route("/api/meta", get(meta));
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:4003").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:4003")
+        .await
+        .unwrap();
     println!("dashboard listening on http://127.0.0.1:4003");
     axum::serve(listener, app).await.unwrap();
 }
@@ -134,7 +156,7 @@ mod tests {
     fn node_network_view_renders_runtime_mode_and_dependencies() {
         let html = UI_SOURCE;
         assert!(html.contains("Node / Network"));
-        assert!(html.contains("bridge dependent modules"));
+        assert!(html.contains("desktop data source"));
         assert!(html.contains("runtime mode"));
     }
 
@@ -192,8 +214,8 @@ mod tests {
     #[test]
     fn direct_node_endpoints_are_referenced_by_terminal_ui() {
         let html = UI_SOURCE;
-        assert!(html.contains("http://127.0.0.1:4002"));
-        assert!(html.contains("http://127.0.0.1:4001"));
+        assert!(html.contains("slicestream_agent_base_url"));
+        assert!(html.contains("slicestream_provider_base_url"));
     }
 
     #[test]
@@ -201,5 +223,21 @@ mod tests {
         let html = UI_SOURCE;
         assert!(html.contains("Dispute Resolution Wizard"));
         assert!(html.contains("disputeApply"));
+    }
+
+    #[test]
+    fn web_helper_is_disabled_without_explicit_opt_in() {
+        std::env::remove_var("SLICESTREAM_ENABLE_WEB_HELPER");
+        assert!(web_helper_enabled().is_err());
+    }
+
+    #[test]
+    fn ui_reason_mapping_layer_is_present() {
+        let html = UI_SOURCE;
+        assert!(html.contains("REASON_MAP"));
+        assert!(html.contains("reason code"));
+        assert!(html.contains("extractReasonCode"));
+        assert!(html.contains("Action Readiness"));
+        assert!(html.contains("computeReadiness"));
     }
 }

@@ -1,19 +1,11 @@
 use crate::market::RUNTIME_DATA_SOURCE_DIRECT;
 
 pub fn current_runtime_mode() -> String {
-    if legacy_bridge_requested() {
-        return "direct".to_string();
-    }
-    match std::env::var("SLICESTREAM_RUNTIME_MODE") {
-        Ok(v) if v.eq_ignore_ascii_case("direct") => "direct".to_string(),
-        _ => "direct".to_string(),
-    }
+    "direct".to_string()
 }
 
 pub fn legacy_bridge_requested() -> bool {
-    std::env::var("SLICESTREAM_RUNTIME_MODE")
-        .map(|v| v.eq_ignore_ascii_case("bridge"))
-        .unwrap_or(false)
+    false
 }
 
 pub fn compute_direct_mode_ready() -> bool {
@@ -22,9 +14,6 @@ pub fn compute_direct_mode_ready() -> bool {
 
 pub fn runtime_mode_dependencies() -> Vec<String> {
     let mut deps = vec![];
-    if legacy_bridge_requested() {
-        deps.push("legacy_bridge_mode_requested".to_string());
-    }
     if !direct_endpoint_ready() {
         deps.push("direct_endpoint_missing".to_string());
     }
@@ -57,13 +46,13 @@ mod tests {
     }
 
     #[test]
-    fn runtime_mode_dependencies_marks_legacy_bridge_request() {
+    fn runtime_mode_dependencies_no_longer_marks_legacy_bridge_request() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         std::env::set_var("SLICESTREAM_RUNTIME_MODE", "bridge");
         std::env::remove_var("SLICESTREAM_DIRECT_ENDPOINT");
         let deps = runtime_mode_dependencies();
-        assert!(legacy_bridge_requested());
-        assert!(deps.iter().any(|d| d == "legacy_bridge_mode_requested"));
+        assert!(!legacy_bridge_requested());
+        assert!(!deps.iter().any(|d| d == "legacy_bridge_mode_requested"));
         assert!(!deps.iter().any(|d| d == "direct_endpoint_missing"));
         std::env::remove_var("SLICESTREAM_RUNTIME_MODE");
     }
