@@ -1,183 +1,194 @@
 # SliceStream
 
-SliceStream is a deterministic work-based billing pipeline that converts telemetry into auditable settlement receipts and merged payments.
+## 1) One-line intro
+SliceStream is a **desktop-first, non-custodial, protocol-gated** operator console for local CKB/Fiber settlement workflows.
 
-## Architecture (text diagram)
+## 2) Project overview
+SliceStream coordinates local services (`providerd` + `agentd`) and a desktop UI (`apps/dashboard/src-tauri`) to make settlement/dispute operations observable and fail-closed by default.
 
-```text
-cpp/telemetryd (250ms exported samples)
-        -> apps/providerd (window runtime + reconcile view)
-        -> crates/metering (formula + merge rules + hash-chain)
-        -> apps/agentd (settlement orchestration)
-        -> SettlementGateway (mock | fiber)
-        -> crates/fiber_rpc (minimal real RPC path)
+This repository is optimized for:
+- hackathon judging and technical review,
+- reproducible local runtime flows,
+- explicit risk boundaries (unknown/untrusted state => block risky action).
 
-cpp/qualify -> benchmark_score -> providerd runtime scaling
+## 3) Core highlights
+- **Desktop-first path**: official delivery UI is Tauri desktop (`apps/dashboard/src-tauri`).
+- **Non-custodial boundary**: tool does not custody assets; high-risk operations require explicit signer/readiness.
+- **Protocol-gated automation**: risky actions require protocol acceptance and network checks.
+- **Fail-closed behavior**: unknown/unregistered Fiber actions are rejected by default.
+- **Operational visibility**: readiness, gate status, reason code, and persistence mode are surfaced in APIs/UI.
 
-SliceStream Desktop Client (Tauri shell) reads direct status/result endpoints from local nodes (`agentd` + `providerd`).
-```
+## 4) System characteristics
+- Local/direct execution model (agent + provider local services).
+- Deterministic billing window + settlement records.
+- Recovery/retry/reaper/dispute operator flows.
+- Compatibility fallback paths are explicit and observable (not silent).
 
-## Default network profile (contest baseline)
+## 5) Current status
+### Completed (high-completion preview)
+- End-to-end local runtime path for provider + agent + desktop UI.
+- Fail-closed preflight guard for unknown action / network mismatch / signer requirement.
+- Runtime mode/readiness/reason-code surfaces in APIs and dashboard.
+- Shared runtime-dir strategy with explicit persistence mode reporting.
 
-SliceStream defaults to **CKB Testnet**:
-- `network=testnet`
-- address prefix `ckt`
+### Not completed / boundary
+- Public installer signing/notarization + release distribution pipeline is not fully complete.
+- Full future Fiber action matrix is not exhaustively implemented yet.
+- This repo is **advanced preview / prototype-quality hardening**, not a finished commercial release.
 
-Mainnet-ready config is retained as opt-in only.
+## 6) Environment requirements
+- Rust + Cargo (stable toolchain)
+- `cargo tauri` CLI (for desktop shell)
+- Python 3 (for some helper scripts)
 
-## Build
+Platform notes:
+- **Windows (recommended for packaging checks)**: WebView2 runtime + Visual Studio C++ build tools
+- **Linux**: GTK/WebKit dev libs may be required for Tauri build (`glib-2.0`, `webkit2gtk`)
 
-```bash
-cargo build --workspace
-cmake -S cpp -B cpp/build && cmake --build cpp/build
-```
+## 7) Quick Start (minimal runnable path)
+> local runtime endpoint examples are shown below; adjust endpoints for your machine.
 
-## Run
-
-### 1) Start Provider (reads qualify + telemetryd if available)
-
+### Step 1: start provider service
 ```bash
 cargo run -p providerd
 ```
 
-### 2) Start Agent (mock settlement by default)
-
+### Step 2: start agent service
 ```bash
 cargo run -p agentd
 ```
 
-### 3) Desktop Client (official UI entry)
-
+### Step 3: start desktop UI (official path)
 ```bash
-# launch desktop shell (Windows-first)
 cd apps/dashboard/src-tauri
 cargo tauri dev
 ```
 
-> Note: official delivery entry is the desktop app (`apps/dashboard/src-tauri`). The `apps/dashboard` binary is **dev-only helper** and now requires `SLICESTREAM_ENABLE_WEB_HELPER=1`.
+### Step 4: configure endpoints in desktop settings
+Use local runtime endpoint examples:
+- Agent endpoint: `http://127.0.0.1:4002`
+- Provider endpoint: `http://127.0.0.1:4001`
 
+### Step 5: verify gate/readiness before actions
+In UI, check:
+- **Gate State**
+- **Action Readiness**
+- **Reason Code**
 
-Desktop runtime dependencies:
-- **Windows (recommended)**: WebView2 runtime + Visual Studio C++ build tools (for local Tauri builds).
-- **Linux container/CI**: Tauri may fail to compile without GTK/WebKit development libs (e.g. `glib-2.0`, `webkit2gtk`). This is an environment limitation, not SliceStream protocol/business-logic failure.
+### Step 6: execute operations
+After readiness is clear, test safe actions (recovery/reaper/trade/dispute flow).
 
-## Settlement modes
+## 8) Desktop usage guide
+After opening desktop UI:
+1. Open **Settings** and configure local service endpoints.
+2. Confirm **Gate Summary**:
+   - `Gate State`: whether risky actions are blocked.
+   - `Action Readiness`: actionable status (`ready`, `needs-config`, `needs-service`, etc.).
+   - `Reason Code`: machine-readable block reason.
+3. Use terminal/workspace tabs to inspect trade/billing/dispute/evidence/runtime metadata.
 
-### Mock mode (default)
-- `settlement_mode=mock` (or no override)
-- merged payments are produced by `MockSettlementGateway`
-- best for repeatable demo/acceptance runs
+## 9) Endpoint configuration notes
+- Endpoint fields are local runtime service endpoints, not hosted web deployment URLs.
+- If either endpoint is missing/unreachable, UI enters fail-closed blocked mode.
+- Runtime path remains local/direct; helper web process is not required for official flow.
 
-### Fiber mode
-- `settlement_mode=fiber`
-- uses `FiberSettlementGateway` + `crates/fiber_rpc`
-- if endpoint is missing/unreachable, system returns structured safe errors (no panic)
+## 10) Common blocked reasons
+- `local_endpoint_not_configured`: endpoint missing in settings.
+- `local_service_unreachable`: service not running or endpoint incorrect.
+- `protocol_not_accepted`: protocol gate not accepted yet.
+- `network_mismatch` / `unknown_network`: requested action/network conflict.
+- `signer_address_required`: high-risk real execution missing signer.
+- `unknown_fiber_action`: action not registered => fail-closed reject.
 
-Example (Fiber mode):
+## 11) Fiber / high-risk action policy
+- Unregistered or unknown Fiber actions are rejected by default.
+- High-risk chain actions are restricted by mode/signer/readiness constraints.
+- `real` mode requires explicit signer input; unknown or unsafe contexts remain fail-closed.
 
+Fiber mode local endpoint example:
 ```bash
 export SLICESTREAM_SETTLEMENT_MODE=fiber
-export SLICESTREAM_FIBER_RPC_ENDPOINT=http://127.0.0.1:8227
+export SLICESTREAM_FIBER_RPC_ENDPOINT=http://<local-fiber-endpoint>:8227
 cargo run -p agentd
 ```
 
-## What is complete vs future
-
-### Completed now
-- Deterministic metering constants and merge rules (250ms / 15s / 60 samples, 30s/60s merge).
-- Telemetry pipeline with C++ telemetryd integration and Provider fallback path.
-- Provider qualification tri-test (`cpp/qualify`) and benchmark-score scaling in Provider runtime.
-- Mock/Fiber gateway branching with structured Fiber failure categories.
-- Receipt/evidence/audit and Provider-Agent reconciliation flow.
-- Market runtime includes match transitions (`proposed/accepted/rejected/settling/settled`), market modes (`manual/auto/hybrid`), and pricing modes (`fixed/band/recommended_band`).
-
-### Future extension
-- Fiber `record_result` remains minimal/placeholder-oriented and can be expanded to full on-chain writeback semantics.
-- Terminal-style desktop/dashboard UX is now implemented and is the primary operator interface.
-- Long-term persistence/indexing and further strategy sophistication remain future optimization.
-
-
-## P0 audit reconciliation status
-
-Release closing P0 reconciliation (audit vs code vs historical requirements) is tracked in `docs/audit-reconciliation.md`, including classification by `still_open`, `fixed_after_audit`, and `doc_drift_only`, plus concrete closure actions.
-
-## P1 transition (now in progress)
-
-- Runtime mode is now **direct-only** in service defaults; legacy relay env inputs are ignored.
-- P1 focus: lifecycle convergence, recovery/reaper idempotency hardening, and operator-facing diagnostics quality.
-
-## Demo + acceptance docs
-
-- 90–120s operator script: `docs/demo-script.md`
-- Technical deep dive: `docs/technical-breakdown.md`
-- Executable acceptance commands: `docs/acceptance.md`
-- Desktop build/package checklist: `docs/desktop-build-and-package-checklist.md`
-- Desktop runtime directory strategy: `docs/desktop-runtime-directories.md`
-- Market persistence now fails closed if runtime dir resolution fails; temporary compatibility fallback requires explicit opt-in: `SLICESTREAM_ALLOW_MARKET_PERSISTENCE_FALLBACK=1`.
-- Final submission package draft: `docs/final-submission-package.md`
-- Project scope and commitments: `docs/project-charter.md`
-
-## Protocol & risk documents
-
-- Agent intelligent automation protocol: `docs/protocols/agent-automation-protocol-v1.md`
-- Fiber pre-contract protocol: `docs/protocols/fiber-precontract-protocol-v1.md`
-- Risk disclosure draft: `docs/risk-disclosure.md`
-- Runtime agreement APIs:
-  - `GET /internal/protocol/agreements`
-  - `POST /internal/protocol/agreements/agent_automation_protocol_v1/accept`
-  - `POST /internal/protocol/agreements/agent_automation_protocol_v1/revoke`
-  - `POST /internal/fiber/preflight`
-  - fail-closed policy: unknown protocol/network/preflight state blocks risky actions by default
-  - protocol version mismatch triggers `protocol_version_mismatch` and requires re-accept
-
-
-## Submission Checklist
-
-Before final handoff, verify this package is complete:
-
-- **Repo**: clean branch with docs + code aligned to the final submission scope.
-- **Testable version**: all acceptance commands in `docs/acceptance.md` are runnable in order.
-- **Screenshots**: include key service/status screenshots used in slides or submission form.
-- **Video**: record the 90–120s flow from `docs/demo-script.md` (plus fallback scenario).
-- **Summary**: short problem/solution/value summary for judges.
-- **Technical breakdown**: attach/link `docs/technical-breakdown.md` in submission materials.
-
-
-
-## Desktop packaging (Windows)
-
+## 12) Troubleshooting
+### `cargo tauri` not found
+Install CLI:
 ```bash
-cd apps/dashboard/src-tauri
-# optional icon generation from SS svg
-cargo tauri icon icons/icon.svg
-
-# create staging/internal-preview desktop bundles (Linux host)
-../../scripts/package-desktop.sh staging release linux
-
-# Windows host: NSIS installer
-../../scripts/package-desktop.sh release-candidate release windows
-
-# optional manual command (current OS target only)
-cargo tauri build --bundles appimage,deb
+cargo install tauri-cli --version '^2'
 ```
 
-Desktop branding assets live under `apps/dashboard/src-tauri/icons/` and use the `SS` mark (`icon.svg`) as source.
-Current desktop bundle name/version is explicitly **staging/internal preview** (`SliceStream-InternalPreview`, `0.1.0-beta.2`) and is not a final release.
-Packaging metadata knobs:
-- `SLICESTREAM_PUBLISHER`
-- `SLICESTREAM_RELEASE_NOTES`
-- `SLICESTREAM_CHANGELOG_FILE` (default: `docs/changelog-internal-preview.md`)
+### Port in use / bind failed
+- Stop conflicting local process, or run service with updated local endpoint configuration.
+- Service startup now reports bind failure explicitly and exits with non-zero code.
 
+### Endpoint not configured
+- Open desktop **Settings** and set both agent/provider endpoints.
 
-> Repo note: to keep PR diff text-friendly, we do **not** commit generated binary icon artifacts (`.png/.ico`).
-> If your local packager requires them, generate locally with:
-> `cargo tauri icon icons/icon.svg`
+### Service unreachable
+- Ensure `providerd` and `agentd` are running.
+- Verify endpoint host/port in Settings.
 
+### Why action is blocked
+- Check `Reason Code` first, then gate details.
+- Unknown/untrusted states are intentionally fail-closed.
 
-## Desktop client status (current)
+### Why high-risk action rejected
+- Guard checks can reject action based on network/readiness/signer requirements and protocol gate status.
 
-- **Primary UX now**: market terminal layout (top status strip, provider/order/match panels, deal ticket, controls, audit/warnings).
-- **Desktop settings panel** now includes local endpoint configuration (`slicestream_agent_base_url` / `slicestream_provider_base_url`) and build-channel visibility.
-- **Supported runtime controls**: market mode (`manual/auto/hybrid`) and pricing mode (`fixed/band/recommended_band`) via dashboard action APIs.
-- **No relay path in runtime**: desktop UI reads direct local node APIs (`agentd` + `providerd`) with no dashboard relay/proxy dependency.
-- **Future polish**: richer installer assets/signing, persistence/indexing, and deeper native integrations remain future optimization.
+### Why unknown action rejected
+- New actions must be explicitly registered in guard taxonomy; default behavior is reject.
+
+## 13) Official entry vs helper
+- **Official entry**: `apps/dashboard/src-tauri` (desktop).
+- `apps/dashboard` binary is **dev-only optional helper** (`SLICESTREAM_ENABLE_WEB_HELPER=1`) and is **not** part of official delivery path.
+
+## 14) Repository structure
+```text
+apps/
+  agentd/        # agent orchestration service
+  providerd/     # provider runtime service
+  dashboard/     # dev helper + tauri desktop shell
+crates/
+  common/        # shared models/runtime config/guards/persistence utilities
+  fiber_rpc/     # minimal Fiber RPC client path
+  metering/      # settlement window + aggregation logic
+cpp/
+  telemetryd/    # telemetry sampler
+  qualify/       # benchmark helper
+docs/
+  submission, acceptance, architecture, protocol docs
+scripts/
+  developer and packaging scripts
+```
+
+## 15) Interface preview / screenshots
+- In this headless environment, runtime screenshots are not embedded directly.
+- For local capture, run the Quick Start flow and take screenshots for:
+  - Home/status view (endpoint + gate + readiness + reason code),
+  - Settings endpoint configuration view,
+  - One blocked state and one ready state.
+
+## 16) Documentation map
+- Final submission package: `docs/final-submission-package.md`
+- Hackathon submission text: `docs/hackathon-submission.md`
+- Demo script: `docs/demo-script.md`
+- Technical breakdown: `docs/technical-breakdown.md`
+- Acceptance checks: `docs/acceptance.md`
+- Desktop packaging checklist: `docs/desktop-build-and-package-checklist.md`
+- Runtime directories: `docs/desktop-runtime-directories.md`
+
+## 17) Market persistence / runtime dirs boundary
+- Default behavior: runtime-dir resolution failure is fail-closed.
+- Compatibility fallback is opt-in only:
+  - `SLICESTREAM_ALLOW_MARKET_PERSISTENCE_FALLBACK=1`
+- Current persistence mode/reason is surfaced by runtime APIs/UI.
+
+## 18) Competition submission entry
+For form-ready copy and submission checklist, use:
+- `docs/final-submission-package.md`
+- `docs/hackathon-submission.md`
+
+## 19) Safety and honesty statement
+SliceStream is intentionally conservative: when state is unknown, dependencies are missing, or guards fail, risky actions are blocked rather than auto-forced.

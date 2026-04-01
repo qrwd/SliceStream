@@ -21,6 +21,8 @@ Expected on screen:
 Run:
 
 ```bash
+export LOCAL_PROVIDER_ENDPOINT=http://127.0.0.1:4001   # local service endpoint example
+export LOCAL_AGENT_ENDPOINT=http://127.0.0.1:4002      # local service endpoint example
 cargo run -p providerd
 cargo run -p agentd
 ```
@@ -58,8 +60,8 @@ SLICESTREAM_ENABLE_WEB_HELPER=1 cargo run -p dashboard
 Run:
 
 ```bash
-curl -s http://127.0.0.1:4002/v1/tasks/task-demo | jq
-curl -s http://127.0.0.1:4002/v1/tasks/task-demo/receipt | jq
+curl -s "$LOCAL_AGENT_ENDPOINT"/v1/tasks/task-demo | jq
+curl -s "$LOCAL_AGENT_ENDPOINT"/v1/tasks/task-demo/receipt | jq
 ```
 
 Expected:
@@ -72,8 +74,8 @@ Expected:
 Run:
 
 ```bash
-curl -s http://127.0.0.1:4001/v1/provider/jobs/job-demo | jq
-curl -s http://127.0.0.1:4001/v1/provider/jobs/job-demo/result | jq
+curl -s "$LOCAL_PROVIDER_ENDPOINT"/v1/provider/jobs/job-demo | jq
+curl -s "$LOCAL_PROVIDER_ENDPOINT"/v1/provider/jobs/job-demo/result | jq
 ```
 
 Expected:
@@ -86,7 +88,7 @@ Run (quick restart or separate prepared terminal):
 
 ```bash
 SLICESTREAM_SETTLEMENT_MODE=fiber \
-SLICESTREAM_FIBER_RPC_ENDPOINT=http://127.0.0.1:8227 \
+SLICESTREAM_FIBER_RPC_ENDPOINT=http://<local-fiber-endpoint>:8227 \
 cargo run -p agentd
 ```
 

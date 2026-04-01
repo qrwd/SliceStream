@@ -15,6 +15,7 @@ SliceStream is a desktop-first, non-custodial compute-market settlement console 
 1. Run provider: `cargo run -p providerd`
 2. Run agent: `cargo run -p agentd`
 3. Run desktop: `cd apps/dashboard/src-tauri && cargo tauri dev`
+4. Configure local runtime endpoints in desktop settings before risky actions.
 
 Default runtime uses testnet-friendly network config (`ckt` address prefix).
 

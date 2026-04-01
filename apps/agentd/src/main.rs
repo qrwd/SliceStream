@@ -609,6 +609,17 @@ enum FiberActionRisk {
     High,
 }
 
+const REGISTERED_FIBER_ACTIONS: &[&str] = &[
+    "trade_request",
+    "recovery_run",
+    "reaper_run",
+    "settlement_retry",
+    "settlement_mark_final",
+    "contract_create",
+    "sign_request",
+    "submit_tx",
+];
+
 impl FiberActionKind {
     fn code(self) -> &'static str {
         match self {
@@ -659,14 +670,7 @@ impl FiberActionKind {
     }
 
     fn allowed_in_simulate(self) -> bool {
-        matches!(
-            self,
-            Self::TradeRequest
-                | Self::RecoveryRun
-                | Self::ReaperRun
-                | Self::SettlementRetry
-                | Self::SettlementMarkFinal
-        )
+        !matches!(self, Self::Unknown)
     }
 
     fn allowed_in_real(self) -> bool {
@@ -716,7 +720,7 @@ fn enforce_fiber_action_guard(
         if cfg.network == common::runtime_config::Network::Mainnet && !cfg.mainnet_ready {
             return Err("mainnet_not_ready".to_string());
         }
-        if action_kind.requires_signer() && signer_address.unwrap_or("").trim().is_empty() {
+        if signer_address.unwrap_or("").trim().is_empty() {
             return Err("signer_address_required".to_string());
         }
     }
@@ -930,6 +934,15 @@ impl Default for AppState {
             persistence: Arc::new(MarketPersistence::new("agentd")),
         };
         if !cfg!(test) {
+            let persistence_mode = state.persistence.mode_code();
+            let persistence_reason = state
+                .persistence
+                .mode_detail()
+                .unwrap_or_else(|| "none".to_string());
+            println!(
+                "agentd market persistence mode={} reason={}",
+                persistence_mode, persistence_reason
+            );
             load_agent_state(&state);
             append_market_event(
                 &state,
@@ -2089,7 +2102,8 @@ async fn fiber_preflight_check(
                 "error":e,
                 "action_code":action_kind.code(),
                 "action_label":action_kind.label(),
-                "requires_signer":action_kind.requires_signer()
+                "requires_signer":action_kind.requires_signer(),
+                "registered_actions": REGISTERED_FIBER_ACTIONS
             })),
         )
             .into_response();
@@ -5777,7 +5791,16 @@ async fn get_task_status(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> impl IntoResponse {
-    let tasks = state.tasks.lock().expect("tasks lock poisoned");
+    let tasks = match state.tasks.lock() {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"tasks_lock_failed"})),
+            )
+                .into_response();
+        }
+    };
     let Some(runtime) = tasks.get(&task_id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -5788,18 +5811,46 @@ async fn get_task_status(
             .into_response();
     };
 
-    let mode = state.market_mode.lock().expect("market mode lock").clone();
-    let auto_pause_until = *state.auto_pause_until_tick.lock().expect("auto pause lock");
-    let auto_pause_reason = state
-        .auto_pause_reason
-        .lock()
-        .expect("auto pause reason lock")
-        .clone();
-    let recommended_context_hash = state
-        .recommended_context_hash
-        .lock()
-        .expect("recommended context hash lock")
-        .clone();
+    let mode = match state.market_mode.lock() {
+        Ok(v) => v.clone(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"market_mode_lock_failed"})),
+            )
+                .into_response();
+        }
+    };
+    let auto_pause_until = match state.auto_pause_until_tick.lock() {
+        Ok(v) => *v,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"auto_pause_lock_failed"})),
+            )
+                .into_response();
+        }
+    };
+    let auto_pause_reason = match state.auto_pause_reason.lock() {
+        Ok(v) => v.clone(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"auto_pause_reason_lock_failed"})),
+            )
+                .into_response();
+        }
+    };
+    let recommended_context_hash = match state.recommended_context_hash.lock() {
+        Ok(v) => v.clone(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"recommended_context_hash_lock_failed"})),
+            )
+                .into_response();
+        }
+    };
     let recommended_confirmation_valid = recommended_confirmation_is_current(&state);
     let recommended_invalidation_reason = if recommended_confirmation_valid {
         None
@@ -5808,25 +5859,50 @@ async fn get_task_status(
     };
     let (active_accept, active_settlement, retryable_failed, payment_unknown, stuck, queue_size) =
         compute_attempt_counts(&state);
-    let locked_buy_orders_count = state
-        .locked_buy_orders
-        .lock()
-        .expect("locked buys lock")
-        .len();
-    let locked_sell_orders_count = state
-        .locked_sell_orders
-        .lock()
-        .expect("locked sells lock")
-        .len();
-    let provider_offline_impact_count = state
-        .market_audit
-        .lock()
-        .expect("market audit lock")
-        .iter()
-        .filter(|v| v.contains("lifecycle_provider_offline"))
-        .count();
+    let locked_buy_orders_count = match state.locked_buy_orders.lock() {
+        Ok(v) => v.len(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"locked_buy_orders_lock_failed"})),
+            )
+                .into_response();
+        }
+    };
+    let locked_sell_orders_count = match state.locked_sell_orders.lock() {
+        Ok(v) => v.len(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"locked_sell_orders_lock_failed"})),
+            )
+                .into_response();
+        }
+    };
+    let provider_offline_impact_count = match state.market_audit.lock() {
+        Ok(v) => v
+            .iter()
+            .filter(|x| x.contains("lifecycle_provider_offline"))
+            .count(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"market_audit_lock_failed"})),
+            )
+                .into_response();
+        }
+    };
     let runtime_cfg = common::runtime_config::load_runtime_config();
-    let disputes = state.disputes.lock().expect("disputes lock");
+    let disputes = match state.disputes.lock() {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"disputes_lock_failed"})),
+            )
+                .into_response();
+        }
+    };
     let disputes_open_count = disputes
         .values()
         .filter(|d| d.status == DISPUTE_STATUS_OPEN || d.status == DISPUTE_STATUS_AWAITING_MANUAL)
@@ -5840,14 +5916,20 @@ async fn get_task_status(
         .count();
     drop(disputes);
 
-    let committed_compute_total = state
-        .accepted_matches
-        .lock()
-        .expect("accepted matches lock")
-        .values()
-        .find(|m| m.task_id == task_id)
-        .map(|m| m.agreed_work_units)
-        .unwrap_or(0.0);
+    let committed_compute_total = match state.accepted_matches.lock() {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"accepted_matches_lock_failed"})),
+            )
+                .into_response();
+        }
+    }
+    .values()
+    .find(|m| m.task_id == task_id)
+    .map(|m| m.agreed_work_units)
+    .unwrap_or(0.0);
     let delivered_compute_total: f64 = runtime
         .billing_windows
         .iter()
@@ -5992,7 +6074,16 @@ async fn get_trade_desk(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> impl IntoResponse {
-    let tasks = state.tasks.lock().expect("tasks lock poisoned");
+    let tasks = match state.tasks.lock() {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"tasks_lock_failed"})),
+            )
+                .into_response();
+        }
+    };
     let Some(runtime) = tasks.get(&task_id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -6001,10 +6092,16 @@ async fn get_trade_desk(
             .into_response();
     };
 
-    let accepted = state
-        .accepted_matches
-        .lock()
-        .expect("accepted matches lock");
+    let accepted = match state.accepted_matches.lock() {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"accepted_matches_lock_failed"})),
+            )
+                .into_response();
+        }
+    };
     let mut trades: Vec<common::market::TradeRecord> = accepted
         .values()
         .filter(|m| m.task_id == task_id)
@@ -6236,7 +6333,16 @@ async fn get_task_receipt(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> impl IntoResponse {
-    let tasks = state.tasks.lock().expect("tasks lock poisoned");
+    let tasks = match state.tasks.lock() {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"tasks_lock_failed"})),
+            )
+                .into_response();
+        }
+    };
     let Some(runtime) = tasks.get(&task_id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -6296,11 +6402,22 @@ async fn main() {
     let state = AppState::default();
     spawn_polling_loop(state.clone());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:4002")
-        .await
-        .unwrap();
-    println!("agentd listening on http://127.0.0.1:4002");
-    axum::serve(listener, app_with_state(state)).await.unwrap();
+    let listen_addr = "127.0.0.1:4002";
+    let listener = match tokio::net::TcpListener::bind(listen_addr).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "agentd failed to bind local service endpoint {}: {}",
+                listen_addr, e
+            );
+            std::process::exit(1);
+        }
+    };
+    println!("agentd listening on local service endpoint http://{listen_addr}");
+    if let Err(e) = axum::serve(listener, app_with_state(state)).await {
+        eprintln!("agentd server exited with error: {}", e);
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
@@ -8993,13 +9110,10 @@ Content-Length: {}
     }
 
     #[test]
-    fn fiber_worker_guard_rejects_high_risk_action_in_simulate_mode() {
+    fn fiber_worker_guard_allows_registered_high_risk_action_in_simulate_mode() {
         let result =
             enforce_fiber_action_guard(FiberActionKind::SubmitTx, "simulate", Some("ckt1qexample"));
-        assert!(matches!(
-            result,
-            Err(e) if e == "action_not_allowed_in_simulate:submit_tx"
-        ));
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -9009,7 +9123,14 @@ Content-Length: {}
         assert_eq!(action.label(), "Submit Transaction");
         assert!(action.requires_signer());
         assert!(action.allowed_in_real());
-        assert!(!action.allowed_in_simulate());
+        assert!(action.allowed_in_simulate());
+        assert!(REGISTERED_FIBER_ACTIONS.contains(&"submit_tx"));
+    }
+
+    #[test]
+    fn unregistered_future_action_is_rejected_by_parser() {
+        let action = parse_fiber_action_kind("future_internal_action");
+        assert!(matches!(action, FiberActionKind::Unknown));
     }
 
     #[tokio::test]

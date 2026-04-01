@@ -113,7 +113,7 @@
 
   <section id="tab-profile" class="workspace g2">
     <div class="panel"><h3>Personal Homepage</h3><table><tbody id="profileRows"></tbody></table><h3>Recent Personal Activity</h3><div id="profileActivity" class="timeline"></div></div>
-    <div class="panel"><h3>Settings</h3><p class="note">SliceStream is a local non-custodial desktop tool. Set local agent/provider endpoints before risky actions can run.</p><label>Agent Endpoint</label><input id="agentEndpoint" placeholder="http://127.0.0.1:4002"/><label>Provider Endpoint</label><input id="providerEndpoint" placeholder="http://127.0.0.1:4001"/><h3>Local Endpoint Health</h3><table><tbody id="endpointRows"></tbody></table><label>Theme</label><select id="themeSel"><option>dark-pro</option><option>dark-terminal</option></select><label>Density</label><select id="densitySel"><option>high</option><option>comfortable</option></select><label>Auto refresh interval (ms)</label><input id="refreshInput" value="2500"/><label>Demo Mode</label><select id="demoMode"><option>on</option><option>off</option></select><label>Scenario</label><select id="scenarioSel"><option value="normal">normal_completed_trade</option><option value="penalty">penalty_refund_trade</option><option value="payment_unknown">payment_unknown_dispute_trade</option></select><label>Show Hash Style</label><select id="hashMode"><option>truncated</option><option>full</option></select><button class="btn" id="saveSettings">Save Settings</button><h3>Build / Channel</h3><table><tbody id="buildRows"></tbody></table><h3>Gate Summary</h3><table><tbody id="gateRows"></tbody></table></div>
+    <div class="panel"><h3>Settings</h3><p class="note">SliceStream is a local non-custodial desktop tool. Configure local service endpoints before risky actions can run.</p><label>Agent Endpoint</label><input id="agentEndpoint" placeholder="http://&lt;local-agent-endpoint&gt;:4002"/><label>Provider Endpoint</label><input id="providerEndpoint" placeholder="http://&lt;local-provider-endpoint&gt;:4001"/><h3>Local Endpoint Health</h3><table><tbody id="endpointRows"></tbody></table><label>Theme</label><select id="themeSel"><option>dark-pro</option><option>dark-terminal</option></select><label>Density</label><select id="densitySel"><option>high</option><option>comfortable</option></select><label>Auto refresh interval (ms)</label><input id="refreshInput" value="2500"/><label>Demo Mode</label><select id="demoMode"><option>on</option><option>off</option></select><label>Scenario</label><select id="scenarioSel"><option value="normal">normal_completed_trade</option><option value="penalty">penalty_refund_trade</option><option value="payment_unknown">payment_unknown_dispute_trade</option></select><label>Show Hash Style</label><select id="hashMode"><option>truncated</option><option>full</option></select><button class="btn" id="saveSettings">Save Settings</button><h3>Build / Channel</h3><table><tbody id="buildRows"></tbody></table><h3>Gate Summary</h3><table><tbody id="gateRows"></tbody></table></div>
   </section>
 
   <div class="status" id="status">status: booting...</div>
@@ -149,6 +149,7 @@ const REASON_MAP={
   protocol_version_mismatch:{user:'Protocol version mismatch'},
   mainnet_not_ready:{user:'Mainnet readiness required'},
   unknown_network:{user:'Unsupported network'},
+  local_service_unreachable:{user:'Local service endpoint unreachable'},
   network_mismatch:{user:'Requested network does not match runtime network'},
   signer_address_required:{user:'Signer address required'},
   unknown_fiber_action:{user:'Unsupported Fiber action'},
@@ -201,6 +202,7 @@ function readinessBadge(state){
 function computeReadiness(endpointConfigured, gateBlockedCode){
   if(!endpointConfigured) return 'needs-config';
   if(!gateBlockedCode || gateBlockedCode==='ready') return 'ready';
+  if(gateBlockedCode==='local_service_unreachable') return 'needs-service';
   if(gateBlockedCode==='signer_address_required') return 'needs-signer';
   if(gateBlockedCode==='protocol_not_accepted' || gateBlockedCode==='protocol_version_mismatch') return 'needs-protocol';
   if(gateBlockedCode==='unknown_network' || gateBlockedCode==='network_mismatch') return 'wrong-network';
@@ -256,6 +258,9 @@ async function fetchDirectLive(){
   const map=Object.fromEntries(responses);
   const warnings=[];
   for(const [k,v] of Object.entries(map)){ if(!v.ok) pushWarn(warnings,`${k} error: ${v.error}`); }
+  if(!map.agent_status.ok || !map.provider_status.ok){
+    throw new Error(`local_service_unreachable: agent_status_ok=${map.agent_status.ok} provider_status_ok=${map.provider_status.ok}`);
+  }
 
   const providerStatus = map.provider_status.data||{};
   const providerResult = map.provider_result.data||{};
@@ -513,11 +518,12 @@ async function load(){
     status('connected/direct '+new Date().toLocaleTimeString());
   }catch(e){
     const msg=String(e?.message||e);
-    if(msg.includes('local_endpoint_not_configured')){
+    if(msg.includes('local_endpoint_not_configured') || msg.includes('local_service_unreachable')){
       const normalized=normalizeReason(msg);
       $('endpointState').textContent='missing';
-      $('gateState').textContent='needs-config';
-      $('actionReadiness').innerHTML=readinessBadge('needs-config');
+      const isServiceDown=normalized.code==='local_service_unreachable';
+      $('gateState').textContent=isServiceDown?'needs-service':'needs-config';
+      $('actionReadiness').innerHTML=readinessBadge(isServiceDown?'needs-service':'needs-config');
       $('endpointRows').innerHTML=[
         row('agent endpoint',AGENT||'<span class="bad">not configured</span>'),
         row('provider endpoint',PROVIDER||'<span class="bad">not configured</span>'),
@@ -527,7 +533,7 @@ async function load(){
         row('technical detail',normalized.detail)
       ].join('');
       $('gateRows').innerHTML=[row('gate state','<span class="bad">blocked</span>'),row('reason code',normalized.code),row('user-facing reason',normalized.user),row('technical reason',normalized.detail)].join('');
-      $('pathRows').innerHTML=[row('desktop data source','not configured'),row('gate reason','local endpoint missing (fail-closed)')].join('');
+      $('pathRows').innerHTML=[row('desktop data source','not configured'),row('gate reason',normalized.user+' (fail-closed)')].join('');
       status('blocked: '+normalized.user+'. detail='+normalized.detail);
       return;
     }

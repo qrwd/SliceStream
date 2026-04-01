@@ -164,8 +164,9 @@ See `docs/audit-reconciliation.md` for full issue calibration (`still_open` / `f
   - fiber preflight action taxonomy now uses explicit known action kinds (unknown action => fail-closed reject).
 - Partially implemented:
   - Fiber preflight + core worker settlement + replay settlement stages now share the same fail-closed action guard, but non-settlement future Fiber entrypoints are not yet fully taxonomy-bound.
-  - dashboard web helper remains only as dev-local helper path (desktop entry is official delivery path).
+  - dashboard web helper remains only as optional dev-local helper path (desktop entry is official delivery path).
   - future action coverage is still an active lane, but high-risk chain actions are now explicitly blocked in `simulate` mode by guard policy.
+  - bridge/relay style runtime is not an official feature path; delivery remains local/direct desktop workflow.
 - Not yet implemented:
   - full protocol version migration workflow (catalog upgrade + persistent invalidation history);
   - exhaustive Fiber action taxonomy covering every future contract/channel/swap API variant.

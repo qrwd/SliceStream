@@ -44,11 +44,22 @@ async fn main() {
         .route("/", get(index))
         .route("/api/meta", get(meta));
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:4003")
-        .await
-        .unwrap();
-    println!("dashboard listening on http://127.0.0.1:4003");
-    axum::serve(listener, app).await.unwrap();
+    let listen_addr = "127.0.0.1:4003";
+    let listener = match tokio::net::TcpListener::bind(listen_addr).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "dashboard helper failed to bind local service endpoint {}: {}",
+                listen_addr, e
+            );
+            std::process::exit(1);
+        }
+    };
+    println!("dashboard helper listening on local service endpoint http://{listen_addr}");
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("dashboard helper server exited with error: {}", e);
+        std::process::exit(1);
+    }
 }
 
 async fn index() -> Html<&'static str> {

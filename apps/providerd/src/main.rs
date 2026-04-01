@@ -431,6 +431,15 @@ impl AppState {
         };
 
         if !cfg!(test) {
+            let persistence_mode = state.persistence.mode_code();
+            let persistence_reason = state
+                .persistence
+                .mode_detail()
+                .unwrap_or_else(|| "none".to_string());
+            println!(
+                "providerd market persistence mode={} reason={}",
+                persistence_mode, persistence_reason
+            );
             load_provider_state(&state);
             append_market_event(
                 &state,
@@ -1396,7 +1405,16 @@ async fn get_provider_job_status(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> impl IntoResponse {
-    let jobs = state.jobs.lock().expect("jobs lock poisoned");
+    let jobs = match state.jobs.lock() {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"jobs_lock_failed"})),
+            )
+                .into_response();
+        }
+    };
     let Some(runtime) = jobs.get(&job_id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -1434,7 +1452,16 @@ async fn get_provider_job_result(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> impl IntoResponse {
-    let jobs = state.jobs.lock().expect("jobs lock poisoned");
+    let jobs = match state.jobs.lock() {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"jobs_lock_failed"})),
+            )
+                .into_response();
+        }
+    };
     let Some(runtime) = jobs.get(&job_id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -1514,19 +1541,35 @@ async fn main() {
     let state = AppState::with_benchmark_score(benchmark_score);
     spawn_window_loop(state.clone());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:4001")
-        .await
-        .unwrap();
-    println!("providerd listening on http://127.0.0.1:4001");
-    axum::serve(listener, app_with_state(state)).await.unwrap();
+    let listen_addr = "127.0.0.1:4001";
+    let listener = match tokio::net::TcpListener::bind(listen_addr).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "providerd failed to bind local service endpoint {}: {}",
+                listen_addr, e
+            );
+            std::process::exit(1);
+        }
+    };
+    println!("providerd listening on local service endpoint http://{listen_addr}");
+    if let Err(e) = axum::serve(listener, app_with_state(state)).await {
+        eprintln!("providerd server exited with error: {}", e);
+        std::process::exit(1);
+    }
 }
 
 async fn get_provider_registry(State(state): State<AppState>) -> impl IntoResponse {
-    let registry = state
-        .provider_registry
-        .lock()
-        .expect("provider registry lock")
-        .clone();
+    let registry = match state.provider_registry.lock() {
+        Ok(v) => v.clone(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"provider_registry_lock_failed"})),
+            )
+                .into_response();
+        }
+    };
     (StatusCode::OK, Json(registry)).into_response()
 }
 
@@ -1597,16 +1640,51 @@ fn configured_provider_price(state: &AppState, benchmark_score: f64) -> Option<f
 
 async fn get_sell_orders(State(state): State<AppState>) -> impl IntoResponse {
     {
-        let mut tick = state.lifecycle_tick.lock().expect("lifecycle tick lock");
+        let mut tick = match state.lifecycle_tick.lock() {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error":"lifecycle_tick_lock_failed"})),
+                )
+                    .into_response();
+            }
+        };
         *tick = tick.saturating_add(1);
     }
-    let mode = state.market_mode.lock().expect("market mode lock").clone();
-    let base_orders = state.sell_orders.lock().expect("sell orders lock").clone();
-    let benchmark = state
-        .provider_registry
-        .lock()
-        .expect("provider registry lock")[0]
-        .benchmark_score;
+    let mode = match state.market_mode.lock() {
+        Ok(v) => v.clone(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"market_mode_lock_failed"})),
+            )
+                .into_response();
+        }
+    };
+    let base_orders = match state.sell_orders.lock() {
+        Ok(v) => v.clone(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"sell_orders_lock_failed"})),
+            )
+                .into_response();
+        }
+    };
+    let benchmark = match state.provider_registry.lock() {
+        Ok(v) => v
+            .first()
+            .map(|x| x.benchmark_score)
+            .unwrap_or(DEFAULT_BENCHMARK_SCORE),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"provider_registry_lock_failed"})),
+            )
+                .into_response();
+        }
+    };
     let maybe_price = configured_provider_price(&state, benchmark);
     let adjusted_orders: Vec<SellOrder> = base_orders
         .iter()

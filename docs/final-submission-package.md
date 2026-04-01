@@ -30,6 +30,7 @@ cargo run -p agentd
 cd apps/dashboard/src-tauri
 cargo tauri dev
 ```
+Then configure local runtime endpoints in Settings (agent/provider) before running risky actions.
 
 ## 7) Demo flow (short)
 1. Open desktop UI and verify endpoint/gate/readiness.
@@ -40,7 +41,7 @@ cargo tauri dev
 
 ## 8) Desktop delivery status
 - Official delivery path: `apps/dashboard/src-tauri`.
-- Dev-only helper path remains gated and debug-only.
+- Dev-only helper path remains optional, gated, and not part of official delivery.
 - Packaging script supports linux/windows target intent and metadata checks.
 
 ## 9) Current version status
