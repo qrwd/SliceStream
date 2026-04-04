@@ -1,5 +1,44 @@
 # SliceStream
 
+## 0) Project introduction (current implementation scope)
+### One-line summary
+SliceStream is a **desktop-first decentralized compute-by-slice trading system** that coordinates provider-side supply, buyer demand, matching, metering, and settlement evidence in a local/direct runtime prototype.
+
+### What this system is
+SliceStream is not only an operator console. In the current codebase, it already models a market workflow: provider registry and provider pool views, `SellOrder` / `BuyOrder` lifecycle handling, `MatchRecord` creation, accepted-match settlement binding, telemetry/benchmark-informed pricing context, and settlement/reconciliation traces.
+
+### Core capability overview (as implemented)
+- **Market entities and lifecycle**
+  - Provider registry/pool APIs and provider status surfaces.
+  - Order objects for sell and buy sides with match generation and progression.
+  - Trade path progression including `proposed -> accepted -> settling -> settled` states.
+  - Accepted match binding into settlement attempts and related runtime state.
+- **Execution and control modes**
+  - Market control modes: `manual`, `auto`, `hybrid`.
+  - Pricing modes: `fixed`, `band`, `recommended_band` with confirm/reconfirm behavior.
+- **Metering and settlement foundation**
+  - Telemetry-derived windows and benchmark score integration.
+  - Settlement rails for both mock execution and Fiber-facing execution paths.
+  - Receipt/evidence/reconciliation structures and dispute-related records.
+- **Persistence and observability foundation**
+  - Market persistence with state/event persistence utilities.
+  - Runtime mode/readiness/reason-code reporting exposed to APIs and dashboard.
+- **Desktop experience**
+  - Desktop trading terminal UI via Tauri preview (`apps/dashboard/src-tauri`).
+  - Local helper/dashboard endpoints for development visualization.
+
+### Implemented scope today
+- End-to-end local/direct prototype across `providerd`, `agentd`, and desktop UI.
+- Fail-closed gate behavior for protocol acceptance, network mismatch, unknown actions, and signer requirements in high-risk flows.
+- Test-covered core paths for matching, settlement attempts, replay/idempotency, dispute open/resolve actions, persistence recovery, and runtime diagnostics.
+
+### Honest boundary / not-yet-finished areas
+- This repository is currently a **local/direct market prototype**, not a productionized fully decentralized network deployment.
+- Packaging, release distribution hardening, and production operational guarantees are incomplete.
+- Fiber integration includes practical paths used by the prototype, but not a complete future action matrix for every possible external/network condition.
+- Security/audit/compliance posture is prototype-level hardening, not final commercial-grade assurance.
+
+---
 ## 1) One-line intro
 SliceStream is a **desktop-first, non-custodial, protocol-gated** operator console for local CKB/Fiber settlement workflows.
 
@@ -37,13 +76,35 @@ This repository is optimized for:
 - This repo is **advanced preview / prototype-quality hardening**, not a finished commercial release.
 
 ## 6) Environment requirements
-- Rust + Cargo (stable toolchain)
-- `cargo tauri` CLI (for desktop shell)
-- Python 3 (for some helper scripts)
+### Required toolchain
+- Rust stable toolchain + Cargo (workspace crates and services).
+- `cargo tauri` CLI (desktop shell dev/build path).
+- Python 3 (helper scripts such as smoke checks).
+- C/C++ build tools for native dependencies (`build-essential`/MSVC toolchain depending on platform).
+
+### Service runtime ports (default local/direct profile)
+- `providerd`: `127.0.0.1:4001`
+- `agentd`: `127.0.0.1:4002`
+- dashboard web helper (dev-only): `127.0.0.1:4003`
+
+### Linux desktop dependencies (Tauri/WebKit path)
+Depending on your distro, install equivalents of:
+- `libglib2.0-dev`
+- `libgtk-3-dev`
+- `libwebkit2gtk-4.1-dev` (or distro equivalent)
+- `libayatana-appindicator3-dev` (or appindicator equivalent)
+- `libsoup-3.0-dev`
+
+### Windows desktop dependencies
+- WebView2 Runtime
+- Visual Studio C++ Build Tools
+
+### Optional but practical for docs and validation
+- A headless browser toolchain (for screenshot capture and UI verification in CI/headless environments).
 
 Platform notes:
-- **Windows (recommended for packaging checks)**: WebView2 runtime + Visual Studio C++ build tools
-- **Linux**: GTK/WebKit dev libs may be required for Tauri build (`glib-2.0`, `webkit2gtk`)
+- **Windows (recommended for packaging checks)**: WebView2 runtime + Visual Studio C++ build tools.
+- **Linux**: Tauri build/runtime depends on GTK/WebKit stack; package names vary by distribution.
 
 ## 7) Quick Start (minimal runnable path)
 > local runtime endpoint examples are shown below; adjust endpoints for your machine.
@@ -86,6 +147,20 @@ After opening desktop UI:
    - `Action Readiness`: actionable status (`ready`, `needs-config`, `needs-service`, etc.).
    - `Reason Code`: machine-readable block reason.
 3. Use terminal/workspace tabs to inspect trade/billing/dispute/evidence/runtime metadata.
+
+### Desktop UI snapshots (current implementation)
+
+**Home / KPI / risk overview**  
+Shows workspace KPIs, risk summary, and recent activity stream for local/direct runtime visibility.
+
+**Trade Terminal view**  
+Shows market watch, trade rows, and trade detail workspace for order/match lifecycle and execution progress inspection.
+
+**Profile / Settings + Gate Summary view**  
+Shows local endpoint settings, endpoint health, build/channel info, and gate summary/readiness outputs used for fail-closed operation.
+
+> Binary screenshots are intentionally not committed.
+> See reproducible capture guidance: `docs/images/README.md`.
 
 ## 9) Endpoint configuration notes
 - Endpoint fields are local runtime service endpoints, not hosted web deployment URLs.

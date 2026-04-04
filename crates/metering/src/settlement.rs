@@ -6,8 +6,9 @@ pub const SETTLE_WINDOW_SECONDS: u64 = 15;
 pub const SAMPLES_PER_WINDOW: u16 = 60;
 pub const RECEIPT_HASH_ALG: HashAlg = HashAlg::Sha256V1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MergePolicy {
+    #[default]
     Merge30s,
     Merge60s,
 }
@@ -18,12 +19,6 @@ impl MergePolicy {
             MergePolicy::Merge30s => 2,
             MergePolicy::Merge60s => 4,
         }
-    }
-}
-
-impl Default for MergePolicy {
-    fn default() -> Self {
-        Self::Merge30s
     }
 }
 

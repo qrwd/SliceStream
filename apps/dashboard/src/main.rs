@@ -86,6 +86,7 @@ async fn meta() -> Json<Value> {
     )
 }
 
+#[cfg(test)]
 fn demo_workspace_seed() -> Value {
     serde_json::json!({
         "trades": [

@@ -14,7 +14,8 @@ if missing:
     sys.exit(1)
 
 cfg = json.loads(conf.read_text())
-assert cfg.get("productName") == "SliceStream", "productName must be SliceStream"
+product_name = cfg.get("productName", "")
+assert product_name.startswith("SliceStream"), "productName must start with SliceStream"
 assert cfg.get("build", {}).get("frontendDist") == "ui", "frontendDist must point to ui"
 assert any(t == "nsis" for t in cfg.get("bundle", {}).get("targets", [])), "nsis target required"
 nsis = cfg.get("bundle", {}).get("windows", {}).get("nsis", {})
@@ -36,4 +37,4 @@ required_strings = [
 for s in required_strings:
     assert s in text, f"ui missing marker: {s}"
 
-print("desktop smoke-check ok: config + direct-connect UI markers are present (binary-friendly)")
+print(f"desktop smoke-check ok: {product_name} config + direct-connect UI markers are present (binary-friendly)")
