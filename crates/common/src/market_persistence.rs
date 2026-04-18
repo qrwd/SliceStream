@@ -56,6 +56,38 @@ fn compatibility_fallback_enabled() -> bool {
         .unwrap_or(false)
 }
 
+
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelInvocationRecord {
+    pub invocation_id: String,
+    pub task_kind: String,
+    pub request_digest: String,
+    pub context_digest: String,
+    pub structured_output_digest: String,
+    pub latency_ms: u32,
+    pub confidence_bps: u16,
+    pub uncertainty_bps: u16,
+    pub verification_expected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelReplayRecord {
+    pub invocation_id: String,
+    pub proposal_summary: String,
+    pub influence_summary: String,
+    pub sample_seed_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelTrainingSeedRecord {
+    pub seed_id: String,
+    pub invocation_id: String,
+    pub kind: String,
+    pub summary: String,
+    pub target: String,
+    pub source_digest: String,
+}
 impl MarketPersistence {
     pub fn new(service: &str) -> Self {
         let (base, mode) = match crate::runtime_dirs::resolve_runtime_dirs("SliceStream") {
@@ -156,6 +188,72 @@ set SLICESTREAM_ALLOW_MARKET_PERSISTENCE_FALLBACK=1 to temporarily enable compat
     }
 }
 
+
+impl MarketPersistence {
+    fn model_invocation_file(&self) -> PathBuf {
+        self.dir.join("model-invocations.ndjson")
+    }
+
+    fn model_replay_file(&self) -> PathBuf {
+        self.dir.join("model-replay.ndjson")
+    }
+
+    fn model_training_seed_file(&self) -> PathBuf {
+        self.dir.join("model-seeds.ndjson")
+    }
+
+    pub fn append_model_invocation(&self, record: &ModelInvocationRecord) -> Result<(), String> {
+        self.append_ndjson(&self.model_invocation_file(), record)
+    }
+
+    pub fn read_model_invocations(&self) -> Vec<ModelInvocationRecord> {
+        self.read_ndjson(&self.model_invocation_file())
+    }
+
+    pub fn append_model_replay(&self, record: &ModelReplayRecord) -> Result<(), String> {
+        self.append_ndjson(&self.model_replay_file(), record)
+    }
+
+    pub fn read_model_replay(&self) -> Vec<ModelReplayRecord> {
+        self.read_ndjson(&self.model_replay_file())
+    }
+
+    pub fn append_model_training_seed(
+        &self,
+        record: &ModelTrainingSeedRecord,
+    ) -> Result<(), String> {
+        self.append_ndjson(&self.model_training_seed_file(), record)
+    }
+
+    pub fn read_model_training_seeds(&self) -> Vec<ModelTrainingSeedRecord> {
+        self.read_ndjson(&self.model_training_seed_file())
+    }
+
+    fn append_ndjson<T: Serialize>(&self, file: &Path, v: &T) -> Result<(), String> {
+        self.ensure()?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file)
+            .map_err(|e| e.to_string())?;
+        let line = serde_json::to_string(v).map_err(|e| e.to_string())?;
+        writeln!(f, "{line}").map_err(|e| e.to_string())
+    }
+
+    fn read_ndjson<T: DeserializeOwned>(&self, file: &Path) -> Vec<T> {
+        let file = match OpenOptions::new().read(true).open(file) {
+            Ok(v) => v,
+            Err(_) => return vec![],
+        };
+        let reader = BufReader::new(file);
+        reader
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|line| serde_json::from_str::<T>(&line).ok())
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +310,56 @@ mod tests {
         let p = MarketPersistence::new_in("/tmp/slicestream", "mode-test");
         assert_eq!(p.mode_code(), "explicit_base");
         assert!(p.mode_detail().is_none());
+    }
+
+    #[test]
+    fn model_artifacts_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "slicestream-model-persist-{}",
+            std::process::id()
+        ));
+        let p = MarketPersistence::new_in(dir.to_string_lossy().as_ref(), "model-test");
+
+        p.append_model_invocation(&ModelInvocationRecord {
+            invocation_id: "inv-1".to_string(),
+            task_kind: "planning".to_string(),
+            request_digest: "req".to_string(),
+            context_digest: "ctx".to_string(),
+            structured_output_digest: "out".to_string(),
+            latency_ms: 123,
+            confidence_bps: 8100,
+            uncertainty_bps: 1800,
+            verification_expected: true,
+        })
+        .unwrap();
+
+        p.append_model_replay(&ModelReplayRecord {
+            invocation_id: "inv-1".to_string(),
+            proposal_summary: "plan=2".to_string(),
+            influence_summary: "governed".to_string(),
+            sample_seed_ids: vec!["s1".to_string(), "s2".to_string()],
+        })
+        .unwrap();
+
+        p.append_model_training_seed(&ModelTrainingSeedRecord {
+            seed_id: "s1".to_string(),
+            invocation_id: "inv-1".to_string(),
+            kind: "verification".to_string(),
+            summary: "check consistency".to_string(),
+            target: "pass".to_string(),
+            source_digest: "digest".to_string(),
+        })
+        .unwrap();
+
+        let inv = p.read_model_invocations();
+        let replay = p.read_model_replay();
+        let seeds = p.read_model_training_seeds();
+
+        assert_eq!(inv.len(), 1);
+        assert_eq!(inv[0].invocation_id, "inv-1");
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].sample_seed_ids.len(), 2);
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].kind, "verification");
     }
 }
